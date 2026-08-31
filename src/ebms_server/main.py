@@ -63,3 +63,24 @@ def download_chart_chunk_file(chunk_id: int):
             detail="File not found"
         )
     return FileResponse(file_path)
+
+@app.get("/api/charthash")
+def get_chart_hash():
+    return Database().get_chart_chunk_hash()
+
+@app.get("/api/files/song/{chart_sha256}")
+def download_song(chart_sha256:str):
+    song_id = Database().get_song_id(chart_sha256)
+    if (song_id) is None:
+        raise HTTPException(
+            status_code=404,
+            detail="chart file not found"
+        )
+    print(song_id)
+    song_path = Database().get_song_file(song_id)
+    if song_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="chart file found but song file not found. report this to admin."
+        )
+    return FileResponse(song_path)
