@@ -5,7 +5,9 @@ import os
 from contextlib import asynccontextmanager
 
 from .db import Database
-from fastapi import FastAPI
+from . import constant
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 
 
 def configure_logging() -> None:
@@ -36,9 +38,13 @@ def configure_logging() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    logging.getLogger(__name__).info("DB is now loading...")
     Database()
+    logging.getLogger(__name__).info("DB is loaded.")
     for folder in os.listdir("./var/tmp"):
-        Database().insert_songs(pathlib.Path("./var/tmp") / folder, True)
+        cur_path = pathlib.Path("./var/tmp") / folder
+        if cur_path.is_file(): continue
+        Database().insert_songs(cur_path, True, True)
     yield
 
 
@@ -48,6 +54,12 @@ app = FastAPI(lifespan=lifespan)
 def read_root():
     return {"Hello": "Worldfffffffff"}
 
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str | None = None):
-    return {"item_id": item_id, "q": q}
+@app.get("/api/files/chart/{chunk_id}")
+def download_chart_chunk_file(chunk_id: int):
+    file_path = constant.CHART_DATA_DIR / constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id)
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+    return FileResponse(file_path)

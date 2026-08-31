@@ -9,7 +9,7 @@ CHART_METADATA_PATH = pathlib.Path(os.path.realpath("./data/chart/metadata.json"
 TMP_DIR = pathlib.Path(os.path.realpath("./var/tmp"))
 LOG_DIR = pathlib.Path(os.path.realpath("./var/log"))
 BYTE_PER_CHUNK = 64 * 1024 * 1024
-CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.tar"
+CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 
 if __name__ == "__main__":
     print(DB_PATH)

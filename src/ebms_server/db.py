@@ -5,7 +5,7 @@ import hashlib
 import logging
 import shutil
 import uuid
-import tarfile
+import zipfile
 import threading
 
 from . import constant
@@ -134,12 +134,11 @@ class Database:
                 bms_files.append((file_path, size, sha256))
 
             if (song_id is None):
-                song_file_base_path = constant.SONG_DATA_DIR / uuid.uuid4().hex
+                song_file_base_path = constant.SONG_DATA_DIR / f"{uuid.uuid4().hex}.zip"
                 song_file_path = pathlib.Path(
-                    shutil.make_archive(
+                    self.create_zip(
+                        root,
                         str(song_file_base_path),
-                        "tar",
-                        root_dir=str(root),
                     )
                 )
 
@@ -164,8 +163,8 @@ class Database:
                 cur.execute(com, (str(sha256), song_id, size))
                 
                 if cur.rowcount == 1:
-                    with tarfile.open(self.get_chunk_file_path(), "a") as tar:
-                        tar.add(chart_file_path, chart_file_path.name) 
+                    with zipfile.ZipFile(self.get_chunk_file_path(), mode="a", compression=zipfile.ZIP_STORED) as zf:
+                        zf.write(chart_file_path)
                     cnt += 1
             self.logger.info(f"insert_song: Inserted {cnt} charts.")
             con.commit()
@@ -186,4 +185,87 @@ class Database:
                 if remove:
                     shutil.rmtree(root_dir)
                 break
+
+    def create_zip(
+        self,
+        source_dir: os.PathLike,
+        output_zip: os.PathLike,
+    ) -> pathlib.Path:
+        """
+        디렉터리를 ZIP 파일로 압축하는 함수
+        """
+
+        source_dir = pathlib.Path(source_dir).resolve()
+        output_zip = pathlib.Path(output_zip).resolve()
+
+        if not source_dir.exists():
+            raise FileNotFoundError(
+                f"Source directory does not exist: {source_dir}"
+            )
+
+        if not source_dir.is_dir():
+            raise NotADirectoryError(
+                f"Source path is not a directory: {source_dir}"
+            )
+
+        output_zip.parent.mkdir(parents=True, exist_ok=True)
+
+        def get_arcname(path: pathlib.Path) -> str:
+            return path.relative_to(source_dir.parent).as_posix()
+
+        def make_zipinfo(
+            name: str,
+            is_dir: bool = False,
+        ) -> zipfile.ZipInfo:
+            if is_dir and not name.endswith("/"):
+                name += "/"
+
+            info = zipfile.ZipInfo(name)
+
+            # Unix permission 정보를 사용하지 않도록 설정
+            info.create_system = 0
+            info.external_attr = 0
+
+            return info
+
+        with zipfile.ZipFile(
+            output_zip,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as zf:
+
+            for path in source_dir.rglob("*"):
+
+                # output_zip이 source_dir 안에 있을 경우 자기 자신 제외
+                if path.resolve() == output_zip:
+                    continue
+
+                arcname = get_arcname(path)
+
+                if path.is_dir():
+                    # 빈 디렉터리는 명시적으로 저장
+                    try:
+                        next(path.iterdir())
+                    except StopIteration:
+                        info = make_zipinfo(
+                            arcname,
+                            is_dir=True,
+                        )
+                        zf.writestr(info, b"")
+
+                elif path.is_file():
+                    info = make_zipinfo(arcname)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+
+                    with path.open("rb") as f:
+                        zf.writestr(
+                            info,
+                            f.read(),
+                            compress_type=zipfile.ZIP_DEFLATED,
+                            compresslevel=6,
+                        )
+
+        return output_zip
+    
     
