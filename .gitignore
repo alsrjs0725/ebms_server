@@ -10,6 +10,8 @@ wheels/
 .venv
 
 
-data/*
-var/*
-ebms.db
+var/log/*
+var/media/chart/*
+var/media/song/*
+var/tmp/*
+var/ebms.db
