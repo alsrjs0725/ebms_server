@@ -1,24 +1,24 @@
 import logging
 import logging.handlers
-import pathlib
 import os
 from contextlib import asynccontextmanager
 
 from .db import Database
 from . import constant
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 
 def configure_logging() -> None:
-    log_dir = pathlib.Path(__file__).resolve().parents[2] / "var" / "log"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    constant.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     file_handler = logging.handlers.TimedRotatingFileHandler(
-        log_dir / "ebms.log",
+        constant.LOG_DIR / "ebms.log",
         when="D",
         interval=7,
         backupCount=53,
@@ -41,8 +41,8 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("DB is now loading...")
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
-    for folder in os.listdir("./var/tmp"):
-        cur_path = pathlib.Path("./var/tmp") / folder
+    for folder in os.listdir(constant.TMP_DIR):
+        cur_path = constant.TMP_DIR / folder
         if cur_path.is_file(): continue
         Database().insert_songs(cur_path, True, True)
     yield
@@ -50,9 +50,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
-def read_root():
-    return {"Hello": "Worldfffffffff"}
+templates = Jinja2Templates(
+    directory=constant.BASE_DIR / "src" / "ebms_server" / "templates"
+)
+app.mount(
+    "/static",
+    StaticFiles(directory=constant.BASE_DIR / "src" / "ebms_server" / "static"),
+    name="static",
+)
+
+@app.get("/", response_class=HTMLResponse)
+def read_root(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/root.html",
+    )
 
 @app.get("/api/files/chart/{chunk_id}")
 def download_chart_chunk_file(chunk_id: int):

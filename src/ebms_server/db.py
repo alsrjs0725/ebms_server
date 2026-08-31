@@ -138,23 +138,19 @@ class Database:
                     bms_files.append((file_path, size, sha256))
 
                 if (song_id is None):
-                    song_file_base_path = constant.SONG_DATA_DIR / f"{uuid.uuid4().hex}.zip"
-                    song_file_path = pathlib.Path(
-                        self.create_zip(
-                            root,
-                            str(song_file_base_path),
-                        )
-                    )
+                    song_file_name = f"{uuid.uuid4().hex}.zip"
+                    song_file_path = constant.SONG_DATA_DIR / song_file_name
+                    self.create_zip(root, str(song_file_path))
 
                     com = """
                         INSERT INTO song (path) VALUES (?)
                     """
 
-                    cur.execute(com, (str(song_file_path),))
+                    cur.execute(com, (str(song_file_name),))
                     song_id = cur.lastrowid
                     con.commit()
                     
-                    self.logger.info(f"insert_song: Inserted new song[{str(song_file_path)}, {song_id}]")
+                    self.logger.info(f"insert_song: Inserted new song[{str(song_file_name)}, {song_id}]")
                     
                 com = """
                     INSERT INTO chart (id, song_id, size) 
@@ -311,4 +307,5 @@ class Database:
         
         cur.execute(com, (song_id,))
         row = cur.fetchone()
-        return pathlib.Path(row[0]) if row else None
+        return constant.SONG_DATA_DIR / row[0] if row else None
+    

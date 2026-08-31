@@ -1,0 +1,7 @@
+Project: Start Bootstrap - Scrolling Nav
+Repository: https://github.com/StartBootstrap/startbootstrap-scrolling-nav
+Version: v5.0.6
+Commit: 45ee8f6a5503ec6d4b41ec86cf5be2c930b606df
+Imported: 2026-08-31
+Imported paths: dist/index.html, dist/css, dist/js, dist/assets
+Local modifications: Converted dist/index.html into Jinja2 base and root templates.
