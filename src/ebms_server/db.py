@@ -164,7 +164,7 @@ class Database:
                     
                     if cur.rowcount == 1:
                         with zipfile.ZipFile(self.get_chunk_file_path(), mode="a", compression=zipfile.ZIP_STORED) as zf:
-                            zf.write(chart_file_path)
+                            zf.write(chart_file_path, arcname=chart_file_path.name)
                         cnt += 1
                 self.logger.info(f"insert_song: Inserted {cnt} charts.")
                 con.commit()
@@ -211,7 +211,7 @@ class Database:
         output_zip.parent.mkdir(parents=True, exist_ok=True)
 
         def get_arcname(path: pathlib.Path) -> str:
-            return path.relative_to(source_dir.parent).as_posix()
+            return path.relative_to(source_dir).as_posix()
 
         def make_zipinfo(
             name: str,
