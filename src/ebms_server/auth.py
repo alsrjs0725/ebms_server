@@ -186,11 +186,37 @@ def safe_next(next_url: str | None, default: str = "/account") -> str:
 
 # ---- 현재 사용자 ----
 
+def set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        constant.SESSION_COOKIE, token,
+        max_age=constant.WEB_SESSION_SECONDS, path="/",
+        httponly=True, samesite="lax", secure=_secure_cookie(),
+    )
+
+
 def optional_session(request: Request) -> tuple[User, int] | None:
     token = request.cookies.get(constant.SESSION_COOKIE)
     if not token:
         return None
-    return accounts.authenticate(token, "web")
+    session = accounts.authenticate(token, "web")
+    if session is not None:
+        # DB의 만료 시각이 연장되므로 쿠키 유효기간도 응답에서 같이 연장합니다(refresh_session_cookie).
+        request.state.web_session_token = token
+    return session
+
+
+async def refresh_session_cookie(request: Request, call_next):
+    """로그인한 요청의 응답에 세션 쿠키를 다시 실어 브라우저 쪽 유효기간도 연장합니다.
+
+    응답이 이미 세션 쿠키를 바꾸는 경우(로그인, 로그아웃)는 건드리지 않습니다.
+    """
+    response = await call_next(request)
+    token = getattr(request.state, "web_session_token", None)
+    if token and not any(
+        v.startswith(f"{constant.SESSION_COOKIE}=") for v in response.headers.getlist("set-cookie")
+    ):
+        set_session_cookie(response, token)
+    return response
 
 
 def current_user(session: Annotated[tuple[User, int] | None, Depends(optional_session)]) -> User:
@@ -323,11 +349,7 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
         return _message(request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403)
     token = accounts.create_session(user.id, "web", request.headers.get("user-agent", ""))
     response = RedirectResponse(pending.get("n") or "/account", status_code=303)
-    response.set_cookie(
-        constant.SESSION_COOKIE, token,
-        max_age=constant.WEB_SESSION_SECONDS, path="/",
-        httponly=True, samesite="lax", secure=_secure_cookie(),
-    )
+    set_session_cookie(response, token)
     # 쿠키가 새 세션으로 바뀌므로 이전 웹 세션은 폐기합니다.
     if session is not None:
         accounts.revoke_session(session[0].id, session[1])

@@ -235,3 +235,21 @@ def test_existing_api_still_public(client):
     # 인증 강제는 이후 단계. 지금 클라이언트가 계속 동작해야 함
     assert client.get("/api/version").status_code == 200
     assert client.get("/api/charthash").status_code == 200
+
+
+def test_session_cookie_renewed(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1")
+    token = client.cookies.get(constant.SESSION_COOKIE)
+    # 로그인한 요청마다 쿠키 유효기간을 다시 내려줌
+    r = client.get("/account")
+    cookie = [v for v in r.headers.get_list("set-cookie") if v.startswith(f"{constant.SESSION_COOKIE}=")]
+    assert len(cookie) == 1
+    assert f"{constant.SESSION_COOKIE}={token}" in cookie[0]
+    assert f"Max-Age={constant.WEB_SESSION_SECONDS}" in cookie[0]
+    # 로그아웃 응답은 쿠키 삭제만 하고 다시 싣지 않음
+    r = client.post("/auth/logout", follow_redirects=False)
+    cookie = [v for v in r.headers.get_list("set-cookie") if v.startswith(f"{constant.SESSION_COOKIE}=")]
+    assert len(cookie) == 1 and "Max-Age=0" in cookie[0]
+    # 비로그인 요청에는 쿠키를 싣지 않음
+    client.cookies.clear()
+    assert "set-cookie" not in client.get("/login").headers

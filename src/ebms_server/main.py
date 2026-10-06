@@ -63,6 +63,7 @@ app.mount(
     name="static",
 )
 app.include_router(auth.router)
+app.middleware("http")(auth.refresh_session_cookie)
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
