@@ -14,7 +14,7 @@ import pymysql
 from . import constant, db
 
 # 세션 종류별 유효기간(초). 쓸 때마다 이만큼 연장됩니다.
-SESSION_SECONDS = {"web": constant.WEB_SESSION_SECONDS}
+SESSION_SECONDS = {"web": constant.WEB_SESSION_SECONDS, "client": constant.CLIENT_SESSION_SECONDS}
 # last_used_at/expires_at 갱신 최소 간격. 요청마다 UPDATE하지 않기 위함입니다.
 TOUCH_INTERVAL = 60
 
@@ -263,3 +263,46 @@ def revoke_session(user_id: str, session_id: int) -> bool:
         changed = cur.rowcount > 0
         con.commit()
     return changed
+
+
+def create_auth_code(user_id: str, code_challenge: str, redirect_uri: str, device_name: str) -> str:
+    """클라이언트 로그인용 1회용 코드를 만들고 원문을 반환합니다."""
+    code = secrets.token_urlsafe(32)
+    now = int(time.time())
+    with db.connect() as con, con.cursor() as cur:
+        # 쓰였거나 만료된 코드는 더 필요 없으므로 새로 만들 때 같이 지웁니다.
+        cur.execute("DELETE FROM auth_code WHERE expires_at < %s", (now - 3600,))
+        cur.execute(
+            """
+            INSERT INTO auth_code (code_sha256, user_id, code_challenge, redirect_uri, device_name, created_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (token_hash(code), user_id, code_challenge, redirect_uri, device_name[:255], now, now + constant.AUTH_CODE_SECONDS),
+        )
+        con.commit()
+    return code
+
+
+def consume_auth_code(code: str) -> tuple[str, str, str] | None:
+    """유효한 코드를 사용 처리하고 (user_id, code_challenge, device_name)을 반환합니다.
+
+    코드는 PKCE 검증 결과와 상관없이 한 번만 쓸 수 있습니다. 없거나 만료·사용됐으면 None.
+    """
+    now = int(time.time())
+    with db.connect() as con, con.cursor() as cur:
+        # 동시에 같은 코드로 요청해도 UPDATE에 성공한 한 쪽만 통과합니다.
+        cur.execute(
+            "UPDATE auth_code SET used_at = %s WHERE code_sha256 = %s AND used_at IS NULL AND expires_at > %s",
+            (now, token_hash(code), now),
+        )
+        if cur.rowcount != 1:
+            con.commit()
+            return None
+        cur.execute(
+            "SELECT user_id, code_challenge, device_name FROM auth_code WHERE code_sha256 = %s",
+            (token_hash(code),),
+        )
+        row = cur.fetchone()
+        con.commit()
+    return tuple(row) if row else None
+

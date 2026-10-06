@@ -1,13 +1,17 @@
-"""Google·Discord 웹 로그인, 웹 세션 쿠키, 내 계정 페이지.
+"""Google·Discord 웹 로그인, 웹 세션 쿠키, 내 계정 페이지, 클라이언트 로그인.
 
 OAuth 진행 중에만 필요한 state·PKCE verifier는 DB 대신 서명된 단기 쿠키에 둡니다.
 로그인이 끝나면 OAuth 토큰은 버리고 user 세션만 발급합니다.
+
+클라이언트는 루프백 리다이렉트 + PKCE(RFC 8252)로 1회용 코드를 받아 세션키로 바꾸고,
+이후 `Authorization: Bearer <세션키>`로 API를 호출합니다.
 """
 import base64
 import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
 import urllib.parse
@@ -17,6 +21,7 @@ from typing import Annotated, Callable
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from pydantic import BaseModel
 
 from . import accounts, constant
 from .accounts import Profile, User
@@ -219,10 +224,35 @@ async def refresh_session_cookie(request: Request, call_next):
     return response
 
 
-def current_user(session: Annotated[tuple[User, int] | None, Depends(optional_session)]) -> User:
-    """웹 세션 쿠키로 로그인한 사용자. 없으면 401."""
+def bearer_token(request: Request) -> str | None:
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def optional_api_session(request: Request) -> tuple[User, int, str] | None:
+    """API 요청의 (user, session id, 세션 종류). 클라이언트는 Bearer 세션키, 웹은 쿠키입니다.
+
+    Authorization 헤더가 있으면 그것만 봅니다(틀린 세션키를 쿠키로 덮지 않음).
+    """
+    if "authorization" in request.headers:
+        token = bearer_token(request)
+        session = accounts.authenticate(token, "client") if token else None
+        return (*session, "client") if session else None
+    session = optional_session(request)
+    return (*session, "web") if session else None
+
+
+def api_session(session: Annotated[tuple[User, int, str] | None, Depends(optional_api_session)]) -> tuple[User, int, str]:
+    """로그인한 API 요청. 없거나 만료·폐기된 세션이면 401."""
     if session is None:
-        raise HTTPException(status_code=401, detail="login required")
+        raise HTTPException(status_code=401, detail="login required", headers={"WWW-Authenticate": "Bearer"})
+    return session
+
+
+def current_user(session: Annotated[tuple[User, int, str], Depends(api_session)]) -> User:
+    """세션키(Bearer) 또는 웹 세션 쿠키로 로그인한 사용자. 없으면 401."""
     return session[0]
 
 
@@ -401,3 +431,120 @@ def delete_session(session_id: int, user: Annotated[User, Depends(current_user)]
     if not accounts.revoke_session(user.id, session_id):
         raise HTTPException(status_code=404, detail="session not found")
     return Response(status_code=204)
+
+
+# ---- 클라이언트 로그인 ----
+
+# base64url(sha256(code_verifier)), 패딩 없음
+_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+# RFC 7636 code_verifier
+_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+DEFAULT_DEVICE_NAME = "EBMS 클라이언트"
+
+
+def is_loopback_redirect(uri: str) -> bool:
+    """클라이언트가 로그인 결과를 받을 주소. http://127.0.0.1:<포트>/... 만 허용합니다."""
+    if len(uri) > 255:
+        return False
+    parts = urllib.parse.urlsplit(uri)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and port is not None
+        and parts.netloc == f"127.0.0.1:{port}"
+        and not parts.fragment
+    )
+
+
+def _with_query(uri: str, params: dict) -> str:
+    parts = urllib.parse.urlsplit(uri)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True) + list(params.items())
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def _user_json(user: User) -> dict:
+    return {"id": user.id, "display_name": user.display_name, "email": user.email, "role": user.role}
+
+
+@router.get("/auth/client/authorize")
+def client_authorize(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+    redirect_uri: str = "",
+    state: str = "",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
+    device_name: str = "",
+):
+    """클라이언트 로그인 시작. 웹에 로그인돼 있으면 1회용 코드를 붙여 클라이언트로 돌려보냅니다."""
+    if (
+        not is_loopback_redirect(redirect_uri)
+        or not state or len(state) > 512
+        or code_challenge_method != "S256"
+        or not _CHALLENGE_RE.fullmatch(code_challenge)
+    ):
+        return _message(
+            request, "로그인 실패",
+            "클라이언트 로그인 요청이 올바르지 않습니다. 클라이언트에서 다시 로그인해 주세요.",
+            400, back="/account",
+        )
+    if session is None:
+        return _login_redirect(request)
+    code = accounts.create_auth_code(
+        session[0].id, code_challenge, redirect_uri, device_name.strip() or DEFAULT_DEVICE_NAME,
+    )
+    return RedirectResponse(_with_query(redirect_uri, {"code": code, "state": state}), status_code=303)
+
+
+class ClientTokenRequest(BaseModel):
+    code: str
+    code_verifier: str
+
+
+@router.post("/api/auth/client/token")
+def client_token(body: ClientTokenRequest):
+    """1회용 코드 + code_verifier를 세션키로 바꿉니다. 코드는 성공 여부와 상관없이 한 번만 쓸 수 있습니다."""
+    found = accounts.consume_auth_code(body.code)
+    if found is None:
+        raise HTTPException(status_code=400, detail="invalid or expired code")
+    user_id, challenge, device_name = found
+    if not _VERIFIER_RE.fullmatch(body.code_verifier) or not hmac.compare_digest(
+        _b64(hashlib.sha256(body.code_verifier.encode()).digest()), challenge
+    ):
+        raise HTTPException(status_code=400, detail="invalid code_verifier")
+    user = accounts.get_user(user_id)
+    if user is None or user.status != "active":
+        raise HTTPException(status_code=403, detail="account suspended")
+    token = accounts.create_session(user.id, "client", device_name)
+    return {
+        "session_key": token,
+        "expires_at": int(time.time()) + constant.CLIENT_SESSION_SECONDS,
+        "user": _user_json(user),
+    }
+
+
+@router.post("/api/auth/client/logout", status_code=204)
+def client_logout(request: Request):
+    """현재 클라이언트 세션키를 폐기합니다."""
+    token = bearer_token(request)
+    session = accounts.authenticate(token, "client") if token else None
+    if session is None:
+        raise HTTPException(status_code=401, detail="login required", headers={"WWW-Authenticate": "Bearer"})
+    accounts.revoke_session(session[0].id, session[1])
+    return Response(status_code=204)
+
+
+@router.get("/api/me")
+def get_me(session: Annotated[tuple[User, int, str], Depends(api_session)]):
+    user, _, kind = session
+    return {
+        **_user_json(user),
+        "oauths": [
+            {"oauth": i.oauth, "name": i.name or i.email or ""}
+            for i in accounts.list_identities(user.id)
+        ],
+        "session": {"kind": kind},
+    }

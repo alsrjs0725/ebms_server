@@ -42,6 +42,10 @@ SESSION_COOKIE = "ebms_session"
 WEB_SESSION_SECONDS = 30 * 24 * 3600
 # OAuth 로그인 화면에 다녀오는 동안의 state 쿠키 유효기간
 OAUTH_STATE_SECONDS = 600
+# 클라이언트 세션키 유효기간. 쓸 때마다 연장됩니다.
+CLIENT_SESSION_SECONDS = 90 * 24 * 3600
+# 클라이언트 로그인용 1회용 코드 유효기간
+AUTH_CODE_SECONDS = 60
 
 if __name__ == "__main__":
     print(DB_HOST, DB_PORT, DB_NAME)

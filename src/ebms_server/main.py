@@ -154,7 +154,9 @@ def get_version():
         server = importlib.metadata.version("ebms-server")
     except importlib.metadata.PackageNotFoundError:
         server = None
-    return {"api": constant.API_VERSION, "server": server}
+    # 로그인 가능한 OAuth. 클라이언트가 로그인 필요 여부와 수단을 알 수 있게 합니다.
+    auth_oauths = [p.name for p in auth.configured_oauths()]
+    return {"api": constant.API_VERSION, "server": server, "auth": auth_oauths}
 
 @app.get("/api/files/chart/{chunk_id}")
 def download_chart_chunk_file(chunk_id: int, request: Request):
