@@ -16,6 +16,5 @@ docker compose up -d --build
 | 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 필요 | 방화벽/리버스 프록시에서 열어야 하는 유일한 포트 |
 | 3306/tcp | MySQL | 불필요 | 호스트에 바인딩하지 않음. compose 내부 네트워크에서 `ebms` 컨테이너만 접근 |
 
-- MySQL 데이터는 `mysql-data`, 서버 런타임 파일(`var/`)은 `ebms-var` 볼륨에 유지됩니다.
-- `docker/mysql/init/*.sql`은 MySQL 볼륨이 비어 있을 때 최초 1회만 실행됩니다.
-  스키마를 바꾼 뒤 다시 적용하려면 `docker compose down -v`로 볼륨을 지우세요.
+- 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
+- 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
