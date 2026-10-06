@@ -1,11 +1,14 @@
 import io
 import os
+import gzip
+import json
 import pathlib
 import hashlib
 import logging
 import shutil
 import zipfile
 import threading
+from collections import defaultdict
 from collections.abc import Iterator
 
 import pymysql
@@ -19,6 +22,9 @@ SCHEMA = [
             size BIGINT UNSIGNED NOT NULL,
             sha256 CHAR(64) NOT NULL,
             data LONGBLOB NOT NULL,
+            -- 매니페스트용: 원래 곡 폴더명과 zip 항목 목록(JSON)
+            folder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            files MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
 
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -43,7 +49,75 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    """
+        CREATE TABLE IF NOT EXISTS manifest_chunk(
+            id INT UNSIGNED NOT NULL,
+            -- 압축을 푼 JSON의 sha256
+            sha256 CHAR(64) NOT NULL,
+            -- gzip으로 압축한 JSON
+            data LONGBLOB NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
+
+# 이전 버전에서 만든 테이블에 없는 컬럼
+MISSING_COLUMNS = [
+    ("song", "folder", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
+    ("song", "files", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+]
+
+
+def zip_entries(data: bytes) -> list[dict]:
+    """zip 안의 파일 항목을 매니페스트 형식으로 반환합니다. offset은 local file header의 위치입니다."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return [
+            {
+                "path": info.filename,
+                "size": info.file_size,
+                "offset": info.header_offset,
+                "comp_size": info.compress_size,
+                "crc32": f"{info.CRC:08x}",
+                "method": info.compress_type,
+            }
+            for info in zf.infolist()
+            if not info.is_dir()
+        ]
+
+
+def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
+    """chart chunk 안의 항목 이름. 곡마다 같은 파일명이 있을 수 있어 sha256을 이름으로 씁니다."""
+    return f"{sha256}{path.suffix.lower()}"
+
+
+class BlobReader:
+    """한 스냅샷에서 BLOB을 나눠 읽습니다. iter_range를 끝까지 돌거나 close를 호출하면 연결을 닫습니다."""
+
+    def __init__(self, con, cur, table: str, row_id: int, size: int, sha256: str):
+        self._con = con
+        self._cur = cur
+        self.table = table
+        self.row_id = row_id
+        self.size = size
+        self.sha256 = sha256
+
+    def iter_range(self, start: int, end: int) -> Iterator[bytes]:
+        """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
+        try:
+            step = constant.BLOB_READ_SIZE
+            for pos in range(start + 1, end + 2, step):
+                self._cur.execute(
+                    f"SELECT SUBSTRING(data, %s, %s) FROM {self.table} WHERE id = %s",
+                    (pos, min(step, end + 2 - pos), self.row_id),
+                )
+                yield self._cur.fetchone()[0]
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self._con.open:
+            self._con.close()
 
 
 def connect(**kwargs) -> pymysql.connections.Connection:
@@ -78,6 +152,7 @@ class Database:
 
         self.logger = logging.getLogger(__name__)
         self.generate_database()
+        self.backfill_manifest()
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT @@max_allowed_packet")
             self.max_allowed_packet = cur.fetchone()[0]
@@ -93,12 +168,23 @@ class Database:
         with connect() as con, con.cursor() as cur:
             for com in SCHEMA:
                 cur.execute(com)
+            for table, column, definition in MISSING_COLUMNS:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                    """,
+                    (table, column),
+                )
+                if cur.fetchone()[0] == 0:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                    self.logger.info(f"generate_database: Added column {table}.{column}")
             con.commit()
 
     def _fits_packet(self, size: int) -> bool:
         return size + constant.PACKET_OVERHEAD <= self.max_allowed_packet
 
-    def _append_charts_to_chunk(self, cur, chart_files: list[pathlib.Path]) -> None:
+    def _append_charts_to_chunk(self, cur, chart_files: list[tuple[pathlib.Path, str]]) -> None:
         """mutable한 chart chunk에 chart 파일들을 추가합니다. chunk가 BYTE_PER_CHUNK를 넘었다면 새 chunk를 만듭니다."""
         cur.execute("SELECT id, size FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE")
         row = cur.fetchone()
@@ -113,8 +199,8 @@ class Database:
 
         buf = io.BytesIO(data)
         with zipfile.ZipFile(buf, mode="a", compression=zipfile.ZIP_STORED) as zf:
-            for chart_file_path in chart_files:
-                zf.write(chart_file_path, arcname=chart_file_path.name)
+            for chart_file_path, sha256 in chart_files:
+                zf.write(chart_file_path, arcname=chart_arcname(sha256, chart_file_path))
         data = buf.getvalue()
 
         if not self._fits_packet(len(data)):
@@ -129,6 +215,106 @@ class Database:
             """,
             (chunk_no, len(data), hashlib.sha256(data).hexdigest(), data),
         )
+
+    def _rebuild_manifest_chunk(self, cur, chunk_no: int) -> None:
+        """chunk_no에 속한 곡들의 매니페스트를 다시 만들어 저장합니다."""
+        lo = chunk_no * constant.SONGS_PER_MANIFEST_CHUNK
+        hi = lo + constant.SONGS_PER_MANIFEST_CHUNK
+        cur.execute(
+            "SELECT song_id, id FROM chart WHERE song_id >= %s AND song_id < %s ORDER BY song_id, id",
+            (lo, hi),
+        )
+        charts = defaultdict(list)
+        for song_id, chart_id in cur.fetchall():
+            charts[song_id].append(chart_id)
+
+        cur.execute(
+            "SELECT id, folder, size, sha256, files FROM song WHERE id >= %s AND id < %s ORDER BY id",
+            (lo, hi),
+        )
+        songs = [
+            {
+                "song_id": song_id,
+                "folder": folder,
+                "zip_size": size,
+                "zip_sha256": sha256,
+                "charts": charts[song_id],
+                "files": json.loads(files) if files else [],
+            }
+            for song_id, folder, size, sha256, files in cur.fetchall()
+        ]
+        body = json.dumps(songs, ensure_ascii=False, separators=(",", ":")).encode()
+        data = gzip.compress(body, mtime=0)
+        cur.execute(
+            """
+            INSERT INTO manifest_chunk (id, sha256, data) VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE sha256 = VALUES(sha256), data = VALUES(data)
+            """,
+            (chunk_no, hashlib.sha256(body).hexdigest(), data),
+        )
+
+    def backfill_manifest(self) -> None:
+        """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
+        원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다."""
+        with self._write_lock, connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM song WHERE files IS NULL ORDER BY id")
+            song_ids = [row[0] for row in cur.fetchall()]
+            if not song_ids:
+                return
+            try:
+                for song_id in song_ids:
+                    cur.execute("SELECT data FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    files = zip_entries(cur.fetchone()[0])
+                    cur.execute(
+                        "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
+                        (str(song_id), json.dumps(files), song_id),
+                    )
+                for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in song_ids}):
+                    self._rebuild_manifest_chunk(cur, chunk_no)
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
+            self.logger.info(f"backfill_manifest: Filled manifest of {len(song_ids)} songs.")
+
+    def migrate_chart_chunk_names(self) -> int:
+        """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
+
+        같은 이름의 항목이 여러 개 있어도 항목 순서대로 내용을 읽어 각각의 해시로 이름을 붙입니다.
+        """
+        changed = 0
+        with self._write_lock, connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id")
+            chunk_ids = [row[0] for row in cur.fetchall()]
+            try:
+                for chunk_no in chunk_ids:
+                    cur.execute("SELECT data FROM chart_chunk WHERE id = %s FOR UPDATE", (chunk_no,))
+                    old = cur.fetchone()[0]
+                    buf = io.BytesIO()
+                    renamed = False
+                    with zipfile.ZipFile(io.BytesIO(old)) as src, \
+                            zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as dst:
+                        for info in src.infolist():
+                            content = src.read(info)
+                            name = chart_arcname(
+                                hashlib.sha256(content).hexdigest(), pathlib.PurePosixPath(info.filename)
+                            )
+                            renamed |= name != info.filename
+                            dst.writestr(zipfile.ZipInfo(name, date_time=info.date_time), content)
+                    if not renamed:
+                        continue
+                    data = buf.getvalue()
+                    cur.execute(
+                        "UPDATE chart_chunk SET size = %s, sha256 = %s, data = %s WHERE id = %s",
+                        (len(data), hashlib.sha256(data).hexdigest(), data, chunk_no),
+                    )
+                    changed += 1
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
+        self.logger.info(f"migrate_chart_chunk_names: Rewrote {changed} of {len(chunk_ids)} chunks.")
+        return changed
 
     def insert_song(self, song_path:os.PathLike, remove=False) -> None:
         """BMS 노래 한 곡을 DB에 추가할 수 있는 함수입니다
@@ -176,6 +362,7 @@ class Database:
 
                 bms_files.append((file_path, size, sha256))
 
+            new_song = False
             try:
                 if (song_id is None):
                     data = self.create_zip(root)
@@ -187,9 +374,16 @@ class Database:
                         return
 
                     cur.execute(
-                        "INSERT INTO song (size, sha256, data) VALUES (%s, %s, %s)",
-                        (len(data), hashlib.sha256(data).hexdigest(), data),
+                        "INSERT INTO song (size, sha256, data, folder, files) VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            len(data),
+                            hashlib.sha256(data).hexdigest(),
+                            data,
+                            root.resolve().name,
+                            json.dumps(zip_entries(data)),
+                        ),
                     )
+                    new_song = True
                     song_id = cur.lastrowid
 
                     self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
@@ -201,9 +395,11 @@ class Database:
                         (str(sha256), song_id, size),
                     )
                     if cur.rowcount == 1:
-                        new_charts.append(chart_file_path)
+                        new_charts.append((chart_file_path, sha256))
                 if new_charts:
                     self._append_charts_to_chunk(cur, new_charts)
+                if new_song or new_charts:
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
                 con.commit()
             except Exception:
                 con.rollback()
@@ -316,14 +512,26 @@ class Database:
             row = cur.fetchone()
             return row[0] if row else None
 
-    def open_blob(self, table: str, row_id: int) -> tuple[int, Iterator[bytes]] | None:
-        """song / chart_chunk 테이블의 BLOB을 BLOB_READ_SIZE 단위로 나눠 읽습니다.
+    def get_manifest_hash(self) -> dict[int, str]:
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id, sha256 FROM manifest_chunk ORDER BY id")
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_manifest_chunk(self, chunk_no: int) -> bytes | None:
+        """gzip으로 압축된 매니페스트 JSON을 반환합니다. 없는 chunk면 None."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT data FROM manifest_chunk WHERE id = %s", (chunk_no,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def open_blob(self, table: str, row_id: int) -> BlobReader | None:
+        """song / chart_chunk 테이블의 BLOB을 BLOB_READ_SIZE 단위로 나눠 읽을 준비를 합니다.
 
         큰 파일을 한 번에 메모리에 올리지 않고, max_allowed_packet보다 큰 응답도 피하기 위함입니다.
-        크기와 내용은 같은 스냅샷에서 읽으므로 읽는 도중 chunk가 갱신되어도 일치합니다.
+        크기, 해시, 내용은 같은 스냅샷에서 읽으므로 읽는 도중 chunk가 갱신되어도 일치합니다.
 
         Returns:
-            (BLOB 크기, bytes iterator). 존재하지 않는 id의 경우 None을 반환합니다.
+            BlobReader. 존재하지 않는 id의 경우 None을 반환합니다.
         """
         if table not in ("song", "chart_chunk"):
             raise ValueError(table)
@@ -331,7 +539,7 @@ class Database:
         try:
             cur = con.cursor()
             cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-            cur.execute(f"SELECT LENGTH(data) FROM {table} WHERE id = %s", (row_id,))
+            cur.execute(f"SELECT LENGTH(data), sha256 FROM {table} WHERE id = %s", (row_id,))
             row = cur.fetchone()
         except Exception:
             con.close()
@@ -339,18 +547,4 @@ class Database:
         if row is None:
             con.close()
             return None
-        size = row[0]
-
-        def iterator() -> Iterator[bytes]:
-            try:
-                step = constant.BLOB_READ_SIZE
-                for pos in range(1, size + 1, step):
-                    cur.execute(
-                        f"SELECT SUBSTRING(data, %s, %s) FROM {table} WHERE id = %s",
-                        (pos, step, row_id),
-                    )
-                    yield cur.fetchone()[0]
-            finally:
-                con.close()
-
-        return size, iterator()
+        return BlobReader(con, cur, table, row_id, row[0], row[1])
