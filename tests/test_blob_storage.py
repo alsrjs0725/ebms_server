@@ -115,7 +115,7 @@ def test_same_chart_name_in_different_songs(tmp_path, client):
     Database().insert_song(make_song(tmp_path, "s1", {"normal.bms": chart_a}))
     Database().insert_song(make_song(tmp_path, "s2", {"NORMAL.BMS": chart_b}))
     with zipfile.ZipFile(io.BytesIO(client.get("/api/files/chart/0").content)) as zf:
-        assert sorted(zf.namelist()) == sorted([f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bms"])
+        assert sorted(zf.namelist()) == sorted([f"{sha(chart_a)}.bms", f"{sha(chart_b)}.BMS"])
 
 
 def test_migrate_chart_chunk_names(tmp_path, client, database):

@@ -155,8 +155,9 @@ def zip_entries(data: bytes) -> list[dict]:
 
 
 def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
-    """chart chunk 안의 항목 이름. 곡마다 같은 파일명이 있을 수 있어 sha256을 이름으로 씁니다."""
-    return f"{sha256}{path.suffix.lower()}"
+    """chart chunk 안의 bms 파일 경로. 겹치지 않게 해시 기반으로 짓되, 기존 구동기와 확장자 호환을 위해 원래 확장자를 붙입니다."""
+    # return f"{sha256}{path.suffix.lower()}"
+    return f"{sha256}{path.suffix}"
 
 
 class BlobReader:
