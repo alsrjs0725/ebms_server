@@ -90,7 +90,7 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     if first:
         start = int(first)
         if last and int(last) < start:
-            return None
+            raise ValueError("invalid range")
         end = min(int(last), size - 1) if last else size - 1
     elif last:
         if int(last) == 0:

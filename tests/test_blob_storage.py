@@ -271,3 +271,38 @@ def test_add_missing_columns(database):
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT folder, files FROM song")
         assert cur.fetchall() == ()
+
+def test_parse_range():
+    from ebms_server.main import parse_range
+
+    # Happy paths
+    assert parse_range("bytes=10-20", 100) == (10, 20)
+    assert parse_range("bytes=10-", 100) == (10, 99)
+    assert parse_range("bytes=-20", 100) == (80, 99)
+    assert parse_range("bytes=0-0", 100) == (0, 0)
+    assert parse_range("bytes=99-99", 100) == (99, 99)
+
+    # Truncated ranges
+    assert parse_range("bytes=10-200", 100) == (10, 99)
+    assert parse_range("bytes=-200", 100) == (0, 99)
+
+    # Invalid ranges that fall back to full file
+    assert parse_range(None, 100) is None
+    assert parse_range("", 100) is None
+    assert parse_range("invalid", 100) is None
+    assert parse_range("bytes=a-b", 100) is None
+    assert parse_range("bytes=10-20,30-40", 100) is None
+    assert parse_range("bytes=-", 100) is None
+
+    # Error paths (unsatisfiable ranges)
+    with pytest.raises(ValueError):
+        parse_range("bytes=-0", 100)
+
+    with pytest.raises(ValueError):
+        parse_range("bytes=100-", 100)
+
+    with pytest.raises(ValueError):
+        parse_range("bytes=101-110", 100)
+
+    with pytest.raises(ValueError):
+        parse_range("bytes=20-10", 100)
