@@ -94,6 +94,9 @@ zip 안 항목 이름은 `{차트 sha256}{확장자 소문자}` (예: `3f1c...e9
     "zip_size": 51234567,
     "zip_sha256": "...",
     "charts": ["<차트 sha256>", "..."],
+    "chart_files": [
+      {"sha256": "<차트 sha256>", "path": "_7a.bme", "size": 12345}
+    ],
     "files": [
       {"path": "bgm01.ogg", "size": 12345, "offset": 0, "comp_size": 12000, "crc32": "1a2b3c4d", "method": 8}
     ]
@@ -102,6 +105,7 @@ zip 안 항목 이름은 `{차트 sha256}{확장자 소문자}` (예: `3f1c...e9
 ```
 
 - `folder`: 등록할 때의 곡 폴더명. 이전 버전에서 등록된 곡은 song id 문자열입니다.
+- `chart_files`: 차트별 SHA-256, 파일 경로(곡 zip 안 경로 또는 등록할 때의 파일명), 파일 크기 목록.
 - `files`: 곡 zip 안의 파일(디렉터리 제외). `offset`은 local file header 위치, `method`는 zip 압축 방식(0 무압축, 8 Deflate)입니다. 파일 하나만 받으려면 `offset`부터 30바이트를 받아 파일명/extra 길이(26~29바이트)를 읽고, 그 뒤 `comp_size` 바이트를 `Range`로 받습니다.
 
 ### `GET /api/files/song/id/{song_id}`
