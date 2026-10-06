@@ -1,4 +1,4 @@
-"""웹 로그인·계정 테스트. provider와의 통신(fetch_profile)은 가짜로 바꿉니다."""
+"""웹 로그인·계정 테스트. OAuth와의 통신(fetch_profile)은 가짜로 바꿉니다."""
 import urllib.parse
 
 import pymysql
@@ -37,31 +37,31 @@ def client(monkeypatch):
     Database._initialized = False
 
 
-def oauth(client, monkeypatch, provider, puid, *, email=None, verified=True, name="tester", link=False, next=None):
-    """start → (가짜 provider) → callback 을 거친 callback 응답을 반환합니다."""
+def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="tester", link=False, next=None):
+    """start → (가짜 oauth) → callback 을 거친 callback 응답을 반환합니다."""
     params = {}
     if link:
         params["link"] = "1"
     if next:
         params["next"] = next
-    r = client.get(f"/auth/{provider}/start", params=params, follow_redirects=False)
+    r = client.get(f"/auth/{oauth}/start", params=params, follow_redirects=False)
     assert r.status_code == 303, r.text
     location = urllib.parse.urlparse(r.headers["location"])
     query = urllib.parse.parse_qs(location.query)
-    assert query["redirect_uri"] == [f"http://testserver/auth/{provider}/callback"]
+    assert query["redirect_uri"] == [f"http://testserver/auth/{oauth}/callback"]
     seen = {}
 
     def fake_fetch_profile(p, code, verifier):
         seen["verifier"] = verifier
-        return Profile(provider, puid, email, verified, name)
+        return Profile(oauth, puid, email, verified, name)
 
     monkeypatch.setattr(auth, "fetch_profile", fake_fetch_profile)
     r = client.get(
-        f"/auth/{provider}/callback",
+        f"/auth/{oauth}/callback",
         params={"code": "c", "state": query["state"][0]},
         follow_redirects=False,
     )
-    if provider == "google":
+    if oauth == "google":
         # PKCE: 쿠키에 둔 verifier가 보낸 challenge와 맞아야 함
         challenge = auth._b64(__import__("hashlib").sha256(seen["verifier"].encode()).digest())
         assert query["code_challenge"] == [challenge]
@@ -90,7 +90,7 @@ def test_login_creates_user_and_session(client, monkeypatch):
     assert r.status_code == 200
     assert "Alice" in r.text and user.id in r.text
 
-    # 같은 provider 계정으로 다시 로그인하면 같은 user, 이전 웹 세션은 폐기
+    # 같은 OAuth 계정으로 다시 로그인하면 같은 user, 이전 웹 세션은 폐기
     old_token = client.cookies.get(constant.SESSION_COOKIE)
     oauth(client, monkeypatch, "google", "g1", email="a@example.com")
     assert me(client).id == user.id
@@ -106,12 +106,12 @@ def test_other_provider_without_link_is_new_user(client, monkeypatch):
     assert me(client).id != first
 
 
-def test_link_and_login_with_either_provider(client, monkeypatch):
+def test_link_and_login_with_either_oauth(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1")
     user_id = me(client).id
     r = oauth(client, monkeypatch, "discord", "d1", link=True, name="disc")
     assert r.status_code == 303
-    assert [i.provider for i in accounts.list_identities(user_id)] == ["google", "discord"]
+    assert [i.oauth for i in accounts.list_identities(user_id)] == ["google", "discord"]
 
     client.post("/auth/logout")
     oauth(client, monkeypatch, "discord", "d1")
@@ -143,7 +143,7 @@ def test_unlink(client, monkeypatch):
     oauth(client, monkeypatch, "discord", "d1", link=True)
     r = client.delete(f"/api/account/identities/{google.id}")
     assert r.status_code == 204
-    assert [i.provider for i in accounts.list_identities(user_id)] == ["discord"]
+    assert [i.oauth for i in accounts.list_identities(user_id)] == ["discord"]
 
     # 다른 사람의 연결은 건드릴 수 없음
     client.post("/auth/logout")
@@ -199,7 +199,7 @@ def test_banned_user_cannot_login(client, monkeypatch):
     assert r.status_code == 403
 
 
-def test_bad_state_and_unknown_provider(client, monkeypatch):
+def test_bad_state_and_unknown_oauth(client, monkeypatch):
     client.get("/auth/google/start", follow_redirects=False)
     r = client.get("/auth/google/callback", params={"code": "c", "state": "wrong"})
     assert r.status_code == 400

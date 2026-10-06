@@ -1,6 +1,6 @@
 """계정·로그인 수단·세션 저장소입니다.
 
-계정은 내부 UUID(user.id)로만 구분합니다. provider는 로그인 순간 UUID를 찾는 데만 쓰고,
+계정은 내부 UUID(user.id)로만 구분합니다. OAuth는 로그인 순간 UUID를 찾는 데만 쓰고,
 세션과 권한은 모두 user.id에 붙습니다. 세션 토큰은 원문 대신 sha256만 저장합니다.
 """
 import hashlib
@@ -35,8 +35,8 @@ class User:
 @dataclass
 class Identity:
     id: int
-    provider: str
-    provider_user_id: str
+    oauth: str
+    oauth_user_id: str
     email: str | None
     name: str
     linked_at: int
@@ -54,9 +54,9 @@ class Session:
 
 @dataclass
 class Profile:
-    """provider가 알려준 사용자 정보."""
-    provider: str
-    provider_user_id: str
+    """OAuth가 알려준 사용자 정보."""
+    oauth: str
+    oauth_user_id: str
     email: str | None
     email_verified: bool
     name: str
@@ -81,7 +81,7 @@ def get_user(user_id: str) -> User | None:
 
 
 def login(profile: Profile) -> User:
-    """provider 계정으로 로그인합니다. 처음 보는 provider 계정이면 새 user를 만듭니다.
+    """OAuth 계정으로 로그인합니다. 처음 보는 OAuth 계정이면 새 user를 만듭니다.
 
     이메일이 같아도 기존 user에 자동으로 합치지 않습니다.
     """
@@ -89,7 +89,7 @@ def login(profile: Profile) -> User:
         try:
             return _login(profile)
         except pymysql.err.IntegrityError:
-            # 같은 provider 계정의 첫 로그인이 동시에 들어와 다른 쪽이 먼저 만든 경우. 다시 찾으면 있습니다.
+            # 같은 OAuth 계정의 첫 로그인이 동시에 들어와 다른 쪽이 먼저 만든 경우. 다시 찾으면 있습니다.
             if attempt:
                 raise
     raise AssertionError("unreachable")
@@ -100,15 +100,15 @@ def _login(profile: Profile) -> User:
     with db.connect() as con, con.cursor() as cur:
         try:
             cur.execute(
-                "SELECT user_id FROM user_identity WHERE provider = %s AND provider_user_id = %s",
-                (profile.provider, profile.provider_user_id),
+                "SELECT user_id FROM user_identity WHERE oauth = %s AND oauth_user_id = %s",
+                (profile.oauth, profile.oauth_user_id),
             )
             row = cur.fetchone()
             if row:
                 user_id = row[0]
                 cur.execute(
-                    "UPDATE user_identity SET email = %s, name = %s WHERE provider = %s AND provider_user_id = %s",
-                    (profile.email, profile.name, profile.provider, profile.provider_user_id),
+                    "UPDATE user_identity SET email = %s, name = %s WHERE oauth = %s AND oauth_user_id = %s",
+                    (profile.email, profile.name, profile.oauth, profile.oauth_user_id),
                 )
             else:
                 user_id = str(uuid.uuid4())
@@ -130,23 +130,23 @@ def _login(profile: Profile) -> User:
 def _insert_identity(cur, user_id: str, profile: Profile, now: int) -> None:
     cur.execute(
         """
-        INSERT INTO user_identity (user_id, provider, provider_user_id, email, name, linked_at)
+        INSERT INTO user_identity (user_id, oauth, oauth_user_id, email, name, linked_at)
         VALUES (%s, %s, %s, %s, %s, %s)
         """,
-        (user_id, profile.provider, profile.provider_user_id, profile.email, profile.name, now),
+        (user_id, profile.oauth, profile.oauth_user_id, profile.email, profile.name, now),
     )
 
 
 def link(user_id: str, profile: Profile) -> str:
-    """provider 계정을 user에 연결합니다.
+    """OAuth 계정을 user에 연결합니다.
 
     반환값: "linked"(새로 연결), "already"(이미 이 user에 연결됨), "taken"(다른 user에 연결돼 있어 거부)
     """
     now = int(time.time())
     with db.connect() as con, con.cursor() as cur:
         cur.execute(
-            "SELECT user_id FROM user_identity WHERE provider = %s AND provider_user_id = %s",
-            (profile.provider, profile.provider_user_id),
+            "SELECT user_id FROM user_identity WHERE oauth = %s AND oauth_user_id = %s",
+            (profile.oauth, profile.oauth_user_id),
         )
         row = cur.fetchone()
         if row:
@@ -166,7 +166,7 @@ def list_identities(user_id: str) -> list[Identity]:
     with db.connect() as con, con.cursor() as cur:
         cur.execute(
             """
-            SELECT id, provider, provider_user_id, email, name, linked_at
+            SELECT id, oauth, oauth_user_id, email, name, linked_at
             FROM user_identity WHERE user_id = %s ORDER BY id
             """,
             (user_id,),
@@ -175,7 +175,7 @@ def list_identities(user_id: str) -> list[Identity]:
 
 
 def unlink(user_id: str, identity_id: int) -> str:
-    """provider 연결을 해제합니다. 반환값: "ok", "not_found", "last"(마지막 1개라 거부)"""
+    """OAuth 연결을 해제합니다. 반환값: "ok", "not_found", "last"(마지막 1개라 거부)"""
     with db.connect() as con, con.cursor() as cur:
         try:
             # 동시에 두 개를 해제해 0개가 되지 않도록 user의 연결을 잠근 뒤 셉니다.

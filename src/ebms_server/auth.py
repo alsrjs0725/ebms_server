@@ -1,7 +1,7 @@
 """Google·Discord 웹 로그인, 웹 세션 쿠키, 내 계정 페이지.
 
 OAuth 진행 중에만 필요한 state·PKCE verifier는 DB 대신 서명된 단기 쿠키에 둡니다.
-로그인이 끝나면 provider 토큰은 버리고 user 세션만 발급합니다.
+로그인이 끝나면 OAuth 토큰은 버리고 user 세션만 발급합니다.
 """
 import base64
 import hashlib
@@ -31,7 +31,7 @@ _fallback_secret = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
-class Provider:
+class OAuth:
     name: str
     label: str
     authorize_url: str
@@ -60,8 +60,8 @@ class Provider:
 
 def _google_profile(data: dict) -> Profile:
     return Profile(
-        provider="google",
-        provider_user_id=str(data["sub"]),
+        oauth="google",
+        oauth_user_id=str(data["sub"]),
         email=data.get("email"),
         email_verified=bool(data.get("email_verified")),
         name=data.get("name") or data.get("email") or "",
@@ -70,18 +70,18 @@ def _google_profile(data: dict) -> Profile:
 
 def _discord_profile(data: dict) -> Profile:
     return Profile(
-        provider="discord",
-        provider_user_id=str(data["id"]),
+        oauth="discord",
+        oauth_user_id=str(data["id"]),
         email=data.get("email"),
         email_verified=bool(data.get("verified")),
         name=data.get("global_name") or data.get("username") or "",
     )
 
 
-PROVIDERS = {
+OAUTHS = {
     p.name: p
     for p in (
-        Provider(
+        OAuth(
             name="google",
             label="Google",
             authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
@@ -91,7 +91,7 @@ PROVIDERS = {
             pkce=True,
             parse_profile=_google_profile,
         ),
-        Provider(
+        OAuth(
             name="discord",
             label="Discord",
             authorize_url="https://discord.com/oauth2/authorize",
@@ -105,35 +105,35 @@ PROVIDERS = {
 }
 
 
-def configured_providers() -> list[Provider]:
-    return [p for p in PROVIDERS.values() if p.configured]
+def configured_oauths() -> list[OAuth]:
+    return [p for p in OAUTHS.values() if p.configured]
 
 
-def get_provider(name: str) -> Provider:
-    provider = PROVIDERS.get(name)
-    if provider is None or not provider.configured:
-        raise HTTPException(status_code=404, detail="unknown provider")
-    return provider
+def get_oauth(name: str) -> OAuth:
+    oauth = OAUTHS.get(name)
+    if oauth is None or not oauth.configured:
+        raise HTTPException(status_code=404, detail="unknown oauth")
+    return oauth
 
 
-def fetch_profile(provider: Provider, code: str, code_verifier: str) -> Profile:
+def fetch_profile(oauth: OAuth, code: str, code_verifier: str) -> Profile:
     """authorization code를 access token으로 바꾸고 사용자 정보를 가져옵니다."""
     form = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": provider.redirect_uri,
-        "client_id": provider.client_id,
-        "client_secret": provider.client_secret,
+        "redirect_uri": oauth.redirect_uri,
+        "client_id": oauth.client_id,
+        "client_secret": oauth.client_secret,
     }
-    if provider.pkce:
+    if oauth.pkce:
         form["code_verifier"] = code_verifier
     with httpx.Client(timeout=10) as http:
-        r = http.post(provider.token_url, data=form, headers={"Accept": "application/json"})
+        r = http.post(oauth.token_url, data=form, headers={"Accept": "application/json"})
         r.raise_for_status()
         access_token = r.json()["access_token"]
-        r = http.get(provider.userinfo_url, headers={"Authorization": f"Bearer {access_token}"})
+        r = http.get(oauth.userinfo_url, headers={"Authorization": f"Bearer {access_token}"})
         r.raise_for_status()
-        return provider.parse_profile(r.json())
+        return oauth.parse_profile(r.json())
 
 
 # ---- 서명된 쿠키 ----
@@ -222,41 +222,41 @@ def login_page(request: Request, session: Annotated[tuple[User, int] | None, Dep
         request=request,
         name="pages/login.html",
         context={
-            "providers": configured_providers(),
+            "oauths": configured_oauths(),
             "next": safe_next(next),
             "user": session[0] if session else None,
         },
     )
 
 
-@router.get("/auth/{provider_name}/start")
+@router.get("/auth/{oauth_name}/start")
 def auth_start(
-    provider_name: str,
+    oauth_name: str,
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(optional_session)],
     next: str | None = None,
     link: bool = False,
 ):
-    provider = get_provider(provider_name)
+    oauth = get_oauth(oauth_name)
     if link and session is None:
         return _login_redirect(request)
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(48)
     params = {
-        "client_id": provider.client_id,
-        "redirect_uri": provider.redirect_uri,
+        "client_id": oauth.client_id,
+        "redirect_uri": oauth.redirect_uri,
         "response_type": "code",
-        "scope": provider.scope,
+        "scope": oauth.scope,
         "state": state,
     }
-    if provider.pkce:
+    if oauth.pkce:
         params["code_challenge"] = _b64(hashlib.sha256(verifier.encode()).digest())
         params["code_challenge_method"] = "S256"
-    if provider.name == "google":
+    if oauth.name == "google":
         params["prompt"] = "select_account"
-    response = RedirectResponse(f"{provider.authorize_url}?{urllib.parse.urlencode(params)}", status_code=303)
+    response = RedirectResponse(f"{oauth.authorize_url}?{urllib.parse.urlencode(params)}", status_code=303)
     cookie = sign({
-        "p": provider.name,
+        "p": oauth.name,
         "s": state,
         "v": verifier,
         "n": safe_next(next),
@@ -271,37 +271,37 @@ def auth_start(
     return response
 
 
-@router.get("/auth/{provider_name}/callback")
+@router.get("/auth/{oauth_name}/callback")
 def auth_callback(
-    provider_name: str,
+    oauth_name: str,
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(optional_session)],
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
 ):
-    provider = get_provider(provider_name)
+    oauth = get_oauth(oauth_name)
     pending = unsign(request.cookies.get(STATE_COOKIE))
     if error:
-        response = _message(request, "로그인 취소", f"{provider.label} 로그인이 취소됐습니다.", 400)
+        response = _message(request, "로그인 취소", f"{oauth.label} 로그인이 취소됐습니다.", 400)
     elif (
         pending is None or not code or not state
-        or pending.get("p") != provider.name
+        or pending.get("p") != oauth.name
         or not hmac.compare_digest(str(pending.get("s")), state)
     ):
         response = _message(request, "로그인 실패", "로그인 요청이 만료됐거나 올바르지 않습니다. 다시 시도해 주세요.", 400)
     else:
-        response = _finish_login(request, provider, pending, code, session)
+        response = _finish_login(request, oauth, pending, code, session)
     response.delete_cookie(STATE_COOKIE, path="/auth/")
     return response
 
 
-def _finish_login(request: Request, provider: Provider, pending: dict, code: str, session) -> Response:
+def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, session) -> Response:
     try:
-        profile = fetch_profile(provider, code, pending["v"])
+        profile = fetch_profile(oauth, code, pending["v"])
     except (httpx.HTTPError, KeyError, ValueError):
-        logger.exception("OAuth token exchange failed: %s", provider.name)
-        return _message(request, "로그인 실패", f"{provider.label}에서 사용자 정보를 받지 못했습니다. 다시 시도해 주세요.", 502)
+        logger.exception("OAuth token exchange failed: %s", oauth.name)
+        return _message(request, "로그인 실패", f"{oauth.label}에서 사용자 정보를 받지 못했습니다. 다시 시도해 주세요.", 502)
 
     link_user_id = pending.get("l")
     if link_user_id:
@@ -312,7 +312,7 @@ def _finish_login(request: Request, provider: Provider, pending: dict, code: str
         if result == "taken":
             return _message(
                 request, "연결 실패",
-                f"이 {provider.label} 계정은 이미 다른 EBMS 계정에 연결돼 있습니다. "
+                f"이 {oauth.label} 계정은 이미 다른 EBMS 계정에 연결돼 있습니다. "
                 "그 계정에서 연결을 해제한 뒤 다시 시도해 주세요.",
                 409, back="/account",
             )
@@ -349,15 +349,15 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
         return _login_redirect(request)
     user, session_id = session
     identities = accounts.list_identities(user.id)
-    linked = {i.provider for i in identities}
+    linked = {i.oauth for i in identities}
     return templates.TemplateResponse(
         request=request,
         name="pages/account.html",
         context={
             "user": user,
             "identities": identities,
-            "labels": {p.name: p.label for p in PROVIDERS.values()},
-            "linkable": [p for p in configured_providers() if p.name not in linked],
+            "labels": {p.name: p.label for p in OAUTHS.values()},
+            "linkable": [p for p in configured_oauths() if p.name not in linked],
             "sessions": accounts.list_sessions(user.id),
             "current_session_id": session_id,
         },

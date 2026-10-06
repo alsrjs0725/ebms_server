@@ -15,9 +15,9 @@
 <ul class="list-group mb-3">
     {% for i in identities %}
     <li class="list-group-item d-flex justify-content-between align-items-center">
-        <span><strong>{{ labels.get(i.provider, i.provider) }}</strong> <span class="text-muted">{{ i.name or i.email or i.provider_user_id }}</span></span>
+        <span><strong>{{ labels.get(i.oauth, i.oauth) }}</strong> <span class="text-muted">{{ i.name or i.email or i.oauth_user_id }}</span></span>
         {% if identities | length > 1 %}
-        <button class="btn btn-sm btn-outline-danger" data-delete="/api/account/identities/{{ i.id }}" data-confirm="{{ labels.get(i.provider, i.provider) }} 연결을 해제할까요?">연결 해제</button>
+        <button class="btn btn-sm btn-outline-danger" data-delete="/api/account/identities/{{ i.id }}" data-confirm="{{ labels.get(i.oauth, i.oauth) }} 연결을 해제할까요?">연결 해제</button>
         {% endif %}
     </li>
     {% endfor %}

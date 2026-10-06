@@ -61,7 +61,7 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
-    # 계정. provider와 무관하게 내부 UUID로만 구분합니다. 시각은 모두 unix 초(UTC)입니다.
+    # 계정. OAuth와 무관하게 내부 UUID로만 구분합니다. 시각은 모두 unix 초(UTC)입니다.
     """
         CREATE TABLE IF NOT EXISTS user(
             id CHAR(36) NOT NULL,
@@ -80,14 +80,14 @@ SCHEMA = [
         CREATE TABLE IF NOT EXISTS user_identity(
             id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             user_id CHAR(36) NOT NULL,
-            provider VARCHAR(16) NOT NULL,
-            provider_user_id VARCHAR(255) NOT NULL,
+            oauth VARCHAR(16) NOT NULL,
+            oauth_user_id VARCHAR(255) NOT NULL,
             email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
             name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             linked_at BIGINT UNSIGNED NOT NULL,
 
             PRIMARY KEY (id),
-            UNIQUE (provider, provider_user_id),
+            UNIQUE (oauth, oauth_user_id),
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,

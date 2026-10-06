@@ -46,8 +46,8 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("DB is loaded.")
     if not constant.SECRET_KEY:
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
-    if not auth.configured_providers():
-        logging.getLogger(__name__).warning("No login provider is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
+    if not auth.configured_oauths():
+        logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     for folder in os.listdir(constant.TMP_DIR):
         cur_path = constant.TMP_DIR / folder
         if cur_path.is_file(): continue
