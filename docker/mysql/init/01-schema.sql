@@ -3,15 +3,15 @@
 -- MySQL 마이그레이션/BLOB 작업에서 최종 스키마로 교체될 예정입니다.
 
 CREATE TABLE IF NOT EXISTS song (
-    id   INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    id   INT NOT NULL AUTO_INCREMENT,
     path VARCHAR(255) NOT NULL,
     PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS chart (
     id      CHAR(64)        NOT NULL,
-    song_id INT UNSIGNED    NULL,
-    size    BIGINT UNSIGNED NOT NULL,
+    song_id INT             NULL,
+    size    BIGINT          NOT NULL,
     PRIMARY KEY (id, size),
     KEY idx_chart_song_id (song_id),
     CONSTRAINT fk_chart_song FOREIGN KEY (song_id) REFERENCES song (id)
