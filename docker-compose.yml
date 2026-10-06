@@ -1,6 +1,7 @@
 services:
   mysql:
     image: mysql:8.4
+    # ports를 열지 않음: compose 내부 네트워크에서 ebms 컨테이너만 접근
     restart: unless-stopped
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-ebms}
