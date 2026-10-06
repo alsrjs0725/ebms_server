@@ -58,7 +58,26 @@ docker compose up -d --build
 
 - 처음 보는 OAuth 계정으로 로그인하면 새 계정을 만듭니다. 이메일이 같아도 자동으로 합치지 않으니, 다른 OAuth는 로그인한 상태에서 `/account`의 "연결"로 추가하세요.
 - 이미 다른 계정에 연결된 OAuth 계정은 연결할 수 없습니다(`409`).
-- `/api/account/*`는 웹 세션 쿠키가 없거나 만료되면 `401`입니다.
+- `/api/account/*`는 세션(웹 쿠키 또는 클라이언트 세션키)이 없거나 만료되면 `401`입니다.
+
+### 클라이언트 로그인
+
+클라이언트는 브라우저 로그인 결과를 루프백 리다이렉트 + PKCE(RFC 8252)로 받아 세션키로 바꿉니다. 세션키는 90일 유효하고 쓸 때마다 연장되며, `/account`의 로그인된 기기에 "클라이언트"로 나옵니다.
+
+1. 클라이언트가 `127.0.0.1`의 빈 포트에서 수신을 열고 `state`, `code_verifier`(43~128자)를 만든 뒤 브라우저로 `/auth/client/authorize`를 엽니다.
+2. 웹에 로그인돼 있지 않으면 로그인 페이지를 거칩니다. 서버는 1분짜리 1회용 `code`를 붙여 `<redirect_uri>?code=…&state=…`로 보냅니다.
+3. 클라이언트는 `state`를 확인하고 `code`와 `code_verifier`를 `/api/auth/client/token`에 보내 세션키를 받습니다.
+4. 이후 요청에는 `Authorization: Bearer <세션키>` 헤더를 붙입니다.
+
+| 메서드 | 경로 | 인증 | 설명 |
+| --- | --- | --- | --- |
+| GET | `/auth/client/authorize` | 웹 쿠키(없으면 `/login`으로) | 쿼리: `redirect_uri`(`http://127.0.0.1:<포트>/…`만 허용), `state`, `code_challenge`(base64url SHA-256), `code_challenge_method=S256`, `device_name`(선택, 기기 목록에 표시). 값이 틀리면 `400` 페이지 |
+| POST | `/api/auth/client/token` | - | JSON `{"code", "code_verifier"}` → `{"session_key", "expires_at", "user": {"id", "display_name", "email", "role"}}`. 코드가 없거나 만료·사용됐거나 verifier가 틀리면 `400`(코드는 한 번 시도하면 폐기), 정지된 계정은 `403` |
+| POST | `/api/auth/client/logout` | Bearer | 현재 세션키 폐기. `204` |
+| GET | `/api/me` | Bearer 또는 웹 쿠키 | 내 계정: `id`, `display_name`, `email`, `role`, `oauths`(`[{"oauth", "name"}]`), `session.kind`(`client`/`web`) |
+
+- `Authorization` 헤더가 있으면 쿠키는 보지 않습니다. 세션키가 틀리거나 만료·폐기됐으면 `401` + `WWW-Authenticate: Bearer`입니다.
+- 웹 쿠키 값은 세션키로 쓸 수 없고, 그 반대도 마찬가지입니다.
 
 ## HTTP API
 
@@ -68,7 +87,7 @@ docker compose up -d --build
 | --- | --- | --- |
 | GET | `/` | 웹 메인 페이지 (HTML) |
 | GET | `/static/{path}` | 정적 파일 (CSS/JS/아이콘) |
-| GET | `/api/version` | API 버전 |
+| GET | `/api/version` | API 버전. `auth`에 로그인 가능한 OAuth 목록(예: `["google", "discord"]`) |
 | GET | `/api/charthash` | 차트 청크별 SHA-256 목록 |
 | GET | `/api/files/chart/{chunk_id}` | 차트 청크 zip 다운로드 |
 | GET | `/api/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |

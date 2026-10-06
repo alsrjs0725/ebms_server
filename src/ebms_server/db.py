@@ -109,6 +109,24 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 클라이언트 로그인용 1회용 코드. 세션키로 바꿀 때 PKCE(code_verifier)가 맞아야 합니다.
+    """
+        CREATE TABLE IF NOT EXISTS auth_code(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            code_sha256 CHAR(64) NOT NULL,
+            user_id CHAR(36) NOT NULL,
+            code_challenge VARCHAR(128) NOT NULL,
+            redirect_uri VARCHAR(255) NOT NULL,
+            device_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            created_at BIGINT UNSIGNED NOT NULL,
+            expires_at BIGINT UNSIGNED NOT NULL,
+            used_at BIGINT UNSIGNED,
+
+            PRIMARY KEY (id),
+            UNIQUE (code_sha256),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
