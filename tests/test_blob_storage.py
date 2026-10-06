@@ -222,7 +222,8 @@ def test_manifest(tmp_path, client):
     assert sorted(files) == ["a.bms", "b.bme", "bga/movie.bin", "sound.wav"]
 
     # offset으로 Range 요청해 파일 하나만 꺼낼 수 있어야 합니다.
-    import struct, zlib
+    import struct
+    import zlib
     f = files["bga/movie.bin"]
     head = client.get("/api/files/song/id/1", headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"}).content
     name_len, extra_len = struct.unpack("<HH", head[26:30])
@@ -271,3 +272,17 @@ def test_add_missing_columns(database):
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT folder, files FROM song")
         assert cur.fetchall() == ()
+
+
+def test_blob_reader_context_manager():
+    from unittest.mock import Mock
+    from ebms_server.db import BlobReader
+
+    mock_con = Mock()
+    mock_cur = Mock()
+    mock_con.open = True
+
+    with BlobReader(mock_con, mock_cur, "song", 1, 100, "hash"):
+        pass
+
+    mock_con.close.assert_called_once()
