@@ -215,6 +215,9 @@ def test_manifest(tmp_path, client):
     assert entry["zip_size"] == len(song_zip)
     assert entry["zip_sha256"] == sha(song_zip)
     assert sorted(entry["charts"]) == sorted([sha(chart_a), sha(chart_b)])
+    chart_files = {f["sha256"]: f for f in entry["chart_files"]}
+    assert chart_files[sha(chart_a)] == {"sha256": sha(chart_a), "path": "a.bms", "size": len(chart_a)}
+    assert chart_files[sha(chart_b)] == {"sha256": sha(chart_b), "path": "b.bme", "size": len(chart_b)}
     files = {f["path"]: f for f in entry["files"]}
     assert sorted(files) == ["a.bms", "b.bme", "bga/movie.bin", "sound.wav"]
 
@@ -238,6 +241,8 @@ def test_manifest(tmp_path, client):
     assert client.get("/api/manifest/hash").json()["0"] != hashes["0"]
     [entry] = client.get("/api/manifest/0").json()
     assert sha(chart_c) in entry["charts"]
+    c_file = next(f for f in entry["chart_files"] if f["sha256"] == sha(chart_c))
+    assert c_file == {"sha256": sha(chart_c), "path": "c.bms", "size": len(chart_c)}
 
     assert client.get("/api/manifest/5").status_code == 404
     assert client.get("/api/version").json()["api"] == constant.API_VERSION
@@ -247,12 +252,14 @@ def test_manifest_backfill_for_old_rows(tmp_path, client, database):
     Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#A"}))
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("UPDATE song SET folder = '', files = NULL")
+        cur.execute("UPDATE chart SET filename = ''")
         cur.execute("DELETE FROM manifest_chunk")
         con.commit()
     database.backfill_manifest()
     [entry] = client.get("/api/manifest/0").json()
     assert entry["folder"] == "1"
     assert "sound.wav" in [f["path"] for f in entry["files"]]
+    assert entry["chart_files"][0]["path"] == "a.bms"
 
 
 def test_add_missing_columns(database):

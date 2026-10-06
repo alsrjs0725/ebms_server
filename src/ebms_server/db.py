@@ -34,6 +34,7 @@ SCHEMA = [
             id CHAR(64) NOT NULL,
             song_id INT UNSIGNED,
             size BIGINT UNSIGNED NOT NULL,
+            filename VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
 
             PRIMARY KEY (id, size),
             FOREIGN KEY (song_id) REFERENCES song(id)
@@ -66,6 +67,7 @@ SCHEMA = [
 MISSING_COLUMNS = [
     ("song", "folder", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
     ("song", "files", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("chart", "filename", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
 ]
 
 
@@ -221,12 +223,21 @@ class Database:
         lo = chunk_no * constant.SONGS_PER_MANIFEST_CHUNK
         hi = lo + constant.SONGS_PER_MANIFEST_CHUNK
         cur.execute(
-            "SELECT song_id, id FROM chart WHERE song_id >= %s AND song_id < %s ORDER BY song_id, id",
+            "SELECT song_id, id, filename, size FROM chart WHERE song_id >= %s AND song_id < %s ORDER BY song_id, id",
             (lo, hi),
         )
         charts = defaultdict(list)
-        for song_id, chart_id in cur.fetchall():
+        chart_files = defaultdict(list)
+        for song_id, chart_id, filename, size in cur.fetchall():
             charts[song_id].append(chart_id)
+            path = filename if filename else f"{chart_id}.bms"
+            chart_files[song_id].append(
+                {
+                    "sha256": chart_id,
+                    "path": path,
+                    "size": size,
+                }
+            )
 
         cur.execute(
             "SELECT id, folder, size, sha256, files FROM song WHERE id >= %s AND id < %s ORDER BY id",
@@ -239,6 +250,7 @@ class Database:
                 "zip_size": size,
                 "zip_sha256": sha256,
                 "charts": charts[song_id],
+                "chart_files": chart_files[song_id],
                 "files": json.loads(files) if files else [],
             }
             for song_id, folder, size, sha256, files in cur.fetchall()
@@ -255,27 +267,48 @@ class Database:
 
     def backfill_manifest(self) -> None:
         """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
-        원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다."""
+        원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다.
+        또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다."""
         with self._write_lock, connect() as con, con.cursor() as cur:
             cur.execute("SELECT id FROM song WHERE files IS NULL ORDER BY id")
-            song_ids = [row[0] for row in cur.fetchall()]
-            if not song_ids:
+            song_ids_no_files = set(row[0] for row in cur.fetchall())
+
+            cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
+            song_ids_no_filenames = set(row[0] for row in cur.fetchall())
+
+            affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
+            if not affected_song_ids:
                 return
             try:
-                for song_id in song_ids:
+                for song_id in affected_song_ids:
                     cur.execute("SELECT data FROM song WHERE id = %s FOR UPDATE", (song_id,))
-                    files = zip_entries(cur.fetchone()[0])
-                    cur.execute(
-                        "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
-                        (str(song_id), json.dumps(files), song_id),
-                    )
-                for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in song_ids}):
+                    row = cur.fetchone()
+                    if not row:
+                        continue
+                    song_data = row[0]
+                    if song_id in song_ids_no_files:
+                        files = zip_entries(song_data)
+                        cur.execute(
+                            "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
+                            (str(song_id), json.dumps(files), song_id),
+                        )
+                    if song_id in song_ids_no_filenames:
+                        with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
+                            for info in zf.infolist():
+                                if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
+                                    content = zf.read(info)
+                                    sha256 = hashlib.sha256(content).hexdigest()
+                                    cur.execute(
+                                        "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
+                                        (info.filename, song_id, sha256),
+                                    )
+                for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
                     self._rebuild_manifest_chunk(cur, chunk_no)
                 con.commit()
             except Exception:
                 con.rollback()
                 raise
-            self.logger.info(f"backfill_manifest: Filled manifest of {len(song_ids)} songs.")
+            self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
 
     def migrate_chart_chunk_names(self) -> int:
         """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
@@ -390,12 +423,18 @@ class Database:
 
                 new_charts = []
                 for (chart_file_path, size, sha256) in bms_files:
+                    filename = chart_file_path.relative_to(root).as_posix()
                     cur.execute(
-                        "INSERT IGNORE INTO chart (id, song_id, size) VALUES (%s, %s, %s)",
-                        (str(sha256), song_id, size),
+                        "INSERT IGNORE INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
+                        (str(sha256), song_id, size, filename),
                     )
                     if cur.rowcount == 1:
                         new_charts.append((chart_file_path, sha256))
+                    elif song_id is not None:
+                        cur.execute(
+                            "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
+                            (filename, str(sha256), size),
+                        )
                 if new_charts:
                     self._append_charts_to_chunk(cur, new_charts)
                 if new_song or new_charts:
