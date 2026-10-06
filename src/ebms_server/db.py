@@ -61,6 +61,54 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 계정. provider와 무관하게 내부 UUID로만 구분합니다. 시각은 모두 unix 초(UTC)입니다.
+    """
+        CREATE TABLE IF NOT EXISTS user(
+            id CHAR(36) NOT NULL,
+            display_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            role VARCHAR(16) NOT NULL DEFAULT 'user',
+            status VARCHAR(16) NOT NULL DEFAULT 'active',
+            created_at BIGINT UNSIGNED NOT NULL,
+            last_login_at BIGINT UNSIGNED,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 계정에 연결된 로그인 수단(1 user : N identity)
+    """
+        CREATE TABLE IF NOT EXISTS user_identity(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id CHAR(36) NOT NULL,
+            provider VARCHAR(16) NOT NULL,
+            provider_user_id VARCHAR(255) NOT NULL,
+            email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            linked_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (id),
+            UNIQUE (provider, provider_user_id),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 웹 쿠키와 클라이언트 세션키. 원문 대신 sha256만 저장합니다.
+    """
+        CREATE TABLE IF NOT EXISTS session(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            token_sha256 CHAR(64) NOT NULL,
+            user_id CHAR(36) NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            device_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            created_at BIGINT UNSIGNED NOT NULL,
+            last_used_at BIGINT UNSIGNED NOT NULL,
+            expires_at BIGINT UNSIGNED NOT NULL,
+            revoked_at BIGINT UNSIGNED,
+
+            PRIMARY KEY (id),
+            UNIQUE (token_sha256),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
