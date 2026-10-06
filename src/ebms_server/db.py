@@ -1,4 +1,3 @@
-import sqlite3
 import os
 import pathlib
 import hashlib
@@ -8,7 +7,42 @@ import uuid
 import zipfile
 import threading
 
+import pymysql
+
 from . import constant
+
+SCHEMA = [
+    """
+        CREATE TABLE IF NOT EXISTS song(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            path VARCHAR(255) NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+    """,
+    """
+        CREATE TABLE IF NOT EXISTS chart(
+            id CHAR(64) NOT NULL,
+            song_id INT UNSIGNED,
+            size BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (id, size),
+            FOREIGN KEY (song_id) REFERENCES song(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin;
+    """,
+]
+
+
+def connect() -> pymysql.connections.Connection:
+    """constant.py에 정의된 MySQL 서버에 연결합니다."""
+    return pymysql.connect(
+        host=constant.DB_HOST,
+        port=constant.DB_PORT,
+        user=constant.DB_USER,
+        password=constant.DB_PASSWORD,
+        database=constant.DB_NAME,
+        charset="utf8mb4",
+    )
 
 class Database:
     _instance = None
@@ -26,8 +60,7 @@ class Database:
         
         self.logger = logging.getLogger(__name__)
         self._initialized = True
-        if not constant.DB_PATH.exists():
-            self.generate_database()
+        self.generate_database()
         self.chart_chunk_no = max(0, len(os.listdir(constant.CHART_DATA_DIR)) - 1)
         self.chart_chunk_sha256 = dict()
         self.logger.info("DB hash started")
@@ -51,38 +84,14 @@ class Database:
         return constant.CHART_DATA_DIR / constant.CHART_CHUNK_FILENAME_TEMPLATE.format(self.chart_chunk_no if (number is None) else number)
 
     def generate_database(self) -> None:
-        """DB파일을 constant.py에 정의된 경로에 생성하는 함수입니다.
+        """MySQL에 테이블이 없으면 생성하는 함수입니다.
 
         """
-        if (constant.DB_PATH.exists()):
-            self.logger.error(f"DB 파일이 이미 존재합니다.")
-            raise RuntimeError("DB 파일이 이미 존재합니다.")
-        
-        coms = [
-            """
-                CREATE TABLE song(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path TEXT NOT NULL
-                );
-            """,
-            """
-                CREATE TABLE chart(
-                    id TEXT,
-                    song_id INTEGER REFERENCES song(id),
-                    size INTEGER,
-
-                    PRIMARY KEY (id, size)
-                );
-            """
-        ]
-
-        con = sqlite3.connect(constant.DB_PATH)
-        cur = con.cursor()
-
-        for com in coms:
-            cur.execute(com)
-        con.commit()
-        con.close()
+        con = connect()
+        with con, con.cursor() as cur:
+            for com in SCHEMA:
+                cur.execute(com)
+            con.commit()
 
     def insert_song(self, song_path:os.PathLike, remove=False) -> None:
         """BMS 노래 한 곡을 DB에 추가할 수 있는 함수입니다
@@ -112,7 +121,7 @@ class Database:
             lock = threading.Lock()
             
             with lock:
-                con = sqlite3.connect(constant.DB_PATH)
+                con = connect()
                 cur = con.cursor()
                 for file in os.listdir(root):
                     file_path = root / file
@@ -126,7 +135,7 @@ class Database:
                         """
                         SELECT song_id
                         FROM chart
-                        WHERE id = ? AND size = ?
+                        WHERE id = %s AND size = %s
                         """,
                         (sha256, size)
                     )
@@ -143,7 +152,7 @@ class Database:
                     self.create_zip(root, str(song_file_path))
 
                     com = """
-                        INSERT INTO song (path) VALUES (?)
+                        INSERT INTO song (path) VALUES (%s)
                     """
 
                     cur.execute(com, (str(song_file_name),))
@@ -153,9 +162,8 @@ class Database:
                     self.logger.info(f"insert_song: Inserted new song[{str(song_file_name)}, {song_id}]")
                     
                 com = """
-                    INSERT INTO chart (id, song_id, size) 
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(id, size) DO NOTHING
+                    INSERT IGNORE INTO chart (id, song_id, size)
+                    VALUES (%s, %s, %s)
                 """
                 cnt = 0
                 for (chart_file_path, size, sha256) in bms_files:
@@ -280,14 +288,13 @@ class Database:
         Returns:
             int | None: song_id, 존재하지 않는 sha256일 경우 None 반환
         """
-        con = sqlite3.connect(constant.DB_PATH)
-        cur = con.cursor()
         com = """
-            SELECT song_id FROM chart WHERE id = ?
+            SELECT song_id FROM chart WHERE id = %s
         """
         
-        cur.execute(com, (chart_sha256,))
-        row = cur.fetchone()
+        with connect() as con, con.cursor() as cur:
+            cur.execute(com, (chart_sha256,))
+            row = cur.fetchone()
         return row[0] if row else None
     
     def get_song_file(self, song_id) -> pathlib.Path | None:
@@ -299,13 +306,12 @@ class Database:
         Returns:
             pathlib.Path | None: 파일의 경로를 반환합니다. 존재하지 않는 id의 경우 None을 반환합니다.
         """
-        con = sqlite3.connect(constant.DB_PATH)
-        cur = con.cursor()
         com = """
-            SELECT path FROM song WHERE id = ?
+            SELECT path FROM song WHERE id = %s
         """
         
-        cur.execute(com, (song_id,))
-        row = cur.fetchone()
+        with connect() as con, con.cursor() as cur:
+            cur.execute(com, (song_id,))
+            row = cur.fetchone()
         return constant.SONG_DATA_DIR / row[0] if row else None
     
