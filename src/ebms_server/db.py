@@ -157,10 +157,18 @@ class BlobReader:
         try:
             step = constant.BLOB_READ_SIZE
             for pos in range(start + 1, end + 2, step):
-                self._cur.execute(
-                    f"SELECT SUBSTRING(data, %s, %s) FROM {self.table} WHERE id = %s",
-                    (pos, min(step, end + 2 - pos), self.row_id),
-                )
+                if self.table == "song":
+                    self._cur.execute(
+                        "SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s",
+                        (pos, min(step, end + 2 - pos), self.row_id),
+                    )
+                elif self.table == "chart_chunk":
+                    self._cur.execute(
+                        "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
+                        (pos, min(step, end + 2 - pos), self.row_id),
+                    )
+                else:
+                    raise ValueError(self.table)
                 yield self._cur.fetchone()[0]
         finally:
             self.close()
@@ -626,7 +634,10 @@ class Database:
         try:
             cur = con.cursor()
             cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-            cur.execute(f"SELECT LENGTH(data), sha256 FROM {table} WHERE id = %s", (row_id,))
+            if table == "song":
+                cur.execute("SELECT LENGTH(data), sha256 FROM song WHERE id = %s", (row_id,))
+            elif table == "chart_chunk":
+                cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
             row = cur.fetchone()
         except Exception:
             con.close()
