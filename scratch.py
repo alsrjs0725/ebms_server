@@ -1,5 +1,3 @@
-import os
-import sys
 import pathlib
 import zipfile
 import logging
