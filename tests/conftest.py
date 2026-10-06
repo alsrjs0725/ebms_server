@@ -3,6 +3,7 @@ import sqlite3
 import pymysql
 import pytest
 
+
 class SQLiteCursor:
     def __init__(self, raw_cur):
         self._cur = raw_cur
@@ -25,7 +26,12 @@ class SQLiteCursor:
         sql = re.sub(r"CHARACTER SET \w+", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"COLLATE \w+", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"AUTO_INCREMENT", "AUTOINCREMENT", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"INT UNSIGNED NOT NULL AUTOINCREMENT", "INTEGER PRIMARY KEY AUTOINCREMENT", sql, flags=re.IGNORECASE)
+        sql = re.sub(
+            r"INT UNSIGNED NOT NULL AUTOINCREMENT",
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            sql,
+            flags=re.IGNORECASE,
+        )
         sql = re.sub(r"INT UNSIGNED", "INTEGER", sql, flags=re.IGNORECASE)
         sql = re.sub(r"BIGINT UNSIGNED", "INTEGER", sql, flags=re.IGNORECASE)
         sql = re.sub(r"LONGBLOB", "BLOB", sql, flags=re.IGNORECASE)
@@ -33,7 +39,9 @@ class SQLiteCursor:
         sql = re.sub(r"CHAR\(64\)", "TEXT", sql, flags=re.IGNORECASE)
         sql = re.sub(r"VARCHAR\(\d+\)", "TEXT", sql, flags=re.IGNORECASE)
         if "PRIMARY KEY AUTOINCREMENT" in sql:
-            sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)\s*,?", "", sql, flags=re.IGNORECASE)
+            sql = re.sub(
+                r"PRIMARY KEY\s*\(\s*id\s*\)\s*,?", "", sql, flags=re.IGNORECASE
+            )
         if "CREATE TABLE IF NOT EXISTS chart_chunk" in sql:
             sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
             sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)
@@ -69,7 +77,12 @@ class SQLiteCursor:
             return
 
         if "ON DUPLICATE KEY UPDATE" in sql:
-            sql = re.sub(r"ON DUPLICATE KEY UPDATE", "ON CONFLICT(id) DO UPDATE SET", sql, flags=re.IGNORECASE)
+            sql = re.sub(
+                r"ON DUPLICATE KEY UPDATE",
+                "ON CONFLICT(id) DO UPDATE SET",
+                sql,
+                flags=re.IGNORECASE,
+            )
             sql = re.sub(r"VALUES\((\w+)\)", r"excluded.\1", sql, flags=re.IGNORECASE)
 
         if "INSERT IGNORE INTO chart" in sql:
@@ -92,6 +105,7 @@ class SQLiteCursor:
     def close(self):
         self._cur.close()
 
+
 class SQLiteConnection:
     _dbs = {}
 
@@ -101,7 +115,9 @@ class SQLiteConnection:
             con = sqlite3.connect(":memory:", check_same_thread=False)
             con.isolation_level = None
             con.create_function("IF", 3, lambda cond, t, f: t if cond else f)
-            con.create_function("LENGTH", 1, lambda val: len(val) if val is not None else 0)
+            con.create_function(
+                "LENGTH", 1, lambda val: len(val) if val is not None else 0
+            )
             cls._dbs[dbname] = con
         return cls._dbs[dbname]
 
@@ -137,10 +153,12 @@ class SQLiteConnection:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+
 @pytest.fixture(autouse=True)
 def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     import ebms_server.db as db_module
     import ebms_server.constant as constant
+
     monkeypatch.setattr(constant, "TMP_DIR", tmp_path / "var_tmp")
     constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
     original_connect = db_module.connect
@@ -150,27 +168,35 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     except pymysql.err.OperationalError:
         db_module.Database._instance = None
         db_module.Database._initialized = False
+
         def fake_connect(**kwargs):
             db = kwargs.get("database", constant.DB_NAME)
             if db is None:
                 db = constant.DB_NAME
             return SQLiteConnection(database=db)
+
         monkeypatch.setattr(db_module, "connect", fake_connect)
 
         # Handle DROP DATABASE / CREATE DATABASE in test setup
         orig_cursor = SQLiteConnection.cursor
+
         def cursor_with_db_ops(self):
             cur = orig_cursor(self)
             orig_exec = cur.execute
+
             def exec_with_db_ops(query, args=None):
                 if "DROP DATABASE IF EXISTS" in query:
-                    m = re.search(r"DATABASE IF EXISTS (\w+)", query, flags=re.IGNORECASE)
+                    m = re.search(
+                        r"DATABASE IF EXISTS (\w+)", query, flags=re.IGNORECASE
+                    )
                     if m:
                         SQLiteConnection.reset_db(m.group(1))
                     return
                 if "CREATE DATABASE" in query:
                     return
                 orig_exec(query, args)
+
             cur.execute = exec_with_db_ops
             return cur
+
         monkeypatch.setattr(SQLiteConnection, "cursor", cursor_with_db_ops)

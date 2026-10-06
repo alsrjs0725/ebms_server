@@ -131,9 +131,17 @@ SCHEMA = [
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
 MISSING_COLUMNS = [
-    ("song", "folder", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
+    (
+        "song",
+        "folder",
+        "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''",
+    ),
     ("song", "files", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
-    ("chart", "filename", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
+    (
+        "chart",
+        "filename",
+        "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''",
+    ),
 ]
 
 
@@ -232,7 +240,10 @@ class Database:
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT @@max_allowed_packet")
             self.max_allowed_packet = cur.fetchone()[0]
-        if self.max_allowed_packet < constant.BYTE_PER_CHUNK * 2 + constant.PACKET_OVERHEAD:
+        if (
+            self.max_allowed_packet
+            < constant.BYTE_PER_CHUNK * 2 + constant.PACKET_OVERHEAD
+        ):
             # chunk는 BYTE_PER_CHUNK를 넘긴 뒤에 다음 chunk로 넘어가므로 여유있게 2배를 요구합니다.
             self.logger.warning(
                 f"max_allowed_packet({self.max_allowed_packet}) is too small. "
@@ -254,15 +265,21 @@ class Database:
                 )
                 if cur.fetchone()[0] == 0:
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-                    self.logger.info(f"generate_database: Added column {table}.{column}")
+                    self.logger.info(
+                        f"generate_database: Added column {table}.{column}"
+                    )
             con.commit()
 
     def _fits_packet(self, size: int) -> bool:
         return size + constant.PACKET_OVERHEAD <= self.max_allowed_packet
 
-    def _append_charts_to_chunk(self, cur, chart_files: list[tuple[pathlib.Path, str]]) -> None:
+    def _append_charts_to_chunk(
+        self, cur, chart_files: list[tuple[pathlib.Path, str]]
+    ) -> None:
         """mutable한 chart chunk에 chart 파일들을 추가합니다. chunk가 BYTE_PER_CHUNK를 넘었다면 새 chunk를 만듭니다."""
-        cur.execute("SELECT id, size FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE")
+        cur.execute(
+            "SELECT id, size FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE"
+        )
         row = cur.fetchone()
         if row is None:
             chunk_no, data = 0, b""
@@ -276,7 +293,9 @@ class Database:
         buf = io.BytesIO(data)
         with zipfile.ZipFile(buf, mode="a", compression=zipfile.ZIP_STORED) as zf:
             for chart_file_path, sha256 in chart_files:
-                zf.write(chart_file_path, arcname=chart_arcname(sha256, chart_file_path))
+                zf.write(
+                    chart_file_path, arcname=chart_arcname(sha256, chart_file_path)
+                )
         data = buf.getvalue()
 
         if not self._fits_packet(len(data)):
@@ -347,7 +366,9 @@ class Database:
             cur.execute("SELECT id FROM song WHERE files IS NULL ORDER BY id")
             song_ids_no_files = set(row[0] for row in cur.fetchall())
 
-            cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
+            cur.execute(
+                "SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL"
+            )
             song_ids_no_filenames = set(row[0] for row in cur.fetchall())
 
             affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
@@ -355,7 +376,9 @@ class Database:
                 return
             try:
                 for song_id in affected_song_ids:
-                    cur.execute("SELECT data FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    cur.execute(
+                        "SELECT data FROM song WHERE id = %s FOR UPDATE", (song_id,)
+                    )
                     row = cur.fetchone()
                     if not row:
                         continue
@@ -369,20 +392,30 @@ class Database:
                     if song_id in song_ids_no_filenames:
                         with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
                             for info in zf.infolist():
-                                if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
+                                if (
+                                    not info.is_dir()
+                                    and pathlib.PurePosixPath(
+                                        info.filename
+                                    ).suffix.lower()
+                                    in constant.BMS_FORMAT
+                                ):
                                     content = zf.read(info)
                                     sha256 = hashlib.sha256(content).hexdigest()
                                     cur.execute(
                                         "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
                                         (info.filename, song_id, sha256),
                                     )
-                for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
+                for chunk_no in sorted(
+                    {i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}
+                ):
                     self._rebuild_manifest_chunk(cur, chunk_no)
                 con.commit()
             except Exception:
                 con.rollback()
                 raise
-            self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
+            self.logger.info(
+                f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs."
+            )
 
     def migrate_chart_chunk_names(self) -> int:
         """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
@@ -395,19 +428,29 @@ class Database:
             chunk_ids = [row[0] for row in cur.fetchall()]
             try:
                 for chunk_no in chunk_ids:
-                    cur.execute("SELECT data FROM chart_chunk WHERE id = %s FOR UPDATE", (chunk_no,))
+                    cur.execute(
+                        "SELECT data FROM chart_chunk WHERE id = %s FOR UPDATE",
+                        (chunk_no,),
+                    )
                     old = cur.fetchone()[0]
                     buf = io.BytesIO()
                     renamed = False
-                    with zipfile.ZipFile(io.BytesIO(old)) as src, \
-                            zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as dst:
+                    with (
+                        zipfile.ZipFile(io.BytesIO(old)) as src,
+                        zipfile.ZipFile(
+                            buf, mode="w", compression=zipfile.ZIP_STORED
+                        ) as dst,
+                    ):
                         for info in src.infolist():
                             content = src.read(info)
                             name = chart_arcname(
-                                hashlib.sha256(content).hexdigest(), pathlib.PurePosixPath(info.filename)
+                                hashlib.sha256(content).hexdigest(),
+                                pathlib.PurePosixPath(info.filename),
                             )
                             renamed |= name != info.filename
-                            dst.writestr(zipfile.ZipInfo(name, date_time=info.date_time), content)
+                            dst.writestr(
+                                zipfile.ZipInfo(name, date_time=info.date_time), content
+                            )
                     if not renamed:
                         continue
                     data = buf.getvalue()
@@ -420,27 +463,32 @@ class Database:
             except Exception:
                 con.rollback()
                 raise
-        self.logger.info(f"migrate_chart_chunk_names: Rewrote {changed} of {len(chunk_ids)} chunks.")
+        self.logger.info(
+            f"migrate_chart_chunk_names: Rewrote {changed} of {len(chunk_ids)} chunks."
+        )
         return changed
 
-    def insert_song(self, song_path:os.PathLike, remove=False) -> None:
+    def insert_song(self, song_path: os.PathLike, remove=False) -> None:
         """BMS 노래 한 곡을 DB에 추가할 수 있는 함수입니다
 
         Args:
             song_path (os.PathLike): bms 파일을 포함한 에셋들이 담겨있는 폴더의 경로
         """
         root = pathlib.Path(song_path)
-        if (not os.path.exists(root)):
+        if not os.path.exists(root):
             self.logger.warning(f"insert_song failed: Path doesn't exist[{str(root)}]")
             return
-        if (not os.path.isdir(root)):
-            self.logger.warning(f"insert_song failed: Path isn't directory")
+        if not os.path.isdir(root):
+            self.logger.warning("insert_song failed: Path isn't directory")
             return
         for file_name in os.listdir(song_path):
             full_path = root / file_name
-            if (full_path.suffix.lower() in constant.BMS_FORMAT): break;
+            if full_path.suffix.lower() in constant.BMS_FORMAT:
+                break
         else:
-            self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
+            self.logger.warning(
+                f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}"
+            )
             return
 
         with self._write_lock, connect() as con, con.cursor() as cur:
@@ -448,7 +496,8 @@ class Database:
             song_id = None
             for file in os.listdir(root):
                 file_path = root / file
-                if (file_path.suffix.lower() not in constant.BMS_FORMAT): continue
+                if file_path.suffix.lower() not in constant.BMS_FORMAT:
+                    continue
 
                 with open(file_path, "rb") as fos:
                     sha256 = hashlib.sha256(fos.read()).hexdigest()
@@ -460,18 +509,18 @@ class Database:
                     FROM chart
                     WHERE id = %s AND size = %s
                     """,
-                    (sha256, size)
+                    (sha256, size),
                 )
 
                 row = cur.fetchone()
-                if (row is not None):
+                if row is not None:
                     song_id = row[0]
 
                 bms_files.append((file_path, size, sha256))
 
             new_song = False
             try:
-                if (song_id is None):
+                if song_id is None:
                     data = self.create_zip(root)
                     if not self._fits_packet(len(data)):
                         self.logger.error(
@@ -493,10 +542,12 @@ class Database:
                     new_song = True
                     song_id = cur.lastrowid
 
-                    self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
+                    self.logger.info(
+                        f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]"
+                    )
 
                 new_charts = []
-                for (chart_file_path, size, sha256) in bms_files:
+                for chart_file_path, size, sha256 in bms_files:
                     filename = chart_file_path.relative_to(root).as_posix()
                     cur.execute(
                         "INSERT IGNORE INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
@@ -512,7 +563,9 @@ class Database:
                 if new_charts:
                     self._append_charts_to_chunk(cur, new_charts)
                 if new_song or new_charts:
-                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    self._rebuild_manifest_chunk(
+                        cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK
+                    )
                 con.commit()
             except Exception:
                 con.rollback()
@@ -522,7 +575,9 @@ class Database:
         if remove:
             shutil.rmtree(song_path)
 
-    def insert_songs(self, directory:os.PathLike, reculsive=False, remove=False) -> None:
+    def insert_songs(
+        self, directory: os.PathLike, reculsive=False, remove=False
+    ) -> None:
         root_dir = pathlib.Path(directory)
         for file_name in os.listdir(root_dir):
             cur_dir = root_dir / file_name
@@ -543,14 +598,10 @@ class Database:
         source_dir = pathlib.Path(source_dir).resolve()
 
         if not source_dir.exists():
-            raise FileNotFoundError(
-                f"Source directory does not exist: {source_dir}"
-            )
+            raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
 
         if not source_dir.is_dir():
-            raise NotADirectoryError(
-                f"Source path is not a directory: {source_dir}"
-            )
+            raise NotADirectoryError(f"Source path is not a directory: {source_dir}")
 
         def get_arcname(path: pathlib.Path) -> str:
             return path.relative_to(source_dir).as_posix()
@@ -577,7 +628,6 @@ class Database:
             compression=zipfile.ZIP_DEFLATED,
             compresslevel=6,
         ) as zf:
-
             for path in source_dir.rglob("*"):
                 arcname = get_arcname(path)
 
@@ -653,9 +703,14 @@ class Database:
             cur = con.cursor()
             cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
             if table == "song":
-                cur.execute("SELECT LENGTH(data), sha256 FROM song WHERE id = %s", (row_id,))
+                cur.execute(
+                    "SELECT LENGTH(data), sha256 FROM song WHERE id = %s", (row_id,)
+                )
             elif table == "chart_chunk":
-                cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
+                cur.execute(
+                    "SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s",
+                    (row_id,),
+                )
             row = cur.fetchone()
         except Exception:
             con.close()

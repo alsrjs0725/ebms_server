@@ -40,10 +40,25 @@
     </li>
     {% endfor %}
 </ul>
+
+<div class="mt-5 pt-3 border-top">
+    <button class="btn btn-danger" id="btn-delete-account">회원 탈퇴</button>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+document.getElementById("btn-delete-account")?.addEventListener("click", async () => {
+    if (!confirm("정말 탈퇴하시겠습니까? 탈퇴하면 모든 정보가 삭제되며 복구할 수 없습니다.")) return;
+    const res = await fetch("/api/account", { method: "DELETE" });
+    if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        alert(body.detail || `탈퇴에 실패했습니다 (${res.status})`);
+        return;
+    }
+    location.href = "/";
+});
+
 document.querySelectorAll("[data-time]").forEach((el) => {
     el.textContent = new Date(Number(el.dataset.time) * 1000).toLocaleString();
 });

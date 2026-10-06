@@ -1,4 +1,5 @@
 """웹 로그인·계정 테스트. OAuth와의 통신(fetch_profile)은 가짜로 바꿉니다."""
+
 import urllib.parse
 
 import pymysql
@@ -32,12 +33,24 @@ def client(monkeypatch):
     Database._initialized = False
     Database()
     from ebms_server.main import app
+
     yield TestClient(app)
     Database._instance = None
     Database._initialized = False
 
 
-def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="tester", link=False, next=None):
+def oauth(
+    client,
+    monkeypatch,
+    oauth,
+    puid,
+    *,
+    email=None,
+    verified=True,
+    name="tester",
+    link=False,
+    next=None,
+):
     """start → (가짜 oauth) → callback 을 거친 callback 응답을 반환합니다."""
     params = {}
     if link:
@@ -63,7 +76,9 @@ def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="
     )
     if oauth == "google":
         # PKCE: 쿠키에 둔 verifier가 보낸 challenge와 맞아야 함
-        challenge = auth._b64(__import__("hashlib").sha256(seen["verifier"].encode()).digest())
+        challenge = auth._b64(
+            __import__("hashlib").sha256(seen["verifier"].encode()).digest()
+        )
         assert query["code_challenge"] == [challenge]
     return r
 
@@ -152,6 +167,39 @@ def test_unlink(client, monkeypatch):
     assert client.delete(f"/api/account/identities/{discord.id}").status_code == 404
 
 
+def test_delete_account(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1")
+    user_id = me(client).id
+    token = client.cookies.get(constant.SESSION_COOKIE)
+
+    # API 호출로 탈퇴 처리
+    r = client.delete("/api/account")
+    assert r.status_code == 204
+
+    # DB에서 삭제되었는지 확인
+    assert accounts.get_user(user_id) is None
+    # 연결된 인증 수단 및 세션도 삭제되었는지 확인
+    assert len(accounts.list_identities(user_id)) == 0
+    assert len(accounts.list_sessions(user_id)) == 0
+
+    # 쿠키에서 삭제되었는지 확인 (현재 로그인 상태 아님)
+    cookie = [
+        v
+        for v in r.headers.get_list("set-cookie")
+        if v.startswith(f"{constant.SESSION_COOKIE}=")
+    ]
+    assert len(cookie) == 1
+    assert "Max-Age=0" in cookie[0]
+    assert accounts.authenticate(token, "web") is None
+
+    # 새 유저로 재가입 가능한지 확인
+    client.cookies.clear()
+    oauth(client, monkeypatch, "google", "g1", name="Alice 2")
+    new_user = me(client)
+    assert new_user.id != user_id
+    assert new_user.display_name == "Alice 2"
+
+
 def test_sessions_list_and_revoke(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1")
     user_id = me(client).id
@@ -182,7 +230,9 @@ def test_logout(client, monkeypatch):
 
 
 def test_admin_email(client, monkeypatch):
-    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=False)
+    oauth(
+        client, monkeypatch, "discord", "d1", email="admin@example.com", verified=False
+    )
     assert me(client).role == "user"
     oauth(client, monkeypatch, "google", "g1", email="Admin@example.com", verified=True)
     assert me(client).is_admin
@@ -205,8 +255,15 @@ def test_bad_state_and_unknown_oauth(client, monkeypatch):
     assert r.status_code == 400
     # discord start로 만든 쿠키를 google callback에 쓸 수 없음
     r = client.get("/auth/discord/start", follow_redirects=False)
-    state = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["state"][0]
-    assert client.get("/auth/google/callback", params={"code": "c", "state": state}).status_code == 400
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)[
+        "state"
+    ][0]
+    assert (
+        client.get(
+            "/auth/google/callback", params={"code": "c", "state": state}
+        ).status_code
+        == 400
+    )
 
     assert client.get("/auth/github/start", follow_redirects=False).status_code == 404
     monkeypatch.setattr(constant, "DISCORD_CLIENT_ID", "")
@@ -242,13 +299,21 @@ def test_session_cookie_renewed(client, monkeypatch):
     token = client.cookies.get(constant.SESSION_COOKIE)
     # 로그인한 요청마다 쿠키 유효기간을 다시 내려줌
     r = client.get("/account")
-    cookie = [v for v in r.headers.get_list("set-cookie") if v.startswith(f"{constant.SESSION_COOKIE}=")]
+    cookie = [
+        v
+        for v in r.headers.get_list("set-cookie")
+        if v.startswith(f"{constant.SESSION_COOKIE}=")
+    ]
     assert len(cookie) == 1
     assert f"{constant.SESSION_COOKIE}={token}" in cookie[0]
     assert f"Max-Age={constant.WEB_SESSION_SECONDS}" in cookie[0]
     # 로그아웃 응답은 쿠키 삭제만 하고 다시 싣지 않음
     r = client.post("/auth/logout", follow_redirects=False)
-    cookie = [v for v in r.headers.get_list("set-cookie") if v.startswith(f"{constant.SESSION_COOKIE}=")]
+    cookie = [
+        v
+        for v in r.headers.get_list("set-cookie")
+        if v.startswith(f"{constant.SESSION_COOKIE}=")
+    ]
     assert len(cookie) == 1 and "Max-Age=0" in cookie[0]
     # 비로그인 요청에는 쿠키를 싣지 않음
     client.cookies.clear()

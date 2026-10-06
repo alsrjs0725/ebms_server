@@ -1,4 +1,5 @@
 """MySQL BLOB 저장 왕복 테스트. EBMS_DB_* 환경변수의 서버에 ebms_test DB를 만들어 사용합니다."""
+
 import hashlib
 import io
 import os
@@ -36,6 +37,7 @@ def database(monkeypatch):
 @pytest.fixture
 def client(database):
     from ebms_server.main import app
+
     return TestClient(app)
 
 
@@ -115,7 +117,9 @@ def test_same_chart_name_in_different_songs(tmp_path, client):
     Database().insert_song(make_song(tmp_path, "s1", {"normal.bms": chart_a}))
     Database().insert_song(make_song(tmp_path, "s2", {"NORMAL.BMS": chart_b}))
     with zipfile.ZipFile(io.BytesIO(client.get("/api/files/chart/0").content)) as zf:
-        assert sorted(zf.namelist()) == sorted([f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bms"])
+        assert sorted(zf.namelist()) == sorted(
+            [f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bms"]
+        )
 
 
 def test_migrate_chart_chunk_names(tmp_path, client, database):
@@ -128,7 +132,8 @@ def test_migrate_chart_chunk_names(tmp_path, client, database):
     old = buf.getvalue()
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute(
-            "INSERT INTO chart_chunk (id, size, sha256, data) VALUES (0, %s, %s, %s)", (len(old), sha(old), old)
+            "INSERT INTO chart_chunk (id, size, sha256, data) VALUES (0, %s, %s, %s)",
+            (len(old), sha(old), old),
         )
         con.commit()
 
@@ -179,13 +184,25 @@ def test_range_requests(tmp_path, client):
     assert res.headers["content-range"] == f"bytes */{size}"
 
     # 여러 범위나 If-Range 불일치는 전체 응답
-    assert client.get("/api/files/song/id/1", headers={"Range": "bytes=0-1,5-6"}).status_code == 200
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": '"other"'})
+    assert (
+        client.get(
+            "/api/files/song/id/1", headers={"Range": "bytes=0-1,5-6"}
+        ).status_code
+        == 200
+    )
+    res = client.get(
+        "/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": '"other"'}
+    )
     assert res.status_code == 200 and res.content == full
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": etag})
+    res = client.get(
+        "/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": etag}
+    )
     assert res.status_code == 206 and res.content == full[:10]
 
-    assert client.get("/api/files/song/id/1", headers={"If-None-Match": etag}).status_code == 304
+    assert (
+        client.get("/api/files/song/id/1", headers={"If-None-Match": etag}).status_code
+        == 304
+    )
 
     # chart chunk도 같은 방식
     chunk = client.get("/api/files/chart/0").content
@@ -216,19 +233,33 @@ def test_manifest(tmp_path, client):
     assert entry["zip_sha256"] == sha(song_zip)
     assert sorted(entry["charts"]) == sorted([sha(chart_a), sha(chart_b)])
     chart_files = {f["sha256"]: f for f in entry["chart_files"]}
-    assert chart_files[sha(chart_a)] == {"sha256": sha(chart_a), "path": "a.bms", "size": len(chart_a)}
-    assert chart_files[sha(chart_b)] == {"sha256": sha(chart_b), "path": "b.bme", "size": len(chart_b)}
+    assert chart_files[sha(chart_a)] == {
+        "sha256": sha(chart_a),
+        "path": "a.bms",
+        "size": len(chart_a),
+    }
+    assert chart_files[sha(chart_b)] == {
+        "sha256": sha(chart_b),
+        "path": "b.bme",
+        "size": len(chart_b),
+    }
     files = {f["path"]: f for f in entry["files"]}
     assert sorted(files) == ["a.bms", "b.bme", "bga/movie.bin", "sound.wav"]
 
     # offset으로 Range 요청해 파일 하나만 꺼낼 수 있어야 합니다.
-    import struct, zlib
+    import struct
+    import zlib
+
     f = files["bga/movie.bin"]
-    head = client.get("/api/files/song/id/1", headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"}).content
+    head = client.get(
+        "/api/files/song/id/1",
+        headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"},
+    ).content
     name_len, extra_len = struct.unpack("<HH", head[26:30])
     data_start = f["offset"] + 30 + name_len + extra_len
     raw = client.get(
-        "/api/files/song/id/1", headers={"Range": f"bytes={data_start}-{data_start + f['comp_size'] - 1}"}
+        "/api/files/song/id/1",
+        headers={"Range": f"bytes={data_start}-{data_start + f['comp_size'] - 1}"},
     ).content
     assert f["method"] == zipfile.ZIP_DEFLATED
     body = zlib.decompress(raw, -15)
@@ -237,7 +268,9 @@ def test_manifest(tmp_path, client):
 
     # 기존 곡에 chart가 추가되면 매니페스트가 갱신됩니다.
     chart_c = b"#C"
-    Database().insert_song(make_song(tmp_path, "other", {"a.bms": chart_a, "c.bms": chart_c}))
+    Database().insert_song(
+        make_song(tmp_path, "other", {"a.bms": chart_a, "c.bms": chart_c})
+    )
     assert client.get("/api/manifest/hash").json()["0"] != hashes["0"]
     [entry] = client.get("/api/manifest/0").json()
     assert sha(chart_c) in entry["charts"]

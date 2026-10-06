@@ -17,9 +17,7 @@ from fastapi.staticfiles import StaticFiles
 def configure_logging() -> None:
     constant.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     file_handler = logging.handlers.TimedRotatingFileHandler(
         constant.LOG_DIR / "ebms.log",
         when="D",
@@ -45,12 +43,17 @@ async def lifespan(app: FastAPI):
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
     if not constant.SECRET_KEY:
-        logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
+        logging.getLogger(__name__).warning(
+            "EBMS_SECRET_KEY is not set. Using a random key until restart."
+        )
     if not auth.configured_oauths():
-        logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
+        logging.getLogger(__name__).warning(
+            "No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*."
+        )
     for folder in os.listdir(constant.TMP_DIR):
         cur_path = constant.TMP_DIR / folder
-        if cur_path.is_file(): continue
+        if cur_path.is_file():
+            continue
         Database().insert_songs(cur_path, True, True)
     yield
 
@@ -65,12 +68,14 @@ app.mount(
 app.include_router(auth.router)
 app.middleware("http")(auth.refresh_session_cookie)
 
+
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="pages/root.html",
     )
+
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
@@ -103,7 +108,9 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, end
 
 
-def blob_response(request: Request, table: str, row_id: int, filename: str, detail: str) -> Response:
+def blob_response(
+    request: Request, table: str, row_id: int, filename: str, detail: str
+) -> Response:
     """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다."""
     blob = Database().open_blob(table, row_id)
     if blob is None:
@@ -116,7 +123,10 @@ def blob_response(request: Request, table: str, row_id: int, filename: str, deta
     }
 
     if_none_match = request.headers.get("if-none-match")
-    if if_none_match and (if_none_match.strip() == "*" or etag in [t.strip() for t in if_none_match.split(",")]):
+    if if_none_match and (
+        if_none_match.strip() == "*"
+        or etag in [t.strip() for t in if_none_match.split(",")]
+    ):
         blob.close()
         return Response(status_code=304, headers=headers)
 
@@ -148,6 +158,7 @@ def blob_response(request: Request, table: str, row_id: int, filename: str, deta
         headers=headers,
     )
 
+
 @app.get("/api/version")
 def get_version():
     try:
@@ -157,6 +168,7 @@ def get_version():
     # 로그인 가능한 OAuth. 클라이언트가 로그인 필요 여부와 수단을 알 수 있게 합니다.
     auth_oauths = [p.name for p in auth.configured_oauths()]
     return {"api": constant.API_VERSION, "server": server, "auth": auth_oauths}
+
 
 @app.get("/api/files/chart/{chunk_id}")
 def download_chart_chunk_file(chunk_id: int, request: Request):
@@ -168,13 +180,16 @@ def download_chart_chunk_file(chunk_id: int, request: Request):
         "File not found",
     )
 
+
 @app.get("/api/charthash")
 def get_chart_hash():
     return Database().get_chart_chunk_hash()
 
+
 @app.get("/api/manifest/hash")
 def get_manifest_hash():
     return Database().get_manifest_hash()
+
 
 @app.get("/api/manifest/{chunk_id}")
 def get_manifest(chunk_id: int, request: Request):
@@ -188,18 +203,17 @@ def get_manifest(chunk_id: int, request: Request):
         data = gzip.decompress(data)
     return Response(data, media_type="application/json", headers=headers)
 
+
 @app.get("/api/files/song/id/{song_id}")
 def download_song_by_id(song_id: int, request: Request):
     return blob_response(request, "song", song_id, f"{song_id}.zip", "song not found")
+
 
 @app.get("/api/files/song/{chart_sha256}")
 def download_song(chart_sha256: str, request: Request):
     song_id = Database().get_song_id(chart_sha256)
     if (song_id) is None:
-        raise HTTPException(
-            status_code=404,
-            detail="chart file not found"
-        )
+        raise HTTPException(status_code=404, detail="chart file not found")
     return blob_response(
         request,
         "song",

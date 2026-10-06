@@ -3,6 +3,7 @@
 계정은 내부 UUID(user.id)로만 구분합니다. OAuth는 로그인 순간 UUID를 찾는 데만 쓰고,
 세션과 권한은 모두 user.id에 붙습니다. 세션 토큰은 원문 대신 sha256만 저장합니다.
 """
+
 import hashlib
 import secrets
 import time
@@ -14,7 +15,10 @@ import pymysql
 from . import constant, db
 
 # 세션 종류별 유효기간(초). 쓸 때마다 이만큼 연장됩니다.
-SESSION_SECONDS = {"web": constant.WEB_SESSION_SECONDS, "client": constant.CLIENT_SESSION_SECONDS}
+SESSION_SECONDS = {
+    "web": constant.WEB_SESSION_SECONDS,
+    "client": constant.CLIENT_SESSION_SECONDS,
+}
 # last_used_at/expires_at 갱신 최소 간격. 요청마다 UPDATE하지 않기 위함입니다.
 TOUCH_INTERVAL = 60
 
@@ -55,6 +59,7 @@ class Session:
 @dataclass
 class Profile:
     """OAuth가 알려준 사용자 정보."""
+
     oauth: str
     oauth_user_id: str
     email: str | None
@@ -70,7 +75,11 @@ def token_hash(token: str) -> str:
 
 
 def _is_admin_email(profile: Profile) -> bool:
-    return bool(profile.email and profile.email_verified and profile.email.lower() in constant.ADMIN_EMAILS)
+    return bool(
+        profile.email
+        and profile.email_verified
+        and profile.email.lower() in constant.ADMIN_EMAILS
+    )
 
 
 def get_user(user_id: str) -> User | None:
@@ -78,6 +87,16 @@ def get_user(user_id: str) -> User | None:
         cur.execute(f"SELECT {_USER_COLUMNS} FROM user WHERE id = %s", (user_id,))
         row = cur.fetchone()
     return User(*row) if row else None
+
+
+def delete_account(user_id: str) -> None:
+    """계정을 삭제합니다."""
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM auth_code WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM session WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM user_identity WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM user WHERE id = %s", (user_id,))
+        con.commit()
 
 
 def login(profile: Profile) -> User:
@@ -114,12 +133,19 @@ def _login(profile: Profile) -> User:
                 user_id = str(uuid.uuid4())
                 cur.execute(
                     "INSERT INTO user (id, display_name, email, created_at) VALUES (%s, %s, %s, %s)",
-                    (user_id, profile.name, profile.email if profile.email_verified else None, now),
+                    (
+                        user_id,
+                        profile.name,
+                        profile.email if profile.email_verified else None,
+                        now,
+                    ),
                 )
                 _insert_identity(cur, user_id, profile, now)
             if _is_admin_email(profile):
                 cur.execute("UPDATE user SET role = 'admin' WHERE id = %s", (user_id,))
-            cur.execute("UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id))
+            cur.execute(
+                "UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id)
+            )
             con.commit()
         except Exception:
             con.rollback()
@@ -133,7 +159,14 @@ def _insert_identity(cur, user_id: str, profile: Profile, now: int) -> None:
         INSERT INTO user_identity (user_id, oauth, oauth_user_id, email, name, linked_at)
         VALUES (%s, %s, %s, %s, %s, %s)
         """,
-        (user_id, profile.oauth, profile.oauth_user_id, profile.email, profile.name, now),
+        (
+            user_id,
+            profile.oauth,
+            profile.oauth_user_id,
+            profile.email,
+            profile.name,
+            now,
+        ),
     )
 
 
@@ -179,14 +212,19 @@ def unlink(user_id: str, identity_id: int) -> str:
     with db.connect() as con, con.cursor() as cur:
         try:
             # 동시에 두 개를 해제해 0개가 되지 않도록 user의 연결을 잠근 뒤 셉니다.
-            cur.execute("SELECT id FROM user_identity WHERE user_id = %s FOR UPDATE", (user_id,))
+            cur.execute(
+                "SELECT id FROM user_identity WHERE user_id = %s FOR UPDATE", (user_id,)
+            )
             ids = [row[0] for row in cur.fetchall()]
             if identity_id not in ids:
                 result = "not_found"
             elif len(ids) <= 1:
                 result = "last"
             else:
-                cur.execute("DELETE FROM user_identity WHERE id = %s AND user_id = %s", (identity_id, user_id))
+                cur.execute(
+                    "DELETE FROM user_identity WHERE id = %s AND user_id = %s",
+                    (identity_id, user_id),
+                )
                 result = "ok"
             con.commit()
         except Exception:
@@ -205,7 +243,15 @@ def create_session(user_id: str, kind: str, device_name: str) -> str:
             INSERT INTO session (token_sha256, user_id, kind, device_name, created_at, last_used_at, expires_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (token_hash(token), user_id, kind, device_name[:255], now, now, now + SESSION_SECONDS[kind]),
+            (
+                token_hash(token),
+                user_id,
+                kind,
+                device_name[:255],
+                now,
+                now,
+                now + SESSION_SECONDS[kind],
+            ),
         )
         con.commit()
     return token
@@ -265,7 +311,9 @@ def revoke_session(user_id: str, session_id: int) -> bool:
     return changed
 
 
-def create_auth_code(user_id: str, code_challenge: str, redirect_uri: str, device_name: str) -> str:
+def create_auth_code(
+    user_id: str, code_challenge: str, redirect_uri: str, device_name: str
+) -> str:
     """클라이언트 로그인용 1회용 코드를 만들고 원문을 반환합니다."""
     code = secrets.token_urlsafe(32)
     now = int(time.time())
@@ -277,7 +325,15 @@ def create_auth_code(user_id: str, code_challenge: str, redirect_uri: str, devic
             INSERT INTO auth_code (code_sha256, user_id, code_challenge, redirect_uri, device_name, created_at, expires_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (token_hash(code), user_id, code_challenge, redirect_uri, device_name[:255], now, now + constant.AUTH_CODE_SECONDS),
+            (
+                token_hash(code),
+                user_id,
+                code_challenge,
+                redirect_uri,
+                device_name[:255],
+                now,
+                now + constant.AUTH_CODE_SECONDS,
+            ),
         )
         con.commit()
     return code
@@ -305,4 +361,3 @@ def consume_auth_code(code: str) -> tuple[str, str, str] | None:
         row = cur.fetchone()
         con.commit()
     return tuple(row) if row else None
-

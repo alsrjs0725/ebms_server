@@ -35,7 +35,9 @@ DISCORD_CLIENT_ID = os.environ.get("EBMS_DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.environ.get("EBMS_DISCORD_CLIENT_SECRET", "")
 # 로그인할 때 OAuth가 확인한 이메일이 이 목록에 있으면 admin으로 지정합니다(쉼표로 구분).
 ADMIN_EMAILS = {
-    e.strip().lower() for e in os.environ.get("EBMS_ADMIN_EMAILS", "").split(",") if e.strip()
+    e.strip().lower()
+    for e in os.environ.get("EBMS_ADMIN_EMAILS", "").split(",")
+    if e.strip()
 }
 SESSION_COOKIE = "ebms_session"
 # 웹 세션 유효기간. 쓸 때마다 연장됩니다.

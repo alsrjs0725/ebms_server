@@ -6,6 +6,7 @@ OAuth 진행 중에만 필요한 state·PKCE verifier는 DB 대신 서명된 단
 클라이언트는 루프백 리다이렉트 + PKCE(RFC 8252)로 1회용 코드를 받아 세션키로 바꾸고,
 이후 `Authorization: Bearer <세션키>`로 API를 호출합니다.
 """
+
 import base64
 import hashlib
 import hmac
@@ -133,15 +134,20 @@ def fetch_profile(oauth: OAuth, code: str, code_verifier: str) -> Profile:
     if oauth.pkce:
         form["code_verifier"] = code_verifier
     with httpx.Client(timeout=10) as http:
-        r = http.post(oauth.token_url, data=form, headers={"Accept": "application/json"})
+        r = http.post(
+            oauth.token_url, data=form, headers={"Accept": "application/json"}
+        )
         r.raise_for_status()
         access_token = r.json()["access_token"]
-        r = http.get(oauth.userinfo_url, headers={"Authorization": f"Bearer {access_token}"})
+        r = http.get(
+            oauth.userinfo_url, headers={"Authorization": f"Bearer {access_token}"}
+        )
         r.raise_for_status()
         return oauth.parse_profile(r.json())
 
 
 # ---- 서명된 쿠키 ----
+
 
 def _secret() -> bytes:
     return constant.SECRET_KEY.encode() if constant.SECRET_KEY else _fallback_secret
@@ -184,18 +190,28 @@ def _secure_cookie() -> bool:
 
 def safe_next(next_url: str | None, default: str = "/account") -> str:
     """로그인 후 이동할 곳. 같은 사이트의 경로만 허용합니다(오픈 리다이렉트 방지)."""
-    if next_url and next_url.startswith("/") and not next_url.startswith("//") and "\\" not in next_url:
+    if (
+        next_url
+        and next_url.startswith("/")
+        and not next_url.startswith("//")
+        and "\\" not in next_url
+    ):
         return next_url
     return default
 
 
 # ---- 현재 사용자 ----
 
+
 def set_session_cookie(response: Response, token: str) -> None:
     response.set_cookie(
-        constant.SESSION_COOKIE, token,
-        max_age=constant.WEB_SESSION_SECONDS, path="/",
-        httponly=True, samesite="lax", secure=_secure_cookie(),
+        constant.SESSION_COOKIE,
+        token,
+        max_age=constant.WEB_SESSION_SECONDS,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_secure_cookie(),
     )
 
 
@@ -218,7 +234,8 @@ async def refresh_session_cookie(request: Request, call_next):
     response = await call_next(request)
     token = getattr(request.state, "web_session_token", None)
     if token and not any(
-        v.startswith(f"{constant.SESSION_COOKIE}=") for v in response.headers.getlist("set-cookie")
+        v.startswith(f"{constant.SESSION_COOKIE}=")
+        for v in response.headers.getlist("set-cookie")
     ):
         set_session_cookie(response, token)
     return response
@@ -244,24 +261,36 @@ def optional_api_session(request: Request) -> tuple[User, int, str] | None:
     return (*session, "web") if session else None
 
 
-def api_session(session: Annotated[tuple[User, int, str] | None, Depends(optional_api_session)]) -> tuple[User, int, str]:
+def api_session(
+    session: Annotated[tuple[User, int, str] | None, Depends(optional_api_session)],
+) -> tuple[User, int, str]:
     """로그인한 API 요청. 없거나 만료·폐기된 세션이면 401."""
     if session is None:
-        raise HTTPException(status_code=401, detail="login required", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(
+            status_code=401,
+            detail="login required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return session
 
 
-def current_user(session: Annotated[tuple[User, int, str], Depends(api_session)]) -> User:
+def current_user(
+    session: Annotated[tuple[User, int, str], Depends(api_session)],
+) -> User:
     """세션키(Bearer) 또는 웹 세션 쿠키로 로그인한 사용자. 없으면 401."""
     return session[0]
 
 
 def _login_redirect(request: Request) -> RedirectResponse:
     target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-    return RedirectResponse(f"/login?{urllib.parse.urlencode({'next': target})}", status_code=303)
+    return RedirectResponse(
+        f"/login?{urllib.parse.urlencode({'next': target})}", status_code=303
+    )
 
 
-def _message(request: Request, title: str, message: str, status_code: int, back: str = "/login") -> HTMLResponse:
+def _message(
+    request: Request, title: str, message: str, status_code: int, back: str = "/login"
+) -> HTMLResponse:
     return templates.TemplateResponse(
         request=request,
         name="pages/message.html",
@@ -272,8 +301,13 @@ def _message(request: Request, title: str, message: str, status_code: int, back:
 
 # ---- 라우트 ----
 
+
 @router.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, session: Annotated[tuple[User, int] | None, Depends(optional_session)], next: str | None = None):
+def login_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+    next: str | None = None,
+):
     return templates.TemplateResponse(
         request=request,
         name="pages/login.html",
@@ -310,19 +344,27 @@ def auth_start(
         params["code_challenge_method"] = "S256"
     if oauth.name == "google":
         params["prompt"] = "select_account"
-    response = RedirectResponse(f"{oauth.authorize_url}?{urllib.parse.urlencode(params)}", status_code=303)
-    cookie = sign({
-        "p": oauth.name,
-        "s": state,
-        "v": verifier,
-        "n": safe_next(next),
-        "l": session[0].id if link else None,
-        "exp": int(time.time()) + constant.OAUTH_STATE_SECONDS,
-    })
+    response = RedirectResponse(
+        f"{oauth.authorize_url}?{urllib.parse.urlencode(params)}", status_code=303
+    )
+    cookie = sign(
+        {
+            "p": oauth.name,
+            "s": state,
+            "v": verifier,
+            "n": safe_next(next),
+            "l": session[0].id if link else None,
+            "exp": int(time.time()) + constant.OAUTH_STATE_SECONDS,
+        }
+    )
     response.set_cookie(
-        STATE_COOKIE, cookie,
-        max_age=constant.OAUTH_STATE_SECONDS, path="/auth/",
-        httponly=True, samesite="lax", secure=_secure_cookie(),
+        STATE_COOKIE,
+        cookie,
+        max_age=constant.OAUTH_STATE_SECONDS,
+        path="/auth/",
+        httponly=True,
+        samesite="lax",
+        secure=_secure_cookie(),
     )
     return response
 
@@ -339,45 +381,72 @@ def auth_callback(
     oauth = get_oauth(oauth_name)
     pending = unsign(request.cookies.get(STATE_COOKIE))
     if error:
-        response = _message(request, "로그인 취소", f"{oauth.label} 로그인이 취소됐습니다.", 400)
+        response = _message(
+            request, "로그인 취소", f"{oauth.label} 로그인이 취소됐습니다.", 400
+        )
     elif (
-        pending is None or not code or not state
+        pending is None
+        or not code
+        or not state
         or pending.get("p") != oauth.name
         or not hmac.compare_digest(str(pending.get("s")), state)
     ):
-        response = _message(request, "로그인 실패", "로그인 요청이 만료됐거나 올바르지 않습니다. 다시 시도해 주세요.", 400)
+        response = _message(
+            request,
+            "로그인 실패",
+            "로그인 요청이 만료됐거나 올바르지 않습니다. 다시 시도해 주세요.",
+            400,
+        )
     else:
         response = _finish_login(request, oauth, pending, code, session)
     response.delete_cookie(STATE_COOKIE, path="/auth/")
     return response
 
 
-def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, session) -> Response:
+def _finish_login(
+    request: Request, oauth: OAuth, pending: dict, code: str, session
+) -> Response:
     try:
         profile = fetch_profile(oauth, code, pending["v"])
     except (httpx.HTTPError, KeyError, ValueError):
         logger.exception("OAuth token exchange failed: %s", oauth.name)
-        return _message(request, "로그인 실패", f"{oauth.label}에서 사용자 정보를 받지 못했습니다. 다시 시도해 주세요.", 502)
+        return _message(
+            request,
+            "로그인 실패",
+            f"{oauth.label}에서 사용자 정보를 받지 못했습니다. 다시 시도해 주세요.",
+            502,
+        )
 
     link_user_id = pending.get("l")
     if link_user_id:
         # 연결은 시작할 때와 같은 계정으로 로그인돼 있을 때만 허용합니다.
         if session is None or session[0].id != link_user_id:
-            return _message(request, "연결 실패", "로그인 상태가 바뀌었습니다. 다시 로그인한 뒤 연결해 주세요.", 400)
+            return _message(
+                request,
+                "연결 실패",
+                "로그인 상태가 바뀌었습니다. 다시 로그인한 뒤 연결해 주세요.",
+                400,
+            )
         result = accounts.link(link_user_id, profile)
         if result == "taken":
             return _message(
-                request, "연결 실패",
+                request,
+                "연결 실패",
                 f"이 {oauth.label} 계정은 이미 다른 EBMS 계정에 연결돼 있습니다. "
                 "그 계정에서 연결을 해제한 뒤 다시 시도해 주세요.",
-                409, back="/account",
+                409,
+                back="/account",
             )
         return RedirectResponse(pending.get("n") or "/account", status_code=303)
 
     user = accounts.login(profile)
     if user.status != "active":
-        return _message(request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403)
-    token = accounts.create_session(user.id, "web", request.headers.get("user-agent", ""))
+        return _message(
+            request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403
+        )
+    token = accounts.create_session(
+        user.id, "web", request.headers.get("user-agent", "")
+    )
     response = RedirectResponse(pending.get("n") or "/account", status_code=303)
     set_session_cookie(response, token)
     # 쿠키가 새 세션으로 바뀌므로 이전 웹 세션은 폐기합니다.
@@ -396,7 +465,10 @@ def logout(session: Annotated[tuple[User, int] | None, Depends(optional_session)
 
 
 @router.get("/account", response_class=HTMLResponse)
-def account_page(request: Request, session: Annotated[tuple[User, int] | None, Depends(optional_session)]):
+def account_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+):
     if session is None:
         return _login_redirect(request)
     user, session_id = session
@@ -416,13 +488,23 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
     )
 
 
+@router.delete("/api/account", status_code=204)
+def delete_account(user: Annotated[User, Depends(current_user)]):
+    accounts.delete_account(user.id)
+    response = Response(status_code=204)
+    response.delete_cookie(constant.SESSION_COOKIE, path="/")
+    return response
+
+
 @router.delete("/api/account/identities/{identity_id}", status_code=204)
 def delete_identity(identity_id: int, user: Annotated[User, Depends(current_user)]):
     result = accounts.unlink(user.id, identity_id)
     if result == "not_found":
         raise HTTPException(status_code=404, detail="identity not found")
     if result == "last":
-        raise HTTPException(status_code=409, detail="cannot remove the last login method")
+        raise HTTPException(
+            status_code=409, detail="cannot remove the last login method"
+        )
     return Response(status_code=204)
 
 
@@ -461,12 +543,19 @@ def is_loopback_redirect(uri: str) -> bool:
 
 def _with_query(uri: str, params: dict) -> str:
     parts = urllib.parse.urlsplit(uri)
-    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True) + list(params.items())
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True) + list(
+        params.items()
+    )
     return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
 def _user_json(user: User) -> dict:
-    return {"id": user.id, "display_name": user.display_name, "email": user.email, "role": user.role}
+    return {
+        "id": user.id,
+        "display_name": user.display_name,
+        "email": user.email,
+        "role": user.role,
+    }
 
 
 @router.get("/auth/client/authorize")
@@ -482,21 +571,29 @@ def client_authorize(
     """클라이언트 로그인 시작. 웹에 로그인돼 있으면 1회용 코드를 붙여 클라이언트로 돌려보냅니다."""
     if (
         not is_loopback_redirect(redirect_uri)
-        or not state or len(state) > 512
+        or not state
+        or len(state) > 512
         or code_challenge_method != "S256"
         or not _CHALLENGE_RE.fullmatch(code_challenge)
     ):
         return _message(
-            request, "로그인 실패",
+            request,
+            "로그인 실패",
             "클라이언트 로그인 요청이 올바르지 않습니다. 클라이언트에서 다시 로그인해 주세요.",
-            400, back="/account",
+            400,
+            back="/account",
         )
     if session is None:
         return _login_redirect(request)
     code = accounts.create_auth_code(
-        session[0].id, code_challenge, redirect_uri, device_name.strip() or DEFAULT_DEVICE_NAME,
+        session[0].id,
+        code_challenge,
+        redirect_uri,
+        device_name.strip() or DEFAULT_DEVICE_NAME,
     )
-    return RedirectResponse(_with_query(redirect_uri, {"code": code, "state": state}), status_code=303)
+    return RedirectResponse(
+        _with_query(redirect_uri, {"code": code, "state": state}), status_code=303
+    )
 
 
 class ClientTokenRequest(BaseModel):
@@ -532,7 +629,11 @@ def client_logout(request: Request):
     token = bearer_token(request)
     session = accounts.authenticate(token, "client") if token else None
     if session is None:
-        raise HTTPException(status_code=401, detail="login required", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(
+            status_code=401,
+            detail="login required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     accounts.revoke_session(session[0].id, session[1])
     return Response(status_code=204)
 
