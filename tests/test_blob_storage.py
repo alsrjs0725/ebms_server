@@ -222,7 +222,8 @@ def test_manifest(tmp_path, client):
     assert sorted(files) == ["a.bms", "b.bme", "bga/movie.bin", "sound.wav"]
 
     # offset으로 Range 요청해 파일 하나만 꺼낼 수 있어야 합니다.
-    import struct, zlib
+    import struct
+    import zlib
     f = files["bga/movie.bin"]
     head = client.get("/api/files/song/id/1", headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"}).content
     name_len, extra_len = struct.unpack("<HH", head[26:30])

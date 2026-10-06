@@ -62,9 +62,6 @@ class Profile:
     name: str
 
 
-_USER_COLUMNS = "id, display_name, email, role, status"
-
-
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -75,7 +72,7 @@ def _is_admin_email(profile: Profile) -> bool:
 
 def get_user(user_id: str) -> User | None:
     with db.connect() as con, con.cursor() as cur:
-        cur.execute(f"SELECT {_USER_COLUMNS} FROM user WHERE id = %s", (user_id,))
+        cur.execute("SELECT id, display_name, email, role, status FROM user WHERE id = %s", (user_id,))
         row = cur.fetchone()
     return User(*row) if row else None
 

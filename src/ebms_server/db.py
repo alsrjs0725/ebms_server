@@ -434,11 +434,11 @@ class Database:
             self.logger.warning(f"insert_song failed: Path doesn't exist[{str(root)}]")
             return
         if (not os.path.isdir(root)):
-            self.logger.warning(f"insert_song failed: Path isn't directory")
+            self.logger.warning("insert_song failed: Path isn't directory")
             return
         for file_name in os.listdir(song_path):
             full_path = root / file_name
-            if (full_path.suffix.lower() in constant.BMS_FORMAT): break;
+            if (full_path.suffix.lower() in constant.BMS_FORMAT): break
         else:
             self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
             return
