@@ -19,9 +19,50 @@ docker compose up -d --build
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
 - 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
 
+## 로그인 설정 (Google, Discord)
+
+계정은 내부 UUID로 관리하고, 한 계정에 Google·Discord를 함께 연결할 수 있습니다. `.env`에 아래 값을 넣고 `docker compose up -d`로 다시 올리면 됩니다. 키를 넣지 않은 OAuth는 로그인 페이지에 나오지 않습니다.
+
+| 변수 | 설명 |
+| --- | --- |
+| `EBMS_PUBLIC_URL` | 브라우저가 접속하는 서버 주소 (예: `https://ebms.example.com`). `https://`면 쿠키에 `Secure`가 붙습니다 |
+| `EBMS_SECRET_KEY` | 쿠키 서명용 임의 문자열. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `EBMS_GOOGLE_CLIENT_ID`, `EBMS_GOOGLE_CLIENT_SECRET` | Google OAuth 클라이언트 |
+| `EBMS_DISCORD_CLIENT_ID`, `EBMS_DISCORD_CLIENT_SECRET` | Discord OAuth 앱 |
+| `EBMS_ADMIN_EMAILS` | 이 이메일(OAuth가 확인한 것만)로 로그인하면 관리자로 지정. 쉼표로 구분 |
+
+### Google
+
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → 사용자 인증 정보 만들기 → **OAuth 클라이언트 ID** → 애플리케이션 유형 **웹 애플리케이션**
+2. 승인된 리디렉션 URI: `<EBMS_PUBLIC_URL>/auth/google/callback`
+3. OAuth 동의 화면의 범위는 `openid`, `email`, `profile`이면 충분합니다.
+4. 발급된 클라이언트 ID/보안 비밀을 `EBMS_GOOGLE_CLIENT_ID`/`EBMS_GOOGLE_CLIENT_SECRET`에 넣습니다.
+
+### Discord
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) → New Application → **OAuth2**
+2. Redirects에 `<EBMS_PUBLIC_URL>/auth/discord/callback` 추가
+3. Client ID/Client Secret을 `EBMS_DISCORD_CLIENT_ID`/`EBMS_DISCORD_CLIENT_SECRET`에 넣습니다. 요청 범위는 `identify email`입니다.
+
+### 웹 페이지
+
+| 메서드 | 경로 | 설명 |
+| --- | --- | --- |
+| GET | `/login?next=<경로>` | 로그인 수단 선택. 로그인 후 `next`(같은 사이트 경로만, 기본 `/account`)로 이동 |
+| GET | `/auth/{oauth}/start` | OAuth 로그인 화면으로 이동. `?link=1`이면 로그인한 계정에 연결 |
+| GET | `/auth/{oauth}/callback` | OAuth가 돌아오는 주소. 계정을 찾거나 만들고 웹 세션 쿠키(`ebms_session`, 30일, 쓸 때마다 연장)를 발급 |
+| POST | `/auth/logout` | 현재 웹 세션 종료 |
+| GET | `/account` | 내 계정: 연결된 로그인 수단(연결·해제), 로그인된 기기(로그아웃) |
+| DELETE | `/api/account/identities/{id}` | 로그인 수단 연결 해제. 마지막 1개면 `409` |
+| DELETE | `/api/account/sessions/{id}` | 해당 기기 로그아웃. 없으면 `404` |
+
+- 처음 보는 OAuth 계정으로 로그인하면 새 계정을 만듭니다. 이메일이 같아도 자동으로 합치지 않으니, 다른 OAuth는 로그인한 상태에서 `/account`의 "연결"로 추가하세요.
+- 이미 다른 계정에 연결된 OAuth 계정은 연결할 수 없습니다(`409`).
+- `/api/account/*`는 웹 세션 쿠키가 없거나 만료되면 `401`입니다.
+
 ## HTTP API
 
-모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 인증은 없습니다.
+모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 아래 다운로드 API는 아직 인증 없이 열려 있습니다(로그인 필수는 이후 단계에서 적용).
 
 | 메서드 | 경로 | 설명 |
 | --- | --- | --- |

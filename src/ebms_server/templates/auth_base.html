@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block body %}
+<nav class="navbar navbar-dark bg-dark">
+    <div class="container px-4">
+        <a class="navbar-brand" href="/">EBMS</a>
+        {% if user %}
+        <div class="d-flex align-items-center gap-3">
+            <a class="nav-link text-white" href="/account">{{ user.display_name or "내 계정" }}</a>
+            <form method="post" action="/auth/logout" class="m-0">
+                <button type="submit" class="btn btn-sm btn-outline-light">로그아웃</button>
+            </form>
+        </div>
+        {% endif %}
+    </div>
+</nav>
+<main class="container px-4 py-5" style="max-width: 720px">
+    {% block content %}{% endblock %}
+</main>
+{% endblock %}

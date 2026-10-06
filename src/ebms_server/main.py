@@ -7,11 +7,11 @@ import re
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import constant
+from . import auth, constant
+from .templating import templates
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 
 def configure_logging() -> None:
@@ -44,6 +44,10 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("DB is now loading...")
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
+    if not constant.SECRET_KEY:
+        logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
+    if not auth.configured_oauths():
+        logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     for folder in os.listdir(constant.TMP_DIR):
         cur_path = constant.TMP_DIR / folder
         if cur_path.is_file(): continue
@@ -53,14 +57,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-templates = Jinja2Templates(
-    directory=constant.BASE_DIR / "src" / "ebms_server" / "templates"
-)
 app.mount(
     "/static",
     StaticFiles(directory=constant.BASE_DIR / "src" / "ebms_server" / "static"),
     name="static",
 )
+app.include_router(auth.router)
+app.middleware("http")(auth.refresh_session_cookie)
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request):

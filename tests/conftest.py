@@ -32,8 +32,8 @@ class SQLiteCursor:
         sql = re.sub(r"MEDIUMTEXT", "TEXT", sql, flags=re.IGNORECASE)
         sql = re.sub(r"CHAR\(64\)", "TEXT", sql, flags=re.IGNORECASE)
         sql = re.sub(r"VARCHAR\(\d+\)", "TEXT", sql, flags=re.IGNORECASE)
-        if "CREATE TABLE IF NOT EXISTS song" in sql:
-            sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)
+        if "PRIMARY KEY AUTOINCREMENT" in sql:
+            sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)\s*,?", "", sql, flags=re.IGNORECASE)
         if "CREATE TABLE IF NOT EXISTS chart_chunk" in sql:
             sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
             sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)

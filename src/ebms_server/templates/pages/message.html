@@ -1,0 +1,9 @@
+{% extends "auth_base.html" %}
+
+{% block title %}{{ title }} - EBMS{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">{{ title }}</h1>
+<p>{{ message }}</p>
+<a class="btn btn-primary" href="{{ back }}">돌아가기</a>
+{% endblock %}
