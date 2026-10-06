@@ -444,71 +444,18 @@ class Database:
             return
 
         with self._write_lock, connect() as con, con.cursor() as cur:
-            bms_files = []
-            song_id = None
-            for file in os.listdir(root):
-                file_path = root / file
-                if (file_path.suffix.lower() not in constant.BMS_FORMAT): continue
-
-                with open(file_path, "rb") as fos:
-                    sha256 = hashlib.sha256(fos.read()).hexdigest()
-                size = os.path.getsize(file_path)
-
-                cur.execute(
-                    """
-                    SELECT song_id
-                    FROM chart
-                    WHERE id = %s AND size = %s
-                    """,
-                    (sha256, size)
-                )
-
-                row = cur.fetchone()
-                if (row is not None):
-                    song_id = row[0]
-
-                bms_files.append((file_path, size, sha256))
+            bms_files, song_id = self._find_bms_files_and_existing_song(root, cur)
 
             new_song = False
             try:
                 if (song_id is None):
-                    data = self.create_zip(root)
-                    if not self._fits_packet(len(data)):
-                        self.logger.error(
-                            f"insert_song failed: song zip ({len(data)} bytes) exceeds "
-                            f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
-                        )
+                    song_id = self._insert_new_song(root, cur)
+                    if song_id is None:
                         return
-
-                    cur.execute(
-                        "INSERT INTO song (size, sha256, data, folder, files) VALUES (%s, %s, %s, %s, %s)",
-                        (
-                            len(data),
-                            hashlib.sha256(data).hexdigest(),
-                            data,
-                            root.resolve().name,
-                            json.dumps(zip_entries(data)),
-                        ),
-                    )
                     new_song = True
-                    song_id = cur.lastrowid
 
-                    self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
+                new_charts = self._insert_or_update_charts(root, bms_files, song_id, cur)
 
-                new_charts = []
-                for (chart_file_path, size, sha256) in bms_files:
-                    filename = chart_file_path.relative_to(root).as_posix()
-                    cur.execute(
-                        "INSERT IGNORE INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
-                        (str(sha256), song_id, size, filename),
-                    )
-                    if cur.rowcount == 1:
-                        new_charts.append((chart_file_path, sha256))
-                    elif song_id is not None:
-                        cur.execute(
-                            "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
-                            (filename, str(sha256), size),
-                        )
                 if new_charts:
                     self._append_charts_to_chunk(cur, new_charts)
                 if new_song or new_charts:
@@ -521,6 +468,73 @@ class Database:
 
         if remove:
             shutil.rmtree(song_path)
+
+    def _find_bms_files_and_existing_song(self, root: pathlib.Path, cur) -> tuple[list, int | None]:
+        bms_files = []
+        song_id = None
+        for file in os.listdir(root):
+            file_path = root / file
+            if (file_path.suffix.lower() not in constant.BMS_FORMAT): continue
+
+            with open(file_path, "rb") as fos:
+                sha256 = hashlib.sha256(fos.read()).hexdigest()
+            size = os.path.getsize(file_path)
+
+            cur.execute(
+                """
+                SELECT song_id
+                FROM chart
+                WHERE id = %s AND size = %s
+                """,
+                (sha256, size)
+            )
+
+            row = cur.fetchone()
+            if (row is not None):
+                song_id = row[0]
+
+            bms_files.append((file_path, size, sha256))
+        return bms_files, song_id
+
+    def _insert_new_song(self, root: pathlib.Path, cur) -> int | None:
+        data = self.create_zip(root)
+        if not self._fits_packet(len(data)):
+            self.logger.error(
+                f"insert_song failed: song zip ({len(data)} bytes) exceeds "
+                f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
+            )
+            return None
+
+        cur.execute(
+            "INSERT INTO song (size, sha256, data, folder, files) VALUES (%s, %s, %s, %s, %s)",
+            (
+                len(data),
+                hashlib.sha256(data).hexdigest(),
+                data,
+                root.resolve().name,
+                json.dumps(zip_entries(data)),
+            ),
+        )
+        song_id = cur.lastrowid
+        self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
+        return song_id
+
+    def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> list:
+        new_charts = []
+        for (chart_file_path, size, sha256) in bms_files:
+            filename = chart_file_path.relative_to(root).as_posix()
+            cur.execute(
+                "INSERT IGNORE INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
+                (str(sha256), song_id, size, filename),
+            )
+            if cur.rowcount == 1:
+                new_charts.append((chart_file_path, sha256))
+            elif song_id is not None:
+                cur.execute(
+                    "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
+                    (filename, str(sha256), size),
+                )
+        return new_charts
 
     def insert_songs(self, directory:os.PathLike, reculsive=False, remove=False) -> None:
         root_dir = pathlib.Path(directory)
