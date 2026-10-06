@@ -1,0 +1,44 @@
+services:
+  mysql:
+    image: mysql:8.4
+    # ports를 열지 않음: compose 내부 네트워크에서 ebms 컨테이너만 접근
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ebms}
+      MYSQL_USER: ${MYSQL_USER:-ebms}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ebms}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 압축 파일을 BLOB으로 주고받기 위해 패킷 한도를 키움
+      - --max_allowed_packet=1G
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ebms:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      EBMS_DB_HOST: mysql
+      EBMS_DB_PORT: 3306
+      EBMS_DB_NAME: ${MYSQL_DATABASE:-ebms}
+      EBMS_DB_USER: ${MYSQL_USER:-ebms}
+      EBMS_DB_PASSWORD: ${MYSQL_PASSWORD:-ebms}
+    ports:
+      - "${EBMS_PORT:-8000}:8000"
+    volumes:
+      - ebms-var:/app/var
+
+volumes:
+  mysql-data:
+  ebms-var:
