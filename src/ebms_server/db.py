@@ -584,6 +584,32 @@ class Database:
 
             return info
 
+        def _add_entry(path: pathlib.Path, zf: zipfile.ZipFile) -> None:
+            arcname = get_arcname(path)
+
+            if path.is_dir():
+                # 빈 디렉터리는 명시적으로 저장
+                try:
+                    next(path.iterdir())
+                except StopIteration:
+                    info = make_zipinfo(
+                        arcname,
+                        is_dir=True,
+                    )
+                    zf.writestr(info, b"")
+
+            elif path.is_file():
+                info = make_zipinfo(arcname)
+                info.compress_type = zipfile.ZIP_DEFLATED
+
+                with path.open("rb") as f:
+                    zf.writestr(
+                        info,
+                        f.read(),
+                        compress_type=zipfile.ZIP_DEFLATED,
+                        compresslevel=6,
+                    )
+
         buf = io.BytesIO()
         with zipfile.ZipFile(
             buf,
@@ -593,30 +619,7 @@ class Database:
         ) as zf:
 
             for path in source_dir.rglob("*"):
-                arcname = get_arcname(path)
-
-                if path.is_dir():
-                    # 빈 디렉터리는 명시적으로 저장
-                    try:
-                        next(path.iterdir())
-                    except StopIteration:
-                        info = make_zipinfo(
-                            arcname,
-                            is_dir=True,
-                        )
-                        zf.writestr(info, b"")
-
-                elif path.is_file():
-                    info = make_zipinfo(arcname)
-                    info.compress_type = zipfile.ZIP_DEFLATED
-
-                    with path.open("rb") as f:
-                        zf.writestr(
-                            info,
-                            f.read(),
-                            compress_type=zipfile.ZIP_DEFLATED,
-                            compresslevel=6,
-                        )
+                _add_entry(path, zf)
 
         return buf.getvalue()
 
