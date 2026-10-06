@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from .db import Database
 from . import constant
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -66,15 +66,28 @@ def read_root(request: Request):
         name="pages/root.html",
     )
 
+def blob_response(table: str, row_id: int, filename: str, detail: str) -> StreamingResponse:
+    blob = Database().open_blob(table, row_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail=detail)
+    size, body = blob
+    return StreamingResponse(
+        body,
+        media_type="application/zip",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
 @app.get("/api/files/chart/{chunk_id}")
 def download_chart_chunk_file(chunk_id: int):
-    file_path = constant.CHART_DATA_DIR / constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id)
-    if not os.path.exists(file_path):
-        raise HTTPException(
-            status_code=404,
-            detail="File not found"
-        )
-    return FileResponse(file_path)
+    return blob_response(
+        "chart_chunk",
+        chunk_id,
+        constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
+        "File not found",
+    )
 
 @app.get("/api/charthash")
 def get_chart_hash():
@@ -88,11 +101,9 @@ def download_song(chart_sha256:str):
             status_code=404,
             detail="chart file not found"
         )
-    print(song_id)
-    song_path = Database().get_song_file(song_id)
-    if song_path is None:
-        raise HTTPException(
-            status_code=404,
-            detail="chart file found but song file not found. report this to admin."
-        )
-    return FileResponse(song_path)
+    return blob_response(
+        "song",
+        song_id,
+        f"{song_id}.zip",
+        "chart file found but song file not found. report this to admin.",
+    )
