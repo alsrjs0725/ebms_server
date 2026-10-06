@@ -3,6 +3,7 @@ import os
 import gzip
 import json
 import pathlib
+import posixpath
 import hashlib
 import logging
 import shutil
@@ -71,6 +72,11 @@ SCHEMA = [
             status VARCHAR(16) NOT NULL DEFAULT 'active',
             created_at BIGINT UNSIGNED NOT NULL,
             last_login_at BIGINT UNSIGNED,
+            -- 사용자별 할당량. NULL이면 setting의 전역 기본값을 씁니다.
+            max_tickets INT UNSIGNED,
+            refill_seconds INT UNSIGNED,
+            pre_monthly_bytes BIGINT UNSIGNED,
+            pre_throttled_kbps INT UNSIGNED,
 
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -127,6 +133,49 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 할당량 전역 기본값. 관리자 페이지에서 수정합니다. 값은 정수 문자열입니다.
+    """
+        CREATE TABLE IF NOT EXISTS setting(
+            name VARCHAR(64) NOT NULL,
+            value VARCHAR(255) NOT NULL,
+
+            PRIMARY KEY (name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 남은 플레이 티켓. 요청 때 경과 시간만큼 채워 계산합니다(타이머 없음). 행이 없으면 가득 찬 상태입니다.
+    """
+        CREATE TABLE IF NOT EXISTS user_ticket(
+            user_id CHAR(36) NOT NULL,
+            tickets DOUBLE NOT NULL,
+            updated_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (user_id),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 티켓을 쓴 곡. expires_at 전에는 같은 곡을 다시 받아도 차감하지 않습니다.
+    """
+        CREATE TABLE IF NOT EXISTS download_grant(
+            user_id CHAR(36) NOT NULL,
+            song_id INT UNSIGNED NOT NULL,
+            charged_at BIGINT UNSIGNED NOT NULL,
+            expires_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (user_id, song_id),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 월별 사전 다운로드 사용량(실제 전송한 바이트). month는 KST 기준 YYYY-MM입니다.
+    """
+        CREATE TABLE IF NOT EXISTS pre_usage(
+            user_id CHAR(36) NOT NULL,
+            month CHAR(7) NOT NULL,
+            bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+
+            PRIMARY KEY (user_id, month),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
@@ -134,12 +183,75 @@ MISSING_COLUMNS = [
     ("song", "folder", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
     ("song", "files", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("chart", "filename", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
+    ("user", "max_tickets", "INT UNSIGNED"),
+    ("user", "refill_seconds", "INT UNSIGNED"),
+    ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
+    ("user", "pre_throttled_kbps", "INT UNSIGNED"),
 ]
+
+
+# 사전 파일을 가리키는 차트 헤더와, 파일 확장자가 달라도 같은 파일로 보는 종류(BMS 플레이어의 확장자 대체)
+PRE_HEADERS = {
+    b"#BANNER": constant.IMAGE_FORMAT,
+    b"#STAGEFILE": constant.IMAGE_FORMAT,
+    b"#BACKBMP": constant.IMAGE_FORMAT,
+    b"#PREVIEW": constant.AUDIO_FORMAT,
+}
+# 차트 헤더 값(파일명)의 인코딩 후보
+CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
+
+
+def _header_targets(chart: bytes, base: str) -> list[tuple[str, tuple[str, ...]]]:
+    """차트 헤더가 가리키는 파일의 (소문자 경로, 대체 가능한 확장자)를 반환합니다. base는 차트가 있는 폴더입니다."""
+    targets = []
+    for line in chart.splitlines():
+        line = line.strip()
+        for header, formats in PRE_HEADERS.items():
+            if line[:len(header)].upper() != header or line[len(header):len(header) + 1] not in (b" ", b"\t"):
+                continue
+            value = line[len(header):].strip()
+            for encoding in CHART_ENCODINGS:
+                try:
+                    name = value.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+                path = posixpath.normpath(posixpath.join(base, name.replace("\\", "/"))).lower()
+                targets.append((path, formats))
+    return targets
+
+
+def file_kinds(zf: zipfile.ZipFile) -> dict[str, str]:
+    """곡 zip 항목별 다운로드 구분. pre(사전): 차트, 차트 헤더 #BANNER·#STAGEFILE·#BACKBMP·#PREVIEW가
+    가리키는 파일, preview*로 시작하는 파일. play(플레이): 나머지(키음, BGA 등)."""
+    infos = [info for info in zf.infolist() if not info.is_dir()]
+    exact: set[str] = set()
+    by_stem: dict[str, set[str]] = defaultdict(set)
+    for info in infos:
+        path = pathlib.PurePosixPath(info.filename)
+        if path.suffix.lower() not in constant.BMS_FORMAT:
+            continue
+        for target, formats in _header_targets(zf.read(info), path.parent.as_posix()):
+            exact.add(target)
+            by_stem[posixpath.splitext(target)[0]].update(formats)
+
+    kinds = {}
+    for info in infos:
+        lower = info.filename.lower()
+        stem, ext = posixpath.splitext(lower)
+        pre = (
+            ext in constant.BMS_FORMAT
+            or posixpath.basename(lower).startswith("preview")
+            or lower in exact
+            or ext in by_stem.get(stem, ())
+        )
+        kinds[info.filename] = "pre" if pre else "play"
+    return kinds
 
 
 def zip_entries(data: bytes) -> list[dict]:
     """zip 안의 파일 항목을 매니페스트 형식으로 반환합니다. offset은 local file header의 위치입니다."""
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        kinds = file_kinds(zf)
         return [
             {
                 "path": info.filename,
@@ -148,6 +260,7 @@ def zip_entries(data: bytes) -> list[dict]:
                 "comp_size": info.compress_size,
                 "crc32": f"{info.CRC:08x}",
                 "method": info.compress_type,
+                "kind": kinds[info.filename],
             }
             for info in zf.infolist()
             if not info.is_dir()
@@ -169,6 +282,14 @@ class BlobReader:
         self.row_id = row_id
         self.size = size
         self.sha256 = sha256
+
+    def read(self, start: int, length: int) -> bytes:
+        """start부터 length 바이트를 읽습니다. 연결은 닫지 않습니다."""
+        if self.table == "song":
+            self._cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, self.row_id))
+        else:
+            raise ValueError(self.table)
+        return self._cur.fetchone()[0]
 
     def iter_range(self, start: int, end: int) -> Iterator[bytes]:
         """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
@@ -255,6 +376,9 @@ class Database:
                 if cur.fetchone()[0] == 0:
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     self.logger.info(f"generate_database: Added column {table}.{column}")
+            # 할당량 전역 기본값. 이미 있는 값(관리자가 바꾼 값)은 그대로 둡니다.
+            for name, value in constant.DEFAULT_SETTINGS.items():
+                cur.execute("INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (name, str(value)))
             con.commit()
 
     def _fits_packet(self, size: int) -> bool:
@@ -341,10 +465,10 @@ class Database:
 
     def backfill_manifest(self) -> None:
         """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
-        원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다.
+        원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다. 항목에 kind(pre/play)가 없는 곡도 다시 채웁니다.
         또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다."""
         with self._write_lock, connect() as con, con.cursor() as cur:
-            cur.execute("SELECT id FROM song WHERE files IS NULL ORDER BY id")
+            cur.execute("SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s ORDER BY id", ('%"kind"%',))
             song_ids_no_files = set(row[0] for row in cur.fetchall())
 
             cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
@@ -624,6 +748,15 @@ class Database:
             cur.execute("SELECT song_id FROM chart WHERE id = %s", (chart_sha256,))
             row = cur.fetchone()
             return row[0] if row else None
+
+    def get_song_files(self, song_id: int) -> list[dict] | None:
+        """곡 zip의 항목 목록(매니페스트의 files). 없는 곡이면 None."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0]) if row[0] else []
 
     def get_manifest_hash(self) -> dict[int, str]:
         with connect() as con, con.cursor() as cur:

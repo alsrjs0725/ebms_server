@@ -8,7 +8,21 @@
     <dt class="col-sm-3">이름</dt><dd class="col-sm-9">{{ user.display_name }}</dd>
     {% if user.email %}<dt class="col-sm-3">이메일</dt><dd class="col-sm-9">{{ user.email }}</dd>{% endif %}
     <dt class="col-sm-3">계정 ID</dt><dd class="col-sm-9"><code>{{ user.id }}</code></dd>
-    {% if user.is_admin %}<dt class="col-sm-3">권한</dt><dd class="col-sm-9">관리자</dd>{% endif %}
+    {% if user.is_admin %}<dt class="col-sm-3">권한</dt><dd class="col-sm-9">관리자 · <a href="/admin">관리 페이지</a></dd>{% endif %}
+</dl>
+
+<h2 class="h5 mt-5">다운로드</h2>
+<dl class="row">
+    <dt class="col-sm-3">플레이 티켓</dt>
+    <dd class="col-sm-9">
+        {{ tickets.available }} / {{ tickets.max }}
+        {% if tickets.next_refill_at %}<span class="text-muted">(다음 리필 <span data-clock="{{ tickets.next_refill_at }}"></span>, {{ tickets.refill_seconds }}초마다 1개)</span>{% endif %}
+    </dd>
+    <dt class="col-sm-3">사전 다운로드</dt>
+    <dd class="col-sm-9">
+        이번 달 {{ "%.2f" | format(pre.used_bytes / 1073741824) }} / {{ "%.2f" | format(pre.limit_bytes / 1073741824) }} GB
+        {% if pre.throttled %}<span class="badge text-bg-warning">{{ pre.throttled_kbps }}Kbps로 감속 중</span>{% endif %}
+    </dd>
 </dl>
 
 <h2 class="h5 mt-5">로그인 수단</h2>
@@ -46,6 +60,9 @@
 <script>
 document.querySelectorAll("[data-time]").forEach((el) => {
     el.textContent = new Date(Number(el.dataset.time) * 1000).toLocaleString();
+});
+document.querySelectorAll("[data-clock]").forEach((el) => {
+    el.textContent = new Date(Number(el.dataset.clock) * 1000).toLocaleTimeString();
 });
 document.querySelectorAll("[data-delete]").forEach((btn) => {
     btn.addEventListener("click", async () => {
