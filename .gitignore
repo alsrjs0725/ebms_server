@@ -13,12 +13,6 @@ wheels/
 var/log/*
 !var/log/.gitkeep
 
-var/media/chart/*
-!var/media/chart/.gitkeep
-
-var/media/song/*
-!var/media/song/.gitkeep
-
 var/tmp/*
 !var/tmp/.gitkeep
 
