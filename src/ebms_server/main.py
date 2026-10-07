@@ -1,16 +1,15 @@
-import gzip
 import importlib.metadata
 import logging
 import logging.handlers
 import os
-import re
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import auth, constant
+from . import admin, auth, constant, downloads
+from .downloads import blob_response, manifest_response
 from .templating import templates
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -63,6 +62,8 @@ app.mount(
     name="static",
 )
 app.include_router(auth.router)
+app.include_router(downloads.router)
+app.include_router(admin.router)
 app.middleware("http")(auth.refresh_session_cookie)
 
 @app.get("/", response_class=HTMLResponse)
@@ -70,82 +71,6 @@ def read_root(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="pages/root.html",
-    )
-
-_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
-
-
-def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
-    """단일 bytes range만 해석해 (start, end)를 반환합니다(양끝 포함).
-
-    헤더가 없거나 해석할 수 없는 형식(여러 범위 등)이면 None을 반환해 전체를 보냅니다.
-    만족할 수 없는 범위면 ValueError를 냅니다.
-    """
-    if not header:
-        return None
-    m = _RANGE_RE.fullmatch(header.strip())
-    if m is None:
-        return None
-    first, last = m.groups()
-    if first:
-        start = int(first)
-        if last and int(last) < start:
-            return None
-        end = min(int(last), size - 1) if last else size - 1
-    elif last:
-        if int(last) == 0:
-            raise ValueError(header)
-        start, end = max(size - int(last), 0), size - 1
-    else:
-        return None
-    if start >= size:
-        raise ValueError(header)
-    return start, end
-
-
-def blob_response(request: Request, table: str, row_id: int, filename: str, detail: str) -> Response:
-    """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다."""
-    blob = Database().open_blob(table, row_id)
-    if blob is None:
-        raise HTTPException(status_code=404, detail=detail)
-    etag = f'"{blob.sha256}"'
-    headers = {
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-        "X-Content-SHA256": blob.sha256,
-    }
-
-    if_none_match = request.headers.get("if-none-match")
-    if if_none_match and (if_none_match.strip() == "*" or etag in [t.strip() for t in if_none_match.split(",")]):
-        blob.close()
-        return Response(status_code=304, headers=headers)
-
-    rng = None
-    if_range = request.headers.get("if-range")
-    if if_range is None or if_range.strip() == etag:
-        try:
-            rng = parse_range(request.headers.get("range"), blob.size)
-        except ValueError:
-            blob.close()
-            raise HTTPException(
-                status_code=416,
-                detail="Range not satisfiable",
-                headers={**headers, "Content-Range": f"bytes */{blob.size}"},
-            )
-
-    headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    if rng is None:
-        start, end, status = 0, blob.size - 1, 200
-    else:
-        start, end = rng
-        status = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
-    headers["Content-Length"] = str(end - start + 1)
-    return StreamingResponse(
-        blob.iter_range(start, end),
-        status_code=status,
-        media_type="application/zip",
-        headers=headers,
     )
 
 @app.get("/api/version")
@@ -178,15 +103,7 @@ def get_manifest_hash():
 
 @app.get("/api/manifest/{chunk_id}")
 def get_manifest(chunk_id: int, request: Request):
-    data = Database().get_manifest_chunk(chunk_id)
-    if data is None:
-        raise HTTPException(status_code=404, detail="Manifest not found")
-    headers = {"Vary": "Accept-Encoding"}
-    if "gzip" in request.headers.get("accept-encoding", ""):
-        headers["Content-Encoding"] = "gzip"
-    else:
-        data = gzip.decompress(data)
-    return Response(data, media_type="application/json", headers=headers)
+    return manifest_response(request, chunk_id)
 
 @app.get("/api/files/song/id/{song_id}")
 def download_song_by_id(song_id: int, request: Request):

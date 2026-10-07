@@ -4,6 +4,9 @@ import pathlib
 BASE_DIR = pathlib.Path(__file__).resolve().parents[2]
 
 BMS_FORMAT = (".bms", ".bme", ".bml", ".pms")
+# 차트 헤더가 가리키는 파일의 확장자가 실제와 달라도 같은 종류면 같은 파일로 봅니다.
+IMAGE_FORMAT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
+AUDIO_FORMAT = (".wav", ".ogg", ".mp3", ".flac")
 DB_HOST = os.environ.get("EBMS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("EBMS_DB_PORT", "3306"))
 DB_USER = os.environ.get("EBMS_DB_USER", "ebms")
@@ -46,6 +49,17 @@ OAUTH_STATE_SECONDS = 600
 CLIENT_SESSION_SECONDS = 90 * 24 * 3600
 # 클라이언트 로그인용 1회용 코드 유효기간
 AUTH_CODE_SECONDS = 60
+
+# 할당량 전역 기본값. 처음 시작할 때 setting 테이블에 넣고, 이후에는 관리자 페이지에서 바꿉니다.
+DEFAULT_SETTINGS = {
+    # 플레이 다운로드: 최대 티켓 수, 티켓 1개가 차는 시간(초), 차감 후 같은 곡을 다시 받아도 차감하지 않는 시간(초)
+    "max_tickets": 5,
+    "refill_seconds": 60,
+    "grant_seconds": 1800,
+    # 사전 다운로드: 매달 정상 속도로 받을 수 있는 바이트, 넘은 뒤 속도(Kbps)
+    "pre_monthly_bytes": 10 * 1024 ** 3,
+    "pre_throttled_kbps": 500,
+}
 
 if __name__ == "__main__":
     print(DB_HOST, DB_PORT, DB_NAME)

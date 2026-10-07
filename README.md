@@ -74,14 +74,57 @@ docker compose up -d --build
 | GET | `/auth/client/authorize` | 웹 쿠키(없으면 `/login`으로) | 쿼리: `redirect_uri`(`http://127.0.0.1:<포트>/…`만 허용), `state`, `code_challenge`(base64url SHA-256), `code_challenge_method=S256`, `device_name`(선택, 기기 목록에 표시). 값이 틀리면 `400` 페이지 |
 | POST | `/api/auth/client/token` | - | JSON `{"code", "code_verifier"}` → `{"session_key", "expires_at", "user": {"id", "display_name", "email", "role"}}`. 코드가 없거나 만료·사용됐거나 verifier가 틀리면 `400`(코드는 한 번 시도하면 폐기), 정지된 계정은 `403` |
 | POST | `/api/auth/client/logout` | Bearer | 현재 세션키 폐기. `204` |
-| GET | `/api/me` | Bearer 또는 웹 쿠키 | 내 계정: `id`, `display_name`, `email`, `role`, `oauths`(`[{"oauth", "name"}]`), `session.kind`(`client`/`web`) |
+| GET | `/api/me` | Bearer 또는 웹 쿠키 | 내 계정: `id`, `display_name`, `email`, `role`, `oauths`(`[{"oauth", "name"}]`), `session.kind`(`client`/`web`), `tickets`, `pre`(아래 다운로드 절) |
 
 - `Authorization` 헤더가 있으면 쿠키는 보지 않습니다. 세션키가 틀리거나 만료·폐기됐으면 `401` + `WWW-Authenticate: Bearer`입니다.
 - 웹 쿠키 값은 세션키로 쓸 수 없고, 그 반대도 마찬가지입니다.
 
+## 다운로드 API (사전 / 플레이)
+
+다운로드는 두 갈래이고 둘 다 로그인(Bearer 세션키 또는 웹 쿠키)이 필요합니다. 없거나 만료된 세션은 `401`입니다. 서버는 경로만 보고 어느 할당량에서 뺄지 정합니다.
+
+| 구분 | 메서드·경로 | 설명 |
+| --- | --- | --- |
+| 사전 | GET `/api/pre/charthash` | 차트 청크별 SHA-256 (`/api/charthash`와 같음) |
+| 사전 | GET `/api/pre/chart/{chunk_id}` | 차트 청크 zip (`/api/files/chart/{chunk_id}`와 같음, Range 지원) |
+| 사전 | GET `/api/pre/manifest/hash`, `/api/pre/manifest/{chunk_id}` | 매니페스트. `files`의 각 항목에 `kind`(`pre`/`play`) |
+| 사전 | GET `/api/pre/song/{song_id}/file?path=<zip 안 경로>` | 곡의 사전 파일 하나를 압축을 풀어 보냅니다. `ETag`/`If-None-Match` 지원. `kind`가 `pre`가 아니면 `403` `not a pre-download file`, 없으면 `404` |
+| 플레이 | GET `/api/play/song/{song_id}` | 곡 zip 전체(Range 이어받기 지원). 본문을 보낼 때 티켓 1개 |
+
+**사전/플레이 판정**: 곡을 등록할 때(기존 곡은 서버 시작 시) 정합니다. 차트 파일, 차트 헤더 `#BANNER`·`#STAGEFILE`·`#BACKBMP`·`#PREVIEW`가 가리키는 파일, 이름이 `preview`로 시작하는 파일은 `pre`, 나머지(키음, BGA 등)는 `play`입니다. 헤더 경로는 대소문자·`\`를 무시하고, 확장자가 달라도 같은 종류(이미지끼리, 오디오끼리)면 같은 파일로 봅니다.
+
+**플레이 티켓**: 곡 1개당 1개를 쓰고, 차감 후 `grant_seconds`(기본 30분) 동안 같은 곡은 다시 받아도 차감하지 않습니다. 티켓은 `refill_seconds`(기본 60초)마다 1개씩 `max_tickets`(기본 5개)까지 찹니다. 티켓이 없으면 `429` + `Retry-After: <다음 티켓까지 초>` + `{"detail": "no download ticket"}`입니다. `304`·`416`·`404`는 차감하지 않습니다.
+
+**사전 다운로드 사용량**: 실제 보낸 바이트(매니페스트는 gzip이면 압축된 크기)를 월별로 더합니다. 월 경계는 KST 1일 0시입니다. 이번 달 사용량이 `pre_monthly_bytes`(기본 10GB)를 넘으면 끊지 않고 `pre_throttled_kbps`(기본 500Kbps)로 감속합니다. 같은 사용자의 동시 요청은 이 속도를 나눠 씁니다(프로세스 메모리, 워커 1개 전제). 해시 목록(`/hash`, `/charthash`)은 세지 않습니다.
+
+`/api/me`에 남은 양이 나옵니다.
+
+```json
+{
+  "tickets": {"available": 3, "max": 5, "refill_seconds": 60, "next_refill_at": 1791315327},
+  "pre": {"month": "2026-10", "used_bytes": 123456, "limit_bytes": 10737418240, "throttled_kbps": 500, "throttled": false}
+}
+```
+
+`next_refill_at`은 다음 티켓 1개가 차는 시각(unix 초)이고, 가득 차 있으면 `null`입니다.
+
+## 관리자 페이지
+
+`EBMS_ADMIN_EMAILS`의 계정으로 웹에 로그인하면 `/admin`을 쓸 수 있습니다(`/account`에 링크). 관리자 API는 웹 세션 쿠키로만 쓸 수 있고, 로그인하지 않았으면 `401`, 관리자가 아니면 `403`입니다.
+
+- 전역 기본값 일괄 수정: 최대 티켓, 리필 시간, 같은 곡 재차감 없음 시간, 사전 다운로드 월 한도, 초과 후 속도. 처음 시작할 때 기본값을 넣고, 이후 바꾼 값은 재시작해도 유지됩니다.
+- 사용자 검색(이름·이메일·계정 ID), 사용자별 한도 덮어쓰기(비우면 전역 기본값), 티켓 즉시 충전, 정지·해제.
+
+| 메서드 | 경로 | 설명 |
+| --- | --- | --- |
+| GET·PUT | `/api/admin/settings` | 전역 기본값. PUT은 보낸 항목만 바꾸고, 하나라도 틀리면 아무것도 바꾸지 않고 `400`. 항목: `max_tickets`, `refill_seconds`, `grant_seconds`, `pre_monthly_bytes`(바이트), `pre_throttled_kbps` |
+| GET | `/api/admin/users?q=` | 사용자 목록(최근 로그인 순 50명). 각 항목에 `overrides`, `tickets`, `pre` |
+| GET·PUT | `/api/admin/users/{id}` | 사용자 상세·수정. PUT 항목: `status`(`active`/`banned`), `max_tickets`, `refill_seconds`, `pre_monthly_bytes`, `pre_throttled_kbps`(null이면 전역 기본값). 자기 자신은 정지할 수 없음 |
+| POST | `/api/admin/users/{id}/refill` | 티켓을 최대치로 채움 |
+
 ## HTTP API
 
-모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 아래 다운로드 API는 아직 인증 없이 열려 있습니다(로그인 필수는 이후 단계에서 적용).
+모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 아래 기존 다운로드 API는 지금 클라이언트를 위해 아직 인증 없이 열려 있고, 클라이언트가 위의 사전/플레이 API로 옮기면 없앱니다.
 
 | 메서드 | 경로 | 설명 |
 | --- | --- | --- |
@@ -158,7 +201,7 @@ zip 안 항목 이름은 `{차트 sha256}{확장자 소문자}` (예: `3f1c...e9
       {"sha256": "<차트 sha256>", "path": "_7a.bme", "size": 12345}
     ],
     "files": [
-      {"path": "bgm01.ogg", "size": 12345, "offset": 0, "comp_size": 12000, "crc32": "1a2b3c4d", "method": 8}
+      {"path": "bgm01.ogg", "size": 12345, "offset": 0, "comp_size": 12000, "crc32": "1a2b3c4d", "method": 8, "kind": "play"}
     ]
   }
 ]
@@ -166,7 +209,7 @@ zip 안 항목 이름은 `{차트 sha256}{확장자 소문자}` (예: `3f1c...e9
 
 - `folder`: 등록할 때의 곡 폴더명. 이전 버전에서 등록된 곡은 song id 문자열입니다.
 - `chart_files`: 차트별 SHA-256, 파일 경로(곡 zip 안 경로 또는 등록할 때의 파일명), 파일 크기 목록.
-- `files`: 곡 zip 안의 파일(디렉터리 제외). `offset`은 local file header 위치, `method`는 zip 압축 방식(0 무압축, 8 Deflate)입니다. 파일 하나만 받으려면 `offset`부터 30바이트를 받아 파일명/extra 길이(26~29바이트)를 읽고, 그 뒤 `comp_size` 바이트를 `Range`로 받습니다.
+- `files`: 곡 zip 안의 파일(디렉터리 제외). `offset`은 local file header 위치, `method`는 zip 압축 방식(0 무압축, 8 Deflate), `kind`는 사전(`pre`)/플레이(`play`) 구분입니다. 파일 하나만 받으려면 `offset`부터 30바이트를 받아 파일명/extra 길이(26~29바이트)를 읽고, 그 뒤 `comp_size` 바이트를 `Range`로 받습니다.
 
 ### `GET /api/files/song/id/{song_id}`
 

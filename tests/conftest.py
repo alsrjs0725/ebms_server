@@ -72,8 +72,7 @@ class SQLiteCursor:
             sql = re.sub(r"ON DUPLICATE KEY UPDATE", "ON CONFLICT(id) DO UPDATE SET", sql, flags=re.IGNORECASE)
             sql = re.sub(r"VALUES\((\w+)\)", r"excluded.\1", sql, flags=re.IGNORECASE)
 
-        if "INSERT IGNORE INTO chart" in sql:
-            sql = sql.replace("INSERT IGNORE INTO chart", "INSERT OR IGNORE INTO chart")
+        sql = re.sub(r"INSERT IGNORE INTO", "INSERT OR IGNORE INTO", sql, flags=re.IGNORECASE)
 
         sql = sql.replace("%s", "?")
         if args is None:

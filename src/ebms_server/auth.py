@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from . import accounts, constant
+from . import accounts, constant, quota
 from .accounts import Profile, User
 from .templating import templates
 
@@ -412,6 +412,7 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
             "linkable": [p for p in configured_oauths() if p.name not in linked],
             "sessions": accounts.list_sessions(user.id),
             "current_session_id": session_id,
+            **_quota_json(user.id),
         },
     )
 
@@ -547,4 +548,14 @@ def get_me(session: Annotated[tuple[User, int, str], Depends(api_session)]):
             for i in accounts.list_identities(user.id)
         ],
         "session": {"kind": kind},
+        **_quota_json(user.id),
+    }
+
+
+def _quota_json(user_id: str) -> dict:
+    """남은 플레이 티켓과 이번 달 사전 다운로드 사용량."""
+    limits = quota.limits_for(user_id)
+    return {
+        "tickets": quota.ticket_json(quota.ticket_state(user_id, limits)),
+        "pre": quota.pre_state(user_id, limits),
     }
