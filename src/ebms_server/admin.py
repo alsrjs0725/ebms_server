@@ -16,6 +16,7 @@ from .templating import templates
 
 router = APIRouter()
 
+ROLES = ("user", "admin")
 STATUSES = ("active", "banned")
 SEARCH_LIMIT = 50
 
@@ -138,6 +139,7 @@ def get_user(user_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 
 class UserUpdate(BaseModel):
+    role: str | None = None
     status: str | None = None
     max_tickets: int | None = None
     refill_seconds: int | None = None
@@ -150,7 +152,13 @@ def put_user(user_id: str, body: UserUpdate, admin: Annotated[User, Depends(web_
     """보낸 항목만 바꿉니다. 한도 항목에 null을 보내면 전역 기본값을 따릅니다."""
     get_user_detail(user_id)
     values = body.model_dump(exclude_unset=True)
+    role = values.pop("role", None)
     status = values.pop("status", None)
+    if "role" in body.model_fields_set:
+        if role not in ROLES:
+            raise HTTPException(status_code=400, detail=f"role must be one of {', '.join(ROLES)}")
+        if role != "admin" and user_id == admin.id:
+            raise HTTPException(status_code=400, detail="cannot demote yourself")
     if "status" in body.model_fields_set:
         if status not in STATUSES:
             raise HTTPException(status_code=400, detail=f"status must be one of {', '.join(STATUSES)}")
@@ -160,9 +168,18 @@ def put_user(user_id: str, body: UserUpdate, admin: Annotated[User, Depends(web_
         quota.set_overrides(user_id, values)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if status is not None:
+    if role is not None or status is not None:
+        updates = []
+        params = []
+        if role is not None:
+            updates.append("role = %s")
+            params.append(role)
+        if status is not None:
+            updates.append("status = %s")
+            params.append(status)
+        params.append(user_id)
         with db.connect() as con, con.cursor() as cur:
-            cur.execute("UPDATE user SET status = %s WHERE id = %s", (status, user_id))
+            cur.execute(f"UPDATE user SET {', '.join(updates)} WHERE id = %s", tuple(params))
             con.commit()
     return get_user_detail(user_id)
 

@@ -340,3 +340,25 @@ def test_admin_ban(client, monkeypatch):
 
     assert client.put(f"/api/admin/users/{user_id}", json={"status": "gone"}).status_code == 400
     assert client.put(f"/api/admin/users/{admin_id}", json={"status": "banned"}).status_code == 400
+
+
+def test_admin_user_update_role(client, monkeypatch):
+    key, user_id = client_login(client, monkeypatch)
+    admin_login(client, monkeypatch)
+    admin_id = next(u["id"] for u in client.get("/api/admin/users").json() if u["role"] == "admin")
+
+    # 일반 사용자를 관리자로 승격
+    r = client.put(f"/api/admin/users/{user_id}", json={"role": "admin"})
+    assert r.status_code == 200
+    assert r.json()["role"] == "admin"
+
+    # 다시 일반 사용자로 강등
+    r = client.put(f"/api/admin/users/{user_id}", json={"role": "user"})
+    assert r.status_code == 200
+    assert r.json()["role"] == "user"
+
+    # 잘못된 role 전달 시 400
+    assert client.put(f"/api/admin/users/{user_id}", json={"role": "super"}).status_code == 400
+
+    # 자기 자신은 강등할 수 없음
+    assert client.put(f"/api/admin/users/{admin_id}", json={"role": "user"}).status_code == 400

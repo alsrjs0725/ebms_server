@@ -114,9 +114,8 @@ def _login(profile: Profile) -> User:
                     (user_id, profile.name, profile.email if profile.email_verified else None, now),
                 )
                 _insert_identity(cur, user_id, profile, now)
-            if _is_admin_email(profile):
-                cur.execute("UPDATE user SET role = 'admin' WHERE id = %s", (user_id,))
-            cur.execute("UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id))
+            role = "admin" if _is_admin_email(profile) else "user"
+            cur.execute("UPDATE user SET role = %s, last_login_at = %s WHERE id = %s", (role, now, user_id))
             con.commit()
         except Exception:
             con.rollback()
@@ -150,8 +149,6 @@ def link(user_id: str, profile: Profile) -> str:
             return "already" if row[0] == user_id else "taken"
         try:
             _insert_identity(cur, user_id, profile, now)
-            if _is_admin_email(profile):
-                cur.execute("UPDATE user SET role = 'admin' WHERE id = %s", (user_id,))
             con.commit()
         except pymysql.err.IntegrityError:
             con.rollback()
