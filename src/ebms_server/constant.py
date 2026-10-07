@@ -19,7 +19,7 @@ CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 SONGS_PER_MANIFEST_CHUNK = 1000
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
-API_VERSION = 1
+API_VERSION = 2
 # BLOB 다운로드 시 한 번에 읽어오는 크기
 BLOB_READ_SIZE = 1024 * 1024
 # INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트

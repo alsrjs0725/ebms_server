@@ -752,20 +752,6 @@ class Database:
             cur.execute("SELECT id, sha256 FROM chart_chunk ORDER BY id")
             return {row[0]: row[1] for row in cur.fetchall()}
 
-    def get_song_id(self, chart_sha256) -> int | None:
-        """chart의 sha256으로 song id를 구하는 함수입니다.
-
-        Args:
-            chart_sha256 (_type_):
-
-        Returns:
-            int | None: song_id, 존재하지 않는 sha256일 경우 None 반환
-        """
-        with connect() as con, con.cursor() as cur:
-            cur.execute("SELECT song_id FROM chart WHERE id = %s", (chart_sha256,))
-            row = cur.fetchone()
-            return row[0] if row else None
-
     def get_song_files(self, song_id: int) -> list[dict] | None:
         """곡 zip의 항목 목록(매니페스트의 files). 없는 곡이면 None."""
         with connect() as con, con.cursor() as cur:
