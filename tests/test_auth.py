@@ -223,6 +223,20 @@ def test_next_redirect(client, monkeypatch):
         assert r.headers["location"] == "/account"
 
 
+def test_safe_next():
+    assert auth.safe_next(None) == "/account"
+    assert auth.safe_next("") == "/account"
+    assert auth.safe_next("/somewhere") == "/somewhere"
+    assert auth.safe_next("/somewhere?x=1") == "/somewhere?x=1"
+    assert auth.safe_next("//evil.com") == "/account"
+    assert auth.safe_next("https://evil.com") == "/account"
+    assert auth.safe_next("evil.com/path") == "/account"
+    assert auth.safe_next("/\\evil.com") == "/account"
+    assert auth.safe_next(None, default="/custom") == "/custom"
+    assert auth.safe_next("", default="/custom") == "/custom"
+    assert auth.safe_next("//evil.com", default="/custom") == "/custom"
+
+
 def test_signed_cookie():
     value = auth.sign({"a": 1, "exp": 2**40})
     assert auth.unsign(value)["a"] == 1
