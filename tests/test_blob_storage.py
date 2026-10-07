@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from ebms_server import constant, db as db_module
 from ebms_server.db import Database
 
+from test_auth import oauth
+
 TEST_DB = os.environ.get("EBMS_DB_TEST_NAME", "ebms_test")
 
 
@@ -34,9 +36,16 @@ def database(monkeypatch):
 
 
 @pytest.fixture
-def client(database):
+def client(database, monkeypatch):
+    """로그인한 웹 세션 쿠키를 가진 클라이언트. 다운로드 API는 모두 로그인이 필요합니다."""
+    monkeypatch.setattr(constant, "PUBLIC_URL", "http://testserver")
+    monkeypatch.setattr(constant, "SECRET_KEY", "test-secret")
+    monkeypatch.setattr(constant, "GOOGLE_CLIENT_ID", "google-id")
+    monkeypatch.setattr(constant, "GOOGLE_CLIENT_SECRET", "google-secret")
     from ebms_server.main import app
-    return TestClient(app)
+    c = TestClient(app)
+    oauth(c, monkeypatch, "google", "g1")
+    return c
 
 
 def make_song(root, name, charts):
@@ -59,17 +68,17 @@ def test_insert_and_download_roundtrip(tmp_path, client):
     song = make_song(tmp_path, "song1", {"a.bms": chart_a, "b.bme": chart_b})
     Database().insert_song(song)
 
-    res = client.get(f"/api/files/song/{sha(chart_a)}")
+    res = client.get("/api/play/song/1")
     assert res.status_code == 200
     assert res.headers["content-length"] == str(len(res.content))
     with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
         assert zf.read("a.bms") == chart_a
         assert zf.read("bga/movie.bin") == (song / "bga" / "movie.bin").read_bytes()
-    assert client.get(f"/api/files/song/{sha(chart_b)}").content == res.content
+    assert client.get("/api/play/song/1").content == res.content
 
-    hashes = client.get("/api/charthash").json()
+    hashes = client.get("/api/pre/charthash").json()
     assert list(hashes) == ["0"]
-    chunk = client.get("/api/files/chart/0")
+    chunk = client.get("/api/pre/chart/0")
     assert chunk.status_code == 200
     assert sha(chunk.content) == hashes["0"]
     with zipfile.ZipFile(io.BytesIO(chunk.content)) as zf:
@@ -80,23 +89,23 @@ def test_insert_and_download_roundtrip(tmp_path, client):
     chart_c = b"#TITLE C\n"
     song2 = make_song(tmp_path, "song2", {"a.bms": chart_a, "c.bms": chart_c})
     Database().insert_song(song2)
-    with zipfile.ZipFile(io.BytesIO(client.get("/api/files/chart/0").content)) as zf:
+    with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/chart/0").content)) as zf:
         assert sorted(zf.namelist()) == sorted(
             [f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bme", f"{sha(chart_c)}.bms"]
         )
-    assert client.get(f"/api/files/song/{sha(chart_c)}").content == res.content
+    assert client.get("/api/play/song/1").content == res.content
 
 
 def test_chunk_rollover(tmp_path, client, monkeypatch):
     monkeypatch.setattr(constant, "BYTE_PER_CHUNK", 1000)
     Database().insert_song(make_song(tmp_path, "s1", {"a.bms": os.urandom(2000)}))
     Database().insert_song(make_song(tmp_path, "s2", {"b.bms": os.urandom(2000)}))
-    assert sorted(client.get("/api/charthash").json()) == ["0", "1"]
+    assert sorted(client.get("/api/pre/charthash").json()) == ["0", "1"]
 
 
 def test_not_found(client):
-    assert client.get("/api/files/song/" + "0" * 64).status_code == 404
-    assert client.get("/api/files/chart/99").status_code == 404
+    assert client.get("/api/play/song/99").status_code == 404
+    assert client.get("/api/pre/chart/99").status_code == 404
 
 
 def test_song_too_large_is_skipped(tmp_path, database, monkeypatch):
@@ -114,7 +123,7 @@ def test_same_chart_name_in_different_songs(tmp_path, client):
     chart_b = b"#TITLE B\n" + os.urandom(100)
     Database().insert_song(make_song(tmp_path, "s1", {"normal.bms": chart_a}))
     Database().insert_song(make_song(tmp_path, "s2", {"NORMAL.BMS": chart_b}))
-    with zipfile.ZipFile(io.BytesIO(client.get("/api/files/chart/0").content)) as zf:
+    with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/chart/0").content)) as zf:
         assert sorted(zf.namelist()) == sorted([f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bms"])
 
 
@@ -133,63 +142,60 @@ def test_migrate_chart_chunk_names(tmp_path, client, database):
         con.commit()
 
     assert database.migrate_chart_chunk_names() == 1
-    chunk = client.get("/api/files/chart/0").content
-    assert client.get("/api/charthash").json() == {"0": sha(chunk)}
+    chunk = client.get("/api/pre/chart/0").content
+    assert client.get("/api/pre/charthash").json() == {"0": sha(chunk)}
     with zipfile.ZipFile(io.BytesIO(chunk)) as zf:
         assert zf.read(f"{sha(chart_a)}.bms") == chart_a
         assert zf.read(f"{sha(chart_b)}.bms") == chart_b
     assert database.migrate_chart_chunk_names() == 0
 
 
-def test_song_by_id_and_hash_headers(tmp_path, client):
-    chart = b"#TITLE\n"
-    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": chart}))
-    by_chart = client.get(f"/api/files/song/{sha(chart)}")
-    by_id = client.get("/api/files/song/id/1")
+def test_song_hash_headers(tmp_path, client):
+    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE\n"}))
+    by_id = client.get("/api/play/song/1")
     assert by_id.status_code == 200
-    assert by_id.content == by_chart.content
     assert by_id.headers["x-content-sha256"] == sha(by_id.content)
     assert by_id.headers["etag"] == f'"{sha(by_id.content)}"'
     assert by_id.headers["accept-ranges"] == "bytes"
-    assert client.get("/api/files/song/id/99").status_code == 404
-    assert client.get("/api/files/song/id/abc").status_code == 422
+    assert client.get("/api/play/song/99").status_code == 404
+    assert client.get("/api/play/song/abc").status_code == 422
 
 
 def test_range_requests(tmp_path, client):
     Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#X"}))
-    full = client.get("/api/files/song/id/1").content
+    full = client.get("/api/play/song/1").content
     size = len(full)
     etag = f'"{sha(full)}"'
 
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=10-2509"})
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=10-2509"})
     assert res.status_code == 206
     assert res.content == full[10:2510]
     assert res.headers["content-range"] == f"bytes 10-2509/{size}"
     assert res.headers["content-length"] == "2500"
 
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=1500-"})
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=1500-"})
     assert res.status_code == 206 and res.content == full[1500:]
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=-100"})
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=-100"})
     assert res.status_code == 206 and res.content == full[-100:]
-    res = client.get("/api/files/song/id/1", headers={"Range": f"bytes=0-{size + 100}"})
+    res = client.get("/api/play/song/1", headers={"Range": f"bytes=0-{size + 100}"})
     assert res.status_code == 206 and res.content == full
 
-    res = client.get("/api/files/song/id/1", headers={"Range": f"bytes={size}-"})
+    res = client.get("/api/play/song/1", headers={"Range": f"bytes={size}-"})
     assert res.status_code == 416
     assert res.headers["content-range"] == f"bytes */{size}"
 
     # 여러 범위나 If-Range 불일치는 전체 응답
-    assert client.get("/api/files/song/id/1", headers={"Range": "bytes=0-1,5-6"}).status_code == 200
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": '"other"'})
+    assert client.get("/api/play/song/1", headers={"Range": "bytes=0-1,5-6"}).status_code == 200
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=0-9", "If-Range": '"other"'})
     assert res.status_code == 200 and res.content == full
-    res = client.get("/api/files/song/id/1", headers={"Range": "bytes=0-9", "If-Range": etag})
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=0-9", "If-Range": etag})
     assert res.status_code == 206 and res.content == full[:10]
 
-    assert client.get("/api/files/song/id/1", headers={"If-None-Match": etag}).status_code == 304
+    assert client.get("/api/play/song/1", headers={"If-None-Match": etag}).status_code == 304
 
     # chart chunk도 같은 방식
-    chunk = client.get("/api/files/chart/0").content
-    res = client.get("/api/files/chart/0", headers={"Range": "bytes=5-20"})
+    chunk = client.get("/api/pre/chart/0").content
+    res = client.get("/api/pre/chart/0", headers={"Range": "bytes=5-20"})
     assert res.status_code == 206 and res.content == chunk[5:21]
 
 
@@ -198,18 +204,18 @@ def test_manifest(tmp_path, client):
     song = make_song(tmp_path, "Artist - 제목", {"a.bms": chart_a, "b.bme": chart_b})
     Database().insert_song(song)
 
-    hashes = client.get("/api/manifest/hash").json()
+    hashes = client.get("/api/pre/manifest/hash").json()
     assert list(hashes) == ["0"]
-    res = client.get("/api/manifest/0")
+    res = client.get("/api/pre/manifest/0")
     assert res.status_code == 200
     assert res.headers["content-encoding"] == "gzip"
     assert sha(res.content) == hashes["0"]
-    plain = client.get("/api/manifest/0", headers={"Accept-Encoding": "identity"})
+    plain = client.get("/api/pre/manifest/0", headers={"Accept-Encoding": "identity"})
     assert "content-encoding" not in plain.headers
     assert plain.content == res.content
 
     [entry] = res.json()
-    song_zip = client.get("/api/files/song/id/1").content
+    song_zip = client.get("/api/play/song/1").content
     assert entry["song_id"] == 1
     assert entry["folder"] == "Artist - 제목"
     assert entry["zip_size"] == len(song_zip)
@@ -225,11 +231,11 @@ def test_manifest(tmp_path, client):
     import struct
     import zlib
     f = files["bga/movie.bin"]
-    head = client.get("/api/files/song/id/1", headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"}).content
+    head = client.get("/api/play/song/1", headers={"Range": f"bytes={f['offset']}-{f['offset'] + 29}"}).content
     name_len, extra_len = struct.unpack("<HH", head[26:30])
     data_start = f["offset"] + 30 + name_len + extra_len
     raw = client.get(
-        "/api/files/song/id/1", headers={"Range": f"bytes={data_start}-{data_start + f['comp_size'] - 1}"}
+        "/api/play/song/1", headers={"Range": f"bytes={data_start}-{data_start + f['comp_size'] - 1}"}
     ).content
     assert f["method"] == zipfile.ZIP_DEFLATED
     body = zlib.decompress(raw, -15)
@@ -239,13 +245,13 @@ def test_manifest(tmp_path, client):
     # 기존 곡에 chart가 추가되면 매니페스트가 갱신됩니다.
     chart_c = b"#C"
     Database().insert_song(make_song(tmp_path, "other", {"a.bms": chart_a, "c.bms": chart_c}))
-    assert client.get("/api/manifest/hash").json()["0"] != hashes["0"]
-    [entry] = client.get("/api/manifest/0").json()
+    assert client.get("/api/pre/manifest/hash").json()["0"] != hashes["0"]
+    [entry] = client.get("/api/pre/manifest/0").json()
     assert sha(chart_c) in entry["charts"]
     c_file = next(f for f in entry["chart_files"] if f["sha256"] == sha(chart_c))
     assert c_file == {"sha256": sha(chart_c), "path": "c.bms", "size": len(chart_c)}
 
-    assert client.get("/api/manifest/5").status_code == 404
+    assert client.get("/api/pre/manifest/5").status_code == 404
     assert client.get("/api/version").json()["api"] == constant.API_VERSION
 
 
@@ -257,7 +263,7 @@ def test_manifest_backfill_for_old_rows(tmp_path, client, database):
         cur.execute("DELETE FROM manifest_chunk")
         con.commit()
     database.backfill_manifest()
-    [entry] = client.get("/api/manifest/0").json()
+    [entry] = client.get("/api/pre/manifest/0").json()
     assert entry["folder"] == "1"
     assert "sound.wav" in [f["path"] for f in entry["files"]]
     assert entry["chart_files"][0]["path"] == "a.bms"

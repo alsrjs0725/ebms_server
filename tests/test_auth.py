@@ -1,4 +1,5 @@
 """웹 로그인·계정 테스트. OAuth와의 통신(fetch_profile)은 가짜로 바꿉니다."""
+import re
 import urllib.parse
 
 import pymysql
@@ -245,10 +246,26 @@ def test_signed_cookie():
     assert auth.unsign(auth.sign({"exp": 1})) is None
 
 
-def test_existing_api_still_public(client):
-    # 인증 강제는 이후 단계. 지금 클라이언트가 계속 동작해야 함
+def test_api_requires_login(client):
+    # /api/version 과 세션키를 받는 /api/auth/client/token 외의 API는 모두 로그인 필요
+    from ebms_server.main import app
+    public = {"/api/version", "/api/auth/client/token"}
+    checked = 0
+    for path, methods in app.openapi()["paths"].items():
+        if not path.startswith("/api/") or path in public:
+            continue
+        url = re.sub(r"\{[^}]+\}", "1", path)
+        for method in methods:
+            r = client.request(method, url, json={}, params={"path": "a.bms"})
+            assert r.status_code == 401, (method, path, r.status_code)
+            checked += 1
+    assert checked >= 10
     assert client.get("/api/version").status_code == 200
-    assert client.get("/api/charthash").status_code == 200
+    assert client.get("/api/version").json()["api"] == 2
+    # 기존 공개 다운로드 경로는 없어짐
+    for path in ("/api/charthash", "/api/files/chart/0", "/api/manifest/hash", "/api/manifest/0",
+                 "/api/files/song/id/1", "/api/files/song/" + "0" * 64):
+        assert client.get(path).status_code == 404, path
 
 
 def test_session_cookie_renewed(client, monkeypatch):
