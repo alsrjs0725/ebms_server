@@ -43,6 +43,7 @@ jobs:
             type=raw,value=sha-${{ github.sha }}
             type=raw,value=stage,enable=${{ github.ref_name == 'stage' }}
             type=raw,value=latest,enable=${{ github.ref_name == 'release' }}
+            type=raw,value=release,enable=${{ github.ref_name == 'release' }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref_name == 'release' }}
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
