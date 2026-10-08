@@ -13,6 +13,8 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       # 압축 파일을 BLOB으로 주고받기 위해 패킷 한도를 키움
       - --max_allowed_packet=1G
+      - --innodb_buffer_pool_size=512M
+      - --max_connections=200
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:

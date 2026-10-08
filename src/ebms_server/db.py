@@ -7,6 +7,7 @@ import posixpath
 import hashlib
 import logging
 import shutil
+import struct
 import zipfile
 import threading
 from collections import defaultdict
@@ -22,12 +23,22 @@ SCHEMA = [
             id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             size BIGINT UNSIGNED NOT NULL,
             sha256 CHAR(64) NOT NULL,
-            data LONGBLOB NOT NULL,
+            data LONGBLOB,
             -- 매니페스트용: 원래 곡 폴더명과 zip 항목 목록(JSON)
             folder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             files MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
 
             PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    """
+        CREATE TABLE IF NOT EXISTS song_part(
+            song_id INT UNSIGNED NOT NULL,
+            seq INT UNSIGNED NOT NULL,
+            data LONGBLOB NOT NULL,
+
+            PRIMARY KEY (song_id, seq),
+            FOREIGN KEY (song_id) REFERENCES song(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     """
@@ -252,19 +263,28 @@ def zip_entries(data: bytes) -> list[dict]:
     """zip 안의 파일 항목을 매니페스트 형식으로 반환합니다. offset은 local file header의 위치입니다."""
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         kinds = file_kinds(zf)
-        return [
-            {
-                "path": info.filename,
-                "size": info.file_size,
-                "offset": info.header_offset,
-                "comp_size": info.compress_size,
-                "crc32": f"{info.CRC:08x}",
-                "method": info.compress_type,
-                "kind": kinds[info.filename],
-            }
-            for info in zf.infolist()
-            if not info.is_dir()
-        ]
+        entries = []
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            head = data[info.header_offset : info.header_offset + 30]
+            data_offset = info.header_offset + 30
+            if len(head) == 30 and head[:4] == b"PK\x03\x04":
+                name_len, extra_len = struct.unpack("<HH", head[26:30])
+                data_offset = info.header_offset + 30 + name_len + extra_len
+            entries.append(
+                {
+                    "path": info.filename,
+                    "size": info.file_size,
+                    "offset": info.header_offset,
+                    "data_offset": data_offset,
+                    "comp_size": info.compress_size,
+                    "crc32": f"{info.CRC:08x}",
+                    "method": info.compress_type,
+                    "kind": kinds[info.filename],
+                }
+            )
+        return entries
 
 
 def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
@@ -286,29 +306,63 @@ class BlobReader:
     def read(self, start: int, length: int) -> bytes:
         """start부터 length 바이트를 읽습니다. 연결은 닫지 않습니다."""
         if self.table == "song":
+            start_seq = start // constant.BLOB_READ_SIZE
+            end_seq = (start + length - 1) // constant.BLOB_READ_SIZE
+            self._cur.execute(
+                "SELECT seq, data FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s ORDER BY seq",
+                (self.row_id, start_seq, end_seq),
+            )
+            rows = self._cur.fetchall()
+            if rows:
+                buf = b"".join(r[1] for r in rows)
+                offset_in_buf = start - start_seq * constant.BLOB_READ_SIZE
+                return buf[offset_in_buf : offset_in_buf + length]
+            # song_part에 없는 경우(마이그레이션 전) song.data fallback
             self._cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, self.row_id))
+            return self._cur.fetchone()[0]
         else:
             raise ValueError(self.table)
-        return self._cur.fetchone()[0]
 
     def iter_range(self, start: int, end: int) -> Iterator[bytes]:
         """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
         try:
             step = constant.BLOB_READ_SIZE
-            for pos in range(start + 1, end + 2, step):
-                if self.table == "song":
-                    self._cur.execute(
-                        "SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s",
-                        (pos, min(step, end + 2 - pos), self.row_id),
-                    )
-                elif self.table == "chart_chunk":
+            if self.table == "song":
+                start_seq = start // step
+                end_seq = end // step
+                self._cur.execute(
+                    "SELECT seq FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s LIMIT 1",
+                    (self.row_id, start_seq, end_seq),
+                )
+                if self._cur.fetchone() is not None:
+                    for seq in range(start_seq, end_seq + 1):
+                        self._cur.execute(
+                            "SELECT data FROM song_part WHERE song_id = %s AND seq = %s",
+                            (self.row_id, seq),
+                        )
+                        row = self._cur.fetchone()
+                        if row is not None:
+                            part_data = row[0]
+                            chunk_start = seq * step
+                            s = max(0, start - chunk_start)
+                            e = min(len(part_data), end + 1 - chunk_start)
+                            yield part_data[s:e]
+                else:
+                    for pos in range(start + 1, end + 2, step):
+                        self._cur.execute(
+                            "SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s",
+                            (pos, min(step, end + 2 - pos), self.row_id),
+                        )
+                        yield self._cur.fetchone()[0]
+            elif self.table == "chart_chunk":
+                for pos in range(start + 1, end + 2, step):
                     self._cur.execute(
                         "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
                         (pos, min(step, end + 2 - pos), self.row_id),
                     )
-                else:
-                    raise ValueError(self.table)
-                yield self._cur.fetchone()[0]
+                    yield self._cur.fetchone()[0]
+            else:
+                raise ValueError(self.table)
         finally:
             self.close()
 
@@ -376,6 +430,20 @@ class Database:
                 if cur.fetchone()[0] == 0:
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     self.logger.info(f"generate_database: Added column {table}.{column}")
+            cur.execute(
+                """
+                SELECT IS_NULLABLE FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                """,
+                ("song", "data"),
+            )
+            row = cur.fetchone()
+            if row and row[0] == "NO":
+                try:
+                    cur.execute("ALTER TABLE song MODIFY COLUMN data LONGBLOB NULL")
+                except Exception:
+                    pass
+                self.logger.info("generate_database: Made song.data column NULLable")
             # 할당량 전역 기본값. 이미 있는 값(관리자가 바꾼 값)은 그대로 둡니다.
             for name, value in constant.DEFAULT_SETTINGS.items():
                 cur.execute("INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (name, str(value)))
@@ -463,50 +531,79 @@ class Database:
             (chunk_no, hashlib.sha256(body).hexdigest(), data),
         )
 
+    def get_song_data(self, song_id: int) -> bytes | None:
+        """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
+        with connect() as con, con.cursor() as cur:
+            return self._get_song_data_with_cur(cur, song_id)
+
+    def _get_song_data_with_cur(self, cur, song_id: int) -> bytes | None:
+        cur.execute("SELECT data FROM song_part WHERE song_id = %s ORDER BY seq", (song_id,))
+        rows = cur.fetchall()
+        if rows:
+            return b"".join(r[0] for r in rows)
+        cur.execute("SELECT data FROM song WHERE id = %s AND data IS NOT NULL", (song_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
     def backfill_manifest(self) -> None:
         """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
         원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다. 항목에 kind(pre/play)가 없는 곡도 다시 채웁니다.
         또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다."""
         with self._write_lock, connect() as con, con.cursor() as cur:
-            cur.execute("SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s ORDER BY id", ('%"kind"%',))
-            song_ids_no_files = set(row[0] for row in cur.fetchall())
-
-            cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
-            song_ids_no_filenames = set(row[0] for row in cur.fetchall())
-
-            affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
-            if not affected_song_ids:
-                return
             try:
-                for song_id in affected_song_ids:
-                    cur.execute("SELECT data FROM song WHERE id = %s FOR UPDATE", (song_id,))
-                    row = cur.fetchone()
-                    if not row:
-                        continue
-                    song_data = row[0]
-                    if song_id in song_ids_no_files:
-                        files = zip_entries(song_data)
-                        cur.execute(
-                            "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
-                            (str(song_id), json.dumps(files), song_id),
-                        )
-                    if song_id in song_ids_no_filenames:
-                        with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
-                            for info in zf.infolist():
-                                if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
-                                    content = zf.read(info)
-                                    sha256 = hashlib.sha256(content).hexdigest()
-                                    cur.execute(
-                                        "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
-                                        (info.filename, song_id, sha256),
-                                    )
-                for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
-                    self._rebuild_manifest_chunk(cur, chunk_no)
+                # 1) 기존 song.data BLOB을 song_part로 마이그레이션
+                cur.execute("SELECT id, data FROM song WHERE data IS NOT NULL")
+                rows = cur.fetchall()
+                for song_id, song_data in rows:
+                    if song_data is not None:
+                        step = constant.BLOB_READ_SIZE
+                        for seq, pos in enumerate(range(0, len(song_data), step)):
+                            part = song_data[pos : pos + step]
+                            cur.execute(
+                                "INSERT IGNORE INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
+                                (song_id, seq, part),
+                            )
+                        cur.execute("UPDATE song SET data = NULL WHERE id = %s", (song_id,))
+
+                cur.execute(
+                    "SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s OR files NOT LIKE %s ORDER BY id",
+                    ('%"kind"%', '%"data_offset"%'),
+                )
+                song_ids_no_files = set(row[0] for row in cur.fetchall())
+
+                cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
+                song_ids_no_filenames = set(row[0] for row in cur.fetchall())
+
+                affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
+                if affected_song_ids:
+                    for song_id in affected_song_ids:
+                        song_data = self._get_song_data_with_cur(cur, song_id)
+                        if not song_data:
+                            continue
+                        if song_id in song_ids_no_files:
+                            files = zip_entries(song_data)
+                            cur.execute(
+                                "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
+                                (str(song_id), json.dumps(files), song_id),
+                            )
+                        if song_id in song_ids_no_filenames:
+                            with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
+                                for info in zf.infolist():
+                                    if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
+                                        content = zf.read(info)
+                                        sha256 = hashlib.sha256(content).hexdigest()
+                                        cur.execute(
+                                            "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
+                                            (info.filename, song_id, sha256),
+                                        )
+                    for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
+                        self._rebuild_manifest_chunk(cur, chunk_no)
                 con.commit()
             except Exception:
                 con.rollback()
                 raise
-            self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
+            if affected_song_ids:
+                self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
 
     def migrate_chart_chunk_names(self) -> int:
         """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
@@ -562,7 +659,8 @@ class Database:
             return
         for file_name in os.listdir(song_path):
             full_path = root / file_name
-            if (full_path.suffix.lower() in constant.BMS_FORMAT): break
+            if full_path.suffix.lower() in constant.BMS_FORMAT:
+                break
         else:
             self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
             return
@@ -598,7 +696,8 @@ class Database:
         song_id = None
         for file in os.listdir(root):
             file_path = root / file
-            if (file_path.suffix.lower() not in constant.BMS_FORMAT): continue
+            if file_path.suffix.lower() not in constant.BMS_FORMAT:
+                continue
 
             with open(file_path, "rb") as fos:
                 sha256 = hashlib.sha256(fos.read()).hexdigest()
@@ -630,16 +729,22 @@ class Database:
             return None
 
         cur.execute(
-            "INSERT INTO song (size, sha256, data, folder, files) VALUES (%s, %s, %s, %s, %s)",
+            "INSERT INTO song (size, sha256, folder, files) VALUES (%s, %s, %s, %s)",
             (
                 len(data),
                 hashlib.sha256(data).hexdigest(),
-                data,
                 root.resolve().name,
                 json.dumps(zip_entries(data)),
             ),
         )
         song_id = cur.lastrowid
+        step = constant.BLOB_READ_SIZE
+        for seq, pos in enumerate(range(0, len(data), step)):
+            part = data[pos : pos + step]
+            cur.execute(
+                "INSERT INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
+                (song_id, seq, part),
+            )
         self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
         return song_id
 
@@ -789,7 +894,7 @@ class Database:
             cur = con.cursor()
             cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
             if table == "song":
-                cur.execute("SELECT LENGTH(data), sha256 FROM song WHERE id = %s", (row_id,))
+                cur.execute("SELECT size, sha256 FROM song WHERE id = %s", (row_id,))
             elif table == "chart_chunk":
                 cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
             row = cur.fetchone()

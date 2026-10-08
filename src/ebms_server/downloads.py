@@ -173,16 +173,20 @@ def pre_manifest(chunk_id: int, request: Request, user: Annotated[User, Depends(
 
 def _zip_member(blob: BlobReader, entry: dict) -> tuple[int, object]:
     """곡 zip에서 항목 데이터가 시작하는 위치와 압축 해제기를 구합니다."""
-    head = blob.read(entry["offset"], 30)
-    if len(head) != 30 or head[:4] != b"PK\x03\x04":
-        raise ValueError("bad local file header")
-    name_len, extra_len = struct.unpack("<HH", head[26:30])
     if entry["method"] == zipfile.ZIP_STORED:
         decompressor = None
     elif entry["method"] == zipfile.ZIP_DEFLATED:
         decompressor = zlib.decompressobj(-15)
     else:
         raise ValueError(f"unsupported compression: {entry['method']}")
+
+    if "data_offset" in entry:
+        return entry["data_offset"], decompressor
+
+    head = blob.read(entry["offset"], 30)
+    if len(head) != 30 or head[:4] != b"PK\x03\x04":
+        raise ValueError("bad local file header")
+    name_len, extra_len = struct.unpack("<HH", head[26:30])
     return entry["offset"] + 30 + name_len + extra_len, decompressor
 
 
