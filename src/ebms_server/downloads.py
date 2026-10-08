@@ -67,62 +67,90 @@ def blob_response(
     filename: str,
     detail: str,
     *,
+    user_id: str | None = None,
     before_send: Callable[[], None] | None = None,
     meter_user: str | None = None,
 ) -> Response:
     """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다.
 
+    user_id: 동시 다운로드 수를 제한할 사용자 ID.
     before_send: 본문(200/206)을 보내기로 정한 뒤 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
     meter_user: 주면 보낸 바이트를 그 사용자의 사전 다운로드 사용량에 더하고 한도를 넘으면 감속합니다.
     """
-    blob = Database().open_blob(table, row_id)
-    if blob is None:
-        raise HTTPException(status_code=404, detail=detail)
-    etag = f'"{blob.sha256}"'
-    headers = {
-        "Accept-Ranges": "bytes",
-        "ETag": etag,
-        "X-Content-SHA256": blob.sha256,
-    }
+    if user_id and not quota.acquire_download_slot(user_id):
+        raise HTTPException(status_code=429, detail="too many concurrent downloads")
 
-    if _not_modified(request, etag):
-        blob.close()
-        return Response(status_code=304, headers=headers)
+    try:
+        blob = Database().open_blob(table, row_id)
+        if blob is None:
+            raise HTTPException(status_code=404, detail=detail)
+        etag = f'"{blob.sha256}"'
+        headers = {
+            "Accept-Ranges": "bytes",
+            "ETag": etag,
+            "X-Content-SHA256": blob.sha256,
+        }
 
-    rng = None
-    if_range = request.headers.get("if-range")
-    if if_range is None or if_range.strip() == etag:
-        try:
-            rng = parse_range(request.headers.get("range"), blob.size)
-        except ValueError:
+        if _not_modified(request, etag):
             blob.close()
-            raise HTTPException(
-                status_code=416,
-                detail="Range not satisfiable",
-                headers={**headers, "Content-Range": f"bytes */{blob.size}"},
-            )
+            if user_id:
+                quota.release_download_slot(user_id)
+            return Response(status_code=304, headers=headers)
 
-    if before_send is not None:
-        try:
-            before_send()
-        except BaseException:
-            blob.close()
-            raise
+        rng = None
+        if_range = request.headers.get("if-range")
+        if if_range is None or if_range.strip() == etag:
+            try:
+                rng = parse_range(request.headers.get("range"), blob.size)
+            except ValueError:
+                blob.close()
+                raise HTTPException(
+                    status_code=416,
+                    detail="Range not satisfiable",
+                    headers={**headers, "Content-Range": f"bytes */{blob.size}"},
+                )
 
-    headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    if rng is None:
-        start, end, status = 0, blob.size - 1, 200
-    else:
-        start, end = rng
-        status = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
-    headers["Content-Length"] = str(end - start + 1)
-    body = blob.iter_range(start, end)
-    if meter_user is not None:
-        iterator = body
-        # 본문을 시작하기 전에 끊기면 generator의 finally가 돌지 않으므로 blob도 직접 닫습니다.
-        body = quota.metered(meter_user, iterator, close=lambda: (iterator.close(), blob.close()))
-    return StreamingResponse(body, status_code=status, media_type="application/zip", headers=headers)
+        if before_send is not None:
+            try:
+                before_send()
+            except BaseException:
+                blob.close()
+                raise
+
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        if rng is None:
+            start, end, status = 0, blob.size - 1, 200
+        else:
+            start, end = rng
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
+        headers["Content-Length"] = str(end - start + 1)
+        gen = blob.iter_range(start, end)
+
+        def cleanup():
+            try:
+                if hasattr(gen, "close"):
+                    gen.close()
+            finally:
+                blob.close()
+                if user_id:
+                    quota.release_download_slot(user_id)
+
+        if meter_user is not None:
+            body = quota.metered(meter_user, gen, close=cleanup)
+        else:
+            def wrapped_body():
+                try:
+                    yield from gen
+                finally:
+                    cleanup()
+            body = wrapped_body()
+
+        return StreamingResponse(body, status_code=status, media_type="application/zip", headers=headers)
+    except Exception:
+        if user_id:
+            quota.release_download_slot(user_id)
+        raise
 
 
 def manifest_response(request: Request, chunk_id: int, meter_user: str | None = None) -> Response:
@@ -157,6 +185,7 @@ def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User, Depen
         chunk_id,
         constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
         "File not found",
+        user_id=user.id,
         meter_user=user.id,
     )
 
@@ -211,36 +240,52 @@ def _iter_member(blob: BlobReader, start: int, comp_size: int, decompressor):
 @router.get("/api/pre/song/{song_id}/file")
 def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[User, Depends(current_user)]):
     """곡의 사전 파일 하나를 압축을 풀어 내려줍니다. 사전 파일이 아니면 403."""
-    files = Database().get_song_files(song_id)
-    if files is None:
-        raise HTTPException(status_code=404, detail="song not found")
-    entry = next((f for f in files if f["path"] == path), None)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="file not found")
-    if entry.get("kind") != "pre":
-        raise HTTPException(status_code=403, detail="not a pre-download file")
+    if not quota.acquire_download_slot(user.id):
+        raise HTTPException(status_code=429, detail="too many concurrent downloads")
 
-    etag = f'"{entry["crc32"]}-{entry["size"]}"'
-    headers = {"ETag": etag, "Content-Length": str(entry["size"])}
-    if _not_modified(request, etag):
-        del headers["Content-Length"]
-        return Response(status_code=304, headers=headers)
-
-    blob = Database().open_blob("song", song_id)
-    if blob is None:
-        raise HTTPException(status_code=404, detail="song not found")
     try:
-        start, decompressor = _zip_member(blob, entry)
-    except ValueError:
-        blob.close()
-        raise HTTPException(status_code=500, detail="broken song file. report this to admin.")
-    body = _iter_member(blob, start, entry["comp_size"], decompressor)
-    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    return StreamingResponse(
-        quota.metered(user.id, body, close=lambda: (body.close(), blob.close())),
-        media_type=media_type,
-        headers=headers,
-    )
+        files = Database().get_song_files(song_id)
+        if files is None:
+            raise HTTPException(status_code=404, detail="song not found")
+        entry = next((f for f in files if f["path"] == path), None)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="file not found")
+        if entry.get("kind") != "pre":
+            raise HTTPException(status_code=403, detail="not a pre-download file")
+
+        etag = f'"{entry["crc32"]}-{entry["size"]}"'
+        headers = {"ETag": etag, "Content-Length": str(entry["size"])}
+        if _not_modified(request, etag):
+            del headers["Content-Length"]
+            quota.release_download_slot(user.id)
+            return Response(status_code=304, headers=headers)
+
+        blob = Database().open_blob("song", song_id)
+        if blob is None:
+            raise HTTPException(status_code=404, detail="song not found")
+        try:
+            start, decompressor = _zip_member(blob, entry)
+        except ValueError:
+            blob.close()
+            raise HTTPException(status_code=500, detail="broken song file. report this to admin.")
+        body = _iter_member(blob, start, entry["comp_size"], decompressor)
+        media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+        def cleanup():
+            try:
+                body.close()
+            finally:
+                blob.close()
+                quota.release_download_slot(user.id)
+
+        return StreamingResponse(
+            quota.metered(user.id, body, close=cleanup),
+            media_type=media_type,
+            headers=headers,
+        )
+    except Exception:
+        quota.release_download_slot(user.id)
+        raise
 
 
 # ---- 플레이 다운로드 ----
@@ -257,4 +302,4 @@ def play_song(song_id: int, request: Request, user: Annotated[User, Depends(curr
                 status_code=429, detail="no download ticket", headers={"Retry-After": str(e.retry_after)}
             )
 
-    return blob_response(request, "song", song_id, f"{song_id}.zip", "song not found", before_send=charge)
+    return blob_response(request, "song", song_id, f"{song_id}.zip", "song not found", user_id=user.id, before_send=charge)

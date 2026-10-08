@@ -293,86 +293,95 @@ def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
 
 
 class BlobReader:
-    """한 스냅샷에서 BLOB을 나눠 읽습니다. iter_range를 끝까지 돌거나 close를 호출하면 연결을 닫습니다."""
+    """BLOB을 나눠 읽습니다. 전송 중에 연결을 유지하지 않고 매 chunk 읽기마다 단기 연결을 씁니다."""
 
-    def __init__(self, con, cur, table: str, row_id: int, size: int, sha256: str):
-        self._con = con
-        self._cur = cur
+    def __init__(self, table: str, row_id: int, size: int, sha256: str):
         self.table = table
         self.row_id = row_id
         self.size = size
         self.sha256 = sha256
 
     def read(self, start: int, length: int) -> bytes:
-        """start부터 length 바이트를 읽습니다. 연결은 닫지 않습니다."""
+        """start부터 length 바이트를 읽습니다."""
         if self.table == "song":
             start_seq = start // constant.BLOB_READ_SIZE
             end_seq = (start + length - 1) // constant.BLOB_READ_SIZE
-            self._cur.execute(
-                "SELECT seq, data FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s ORDER BY seq",
-                (self.row_id, start_seq, end_seq),
-            )
-            rows = self._cur.fetchall()
-            if rows:
-                buf = b"".join(r[1] for r in rows)
-                offset_in_buf = start - start_seq * constant.BLOB_READ_SIZE
-                return buf[offset_in_buf : offset_in_buf + length]
-            # song_part에 없는 경우(마이그레이션 전) song.data fallback
-            self._cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, self.row_id))
-            return self._cur.fetchone()[0]
+            with connect() as con, con.cursor() as cur:
+                cur.execute(
+                    "SELECT seq, data FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s ORDER BY seq",
+                    (self.row_id, start_seq, end_seq),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    buf = b"".join(r[1] for r in rows)
+                    offset_in_buf = start - start_seq * constant.BLOB_READ_SIZE
+                    return buf[offset_in_buf : offset_in_buf + length]
+                # song_part에 없는 경우(마이그레이션 전) song.data fallback
+                cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, self.row_id))
+                return cur.fetchone()[0]
         else:
             raise ValueError(self.table)
 
     def iter_range(self, start: int, end: int) -> Iterator[bytes]:
         """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
-        try:
-            step = constant.BLOB_READ_SIZE
-            if self.table == "song":
-                start_seq = start // step
-                end_seq = end // step
-                self._cur.execute(
+        step = constant.BLOB_READ_SIZE
+        if self.table == "song":
+            start_seq = start // step
+            end_seq = end // step
+            with connect() as con, con.cursor() as cur:
+                cur.execute(
                     "SELECT seq FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s LIMIT 1",
                     (self.row_id, start_seq, end_seq),
                 )
-                if self._cur.fetchone() is not None:
-                    for seq in range(start_seq, end_seq + 1):
-                        self._cur.execute(
+                has_parts = cur.fetchone() is not None
+
+            if has_parts:
+                for seq in range(start_seq, end_seq + 1):
+                    with connect() as con, con.cursor() as cur:
+                        cur.execute(
                             "SELECT data FROM song_part WHERE song_id = %s AND seq = %s",
                             (self.row_id, seq),
                         )
-                        row = self._cur.fetchone()
-                        if row is not None:
-                            part_data = row[0]
-                            chunk_start = seq * step
-                            s = max(0, start - chunk_start)
-                            e = min(len(part_data), end + 1 - chunk_start)
-                            yield part_data[s:e]
-                else:
-                    for pos in range(start + 1, end + 2, step):
-                        self._cur.execute(
+                        row = cur.fetchone()
+                    if row is not None:
+                        part_data = row[0]
+                        chunk_start = seq * step
+                        s = max(0, start - chunk_start)
+                        e = min(len(part_data), end + 1 - chunk_start)
+                        yield part_data[s:e]
+            else:
+                for pos in range(start + 1, end + 2, step):
+                    with connect() as con, con.cursor() as cur:
+                        cur.execute(
                             "SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s",
                             (pos, min(step, end + 2 - pos), self.row_id),
                         )
-                        yield self._cur.fetchone()[0]
-            elif self.table == "chart_chunk":
-                for pos in range(start + 1, end + 2, step):
-                    self._cur.execute(
+                        row = cur.fetchone()
+                    if row is not None:
+                        yield row[0]
+        elif self.table == "chart_chunk":
+            for pos in range(start + 1, end + 2, step):
+                with connect() as con, con.cursor() as cur:
+                    cur.execute(
                         "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
                         (pos, min(step, end + 2 - pos), self.row_id),
                     )
-                    yield self._cur.fetchone()[0]
-            else:
-                raise ValueError(self.table)
-        finally:
-            self.close()
+                    row = cur.fetchone()
+                if row is not None:
+                    yield row[0]
+        else:
+            raise ValueError(self.table)
 
     def close(self) -> None:
-        if self._con.open:
-            self._con.close()
+        pass
 
 
 def connect(**kwargs) -> pymysql.connections.Connection:
-    """constant.py에 정의된 MySQL 서버에 연결합니다."""
+    """constant.py에 정의된 MySQL 서버에 연결합니다.
+
+    주의: PyMySQL Connection의 context manager는 __exit__ 시 con.close()를 부르지 않으므로
+    자동으로 connection을 닫으려면 ConnectionWrapper를 반환합니다.
+    """
     params = dict(
         host=constant.DB_HOST,
         port=constant.DB_PORT,
@@ -383,7 +392,28 @@ def connect(**kwargs) -> pymysql.connections.Connection:
         max_allowed_packet=constant.DB_MAX_ALLOWED_PACKET,
     )
     params.update(kwargs)
-    return pymysql.connect(**params)
+    con = pymysql.connect(**params)
+    return ConnectionWrapper(con)
+
+
+class ConnectionWrapper:
+    """pymysql.Connection의 래퍼. with 문을 빠져나갈 때 연결을 확실히 닫습니다."""
+
+    def __init__(self, con: pymysql.connections.Connection):
+        self._con = con
+
+    def __enter__(self):
+        return self._con.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._con.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            if self._con.open:
+                self._con.close()
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
 
 
 class Database:
@@ -879,29 +909,21 @@ class Database:
             return row[0] if row else None
 
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
-        """song / chart_chunk 테이블의 BLOB을 BLOB_READ_SIZE 단위로 나눠 읽을 준비를 합니다.
+        """song / chart_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
 
-        큰 파일을 한 번에 메모리에 올리지 않고, max_allowed_packet보다 큰 응답도 피하기 위함입니다.
-        크기, 해시, 내용은 같은 스냅샷에서 읽으므로 읽는 도중 chunk가 갱신되어도 일치합니다.
+        전송 중 DB 연결과 트랜잭션을 잡지 않도록 단기 연결을 사용합니다.
 
         Returns:
             BlobReader. 존재하지 않는 id의 경우 None을 반환합니다.
         """
         if table not in ("song", "chart_chunk"):
             raise ValueError(table)
-        con = connect()
-        try:
-            cur = con.cursor()
-            cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        with connect() as con, con.cursor() as cur:
             if table == "song":
                 cur.execute("SELECT size, sha256 FROM song WHERE id = %s", (row_id,))
             elif table == "chart_chunk":
                 cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
             row = cur.fetchone()
-        except Exception:
-            con.close()
-            raise
         if row is None:
-            con.close()
             return None
-        return BlobReader(con, cur, table, row_id, row[0], row[1])
+        return BlobReader(table, row_id, row[0], row[1])

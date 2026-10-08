@@ -168,12 +168,12 @@ def test_pre_throttled_after_monthly_limit(tmp_path, client, monkeypatch):
     full = client.get(url, headers=bearer(key)).content
     assert delays == []
 
-    quota.set_overrides(user_id, {"pre_monthly_bytes": 0, "pre_throttled_kbps": 8})  # 1000 B/s
+    quota.set_overrides(user_id, {"pre_monthly_bytes": 0, "pre_throttled_kbps": 64})  # 8000 B/s
     assert client.get(url, headers=bearer(key)).content == full
     assert len(delays) == len(full) // 100 - 1  # 첫 조각은 바로 보냄
     # 같은 사용자의 요청은 하나의 버킷을 나눠 쓰므로, 테스트처럼 실제로 기다리지 않으면 대기가 계속 늘어납니다.
     assert delays[-1] > delays[0] > 0
-    assert abs(delays[-1] - (len(full) - 100) / 1000) < 0.5
+    assert abs(delays[-1] - (len(full) - 100) / 8000) < 0.5
     assert client.get("/api/me", headers=bearer(key)).json()["pre"]["throttled"] is True
 
 
@@ -362,3 +362,34 @@ def test_admin_user_update_role(client, monkeypatch):
 
     # 자기 자신은 강등할 수 없음
     assert client.put(f"/api/admin/users/{admin_id}", json={"role": "user"}).status_code == 400
+
+
+def test_concurrent_downloads_limit(tmp_path, client, monkeypatch):
+    key, user_id = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+
+    # 10개까지는 슬롯 확보 성공
+    for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER):
+        assert quota.acquire_download_slot(user_id) is True
+
+    # 11번째는 초과
+    assert quota.acquire_download_slot(user_id) is False
+    res = client.get("/api/play/song/1", headers=bearer(key))
+    assert res.status_code == 429
+    assert res.json()["detail"] == "too many concurrent downloads"
+
+    # 반납 후에는 다시 가능
+    quota.release_download_slot(user_id)
+    assert quota.acquire_download_slot(user_id) is True
+
+    # 정리
+    for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER):
+        quota.release_download_slot(user_id)
+
+
+def test_min_throttled_kbps_validation():
+    import pytest
+    with pytest.raises(ValueError, match="pre_throttled_kbps must be between 64 and"):
+        quota.validate("pre_throttled_kbps", 10)
+
+    assert quota.validate("pre_throttled_kbps", 64) == 64
