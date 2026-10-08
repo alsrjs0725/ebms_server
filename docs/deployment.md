@@ -16,9 +16,9 @@
 | --- | --- | --- |
 | `develop` | DEVELOP | 테스트만 실행 |
 | `stage` | STAGE | 테스트 후 홈서버에 `ebms-stage`로 배포 |
-| `main` | RELEASE | 테스트 후 홈서버에 `ebms-release`로 배포 |
+| `release` | RELEASE | 테스트 후 홈서버에 `ebms-release`로 배포 |
 
-작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `main` 순서로 올립니다. `stage`·`main`에 병합되면 `.github/workflows/deploy.yml`이 이미지를 빌드해 GHCR(`ghcr.io/alsrjs0725/ebms_server`)에 올리고(`stage` / `latest`·`<버전>` 태그, 커밋마다 `sha-<커밋>`), 홈서버의 self-hosted runner가 그 커밋의 이미지를 받아 `docker compose -p ebms-<단계> --env-file <단계>.env up -d`로 띄웁니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
+작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `release` 순서로 올립니다. `stage`·`release`에 병합되면 `.github/workflows/deploy.yml`이 이미지를 빌드해 GHCR(`ghcr.io/alsrjs0725/ebms_server`)에 올리고(`stage` / `latest`·`<버전>` 태그, 커밋마다 `sha-<커밋>`), 홈서버의 self-hosted runner가 그 커밋의 이미지를 받아 `docker compose -p ebms-<단계> --env-file <단계>.env up -d`로 띄웁니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
 
 ### 홈서버 초기 세팅 (한 번만)
 
@@ -35,7 +35,7 @@
 
    OAuth 앱의 리다이렉트 주소도 단계별 `EBMS_PUBLIC_URL`에 맞춰 각각 등록합니다([auth.md](auth.md)).
 
-4. 처음 한 번은 저장소 **Actions → Deploy → Run workflow**로 `stage`, `main`을 각각 실행해 확인합니다.
+4. 처음 한 번은 저장소 **Actions → Deploy → Run workflow**로 `stage`, `release`를 각각 실행해 확인합니다.
 
 수동으로 다루려면 같은 이름을 씁니다: `docker compose -p ebms-stage --env-file /opt/ebms/stage.env logs -f ebms`.
 

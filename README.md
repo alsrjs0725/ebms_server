@@ -10,7 +10,7 @@ BMS 곡·차트를 저장하고 클라이언트에 배포하는 서버입니다.
 
 ```bash
 mkdir ebms && cd ebms
-base=https://raw.githubusercontent.com/alsrjs0725/ebms_server/main
+base=https://raw.githubusercontent.com/alsrjs0725/ebms_server/release
 curl -fsSLO $base/docker-compose.yml
 curl -fsSL $base/.env.example -o .env   # 비밀번호 등 수정
 docker compose up -d
