@@ -42,14 +42,28 @@ EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
 
 ### 홈서버 초기 세팅 (한 번만)
 
-1. Docker와 Compose 플러그인을 설치하고, runner를 돌릴 사용자를 `docker` 그룹에 넣습니다.
-2. GitHub 저장소 **Settings → Actions → Runners → New self-hosted runner**의 안내대로 runner를 설치합니다. 설정할 때 라벨에 `ebms`를 추가하고, `sudo ./svc.sh install && sudo ./svc.sh start`로 서비스로 등록합니다.
+1. Docker와 Compose 플러그인을 설치합니다.
+2. runner를 컨테이너로 띄웁니다. 호스트의 docker 소켓을 받아 EBMS 컨테이너를 띄우고, 재부팅하면 docker가 자동으로 다시 시작합니다(root 계정만 있어도 됩니다).
+   1. GitHub 저장소 **Settings → Actions → Runners → New self-hosted runner**에서 `--token` 뒤의 값을 복사합니다(1시간 안에 사용).
+   2. 홈서버에서 실행합니다.
+
+      ```bash
+      git clone https://github.com/alsrjs0725/ebms_server.git /opt/ebms-src
+      cd /opt/ebms-src/deploy/runner
+      RUNNER_TOKEN=<복사한 토큰> docker compose up -d --build
+      docker compose logs -f   # "Listening for Jobs"가 보이면 완료
+      ```
+
+   등록 정보는 `runner` 볼륨에 남으므로 이후 재시작에는 토큰이 필요 없습니다. 다시 등록하려면 `docker compose down -v` 후 새 토큰으로 올립니다. 다른 저장소용 runner가 필요하면 `RUNNER_URL`, `RUNNER_NAME`, `RUNNER_LABELS`를 바꿔 다른 폴더(compose 프로젝트)로 띄웁니다.
+
+   > runner 컨테이너는 docker 소켓을 쓰므로 호스트 root와 같은 권한을 가집니다. 이 저장소의 워크플로만 실행되도록 runner는 저장소 단위로 등록합니다.
+
 3. 단계별 env 파일을 `/opt/ebms/`에 만듭니다(위치는 저장소 변수 `EBMS_ENV_DIR`로 변경 가능). `.env.example`을 복사해 값을 채우되, **포트·주소·비밀번호는 단계마다 다르게** 둡니다.
 
    ```bash
-   sudo mkdir -p /opt/ebms && sudo chown "$USER" /opt/ebms
-   cp .env.example /opt/ebms/release.env   # EBMS_PORT=8000
-   cp .env.example /opt/ebms/stage.env     # EBMS_PORT=8001
+   mkdir -p /opt/ebms
+   cp /opt/ebms-src/.env.example /opt/ebms/release.env   # EBMS_PORT=8000
+   cp /opt/ebms-src/.env.example /opt/ebms/stage.env     # EBMS_PORT=8001
    chmod 600 /opt/ebms/*.env
    ```
 
