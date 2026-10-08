@@ -16,7 +16,7 @@ curl -fsSL $base/.env.example -o .env   # 비밀번호 등 수정
 docker compose up -d
 ```
 
-- 이미지 태그: `latest`(정식), `<버전>`(예: `0.1.0`), `stage`(스테이지). `.env`의 `EBMS_IMAGE`로 고릅니다.
+- 이미지 태그: `latest`·`release`(정식), `<버전>`(예: `0.1.0`), `stage`(스테이지). `.env`의 `EBMS_IMAGE`로 고릅니다.
 - 업데이트: `docker compose pull && docker compose up -d`
 - 소스에서 직접 빌드하려면 저장소를 받은 뒤 `docker compose up -d --build`
 
