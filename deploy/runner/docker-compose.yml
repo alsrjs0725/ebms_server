@@ -1,4 +1,7 @@
 # 홈서버에서: cd deploy/runner && RUNNER_TOKEN=<토큰> docker compose up -d --build
+# 다른 runner와 컨테이너·볼륨 이름이 겹치지 않도록 프로젝트 이름을 고정
+name: ebms-runner
+
 services:
   runner:
     build: .

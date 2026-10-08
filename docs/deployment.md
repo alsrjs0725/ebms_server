@@ -54,7 +54,7 @@ EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
       docker compose logs -f   # "Listening for Jobs"가 보이면 완료
       ```
 
-   등록 정보는 `runner` 볼륨에 남으므로 이후 재시작에는 토큰이 필요 없습니다. 다시 등록하려면 `docker compose down -v` 후 새 토큰으로 올립니다. 다른 저장소용 runner가 필요하면 `RUNNER_URL`, `RUNNER_NAME`, `RUNNER_LABELS`를 바꿔 다른 폴더(compose 프로젝트)로 띄웁니다.
+   등록 정보는 `runner` 볼륨에 남으므로 이후 재시작에는 토큰이 필요 없습니다. 다시 등록하려면 `docker compose down -v` 후 새 토큰으로 올립니다. compose 프로젝트 이름은 `ebms-runner`로 고정돼 있어 다른 runner 컨테이너(`runner-runner-1` 등)와 겹치지 않습니다. 이 파일로 다른 저장소용 runner를 하나 더 띄우려면 `RUNNER_URL`, `RUNNER_NAME`, `RUNNER_LABELS`를 바꾸고 `-p <다른 이름>`을 붙입니다.
 
    > runner 컨테이너는 docker 소켓을 쓰므로 호스트 root와 같은 권한을 가집니다. 이 저장소의 워크플로만 실행되도록 runner는 저장소 단위로 등록합니다.
 
