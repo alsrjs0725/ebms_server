@@ -189,6 +189,47 @@ def test_admin_email(client, monkeypatch):
     assert me(client).is_admin
 
 
+def test_a3_no_demotion_after_list_change(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    assert me(client).is_admin
+
+    # ADMIN_EMAILS 목록에서 제외 후 재로그인하면 user로 강등됨
+    monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
+    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    assert me(client).role == "user"
+
+
+def test_a3_second_account_same_email_other_provider(client, monkeypatch):
+    # 첫 번째 제공자로 로그인
+    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    user1 = me(client)
+    assert user1.is_admin
+
+    # 연결 없이 다른 제공자로 로그인하면 별도 계정이 생성됨
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=True)
+    user2 = me(client)
+    assert user2.id != user1.id
+    assert user2.is_admin
+
+    # 목록에서 빠지면 해당 계정으로 로그인 시 강등됨
+    monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
+    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=True)
+    assert me(client).role == "user"
+
+
+def test_a3_link_promotes(client, monkeypatch):
+    # 일반 사용자 계정 생성
+    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
+    user_id = me(client).id
+    assert me(client).role == "user"
+
+    # 관리자 이메일 OAuth를 연결해도 자동 승격되지 않음
+    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True, link=True)
+    assert me(client).role == "user"
+    assert me(client).id == user_id
+
+
 def test_banned_user_cannot_login(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1")
     user_id = me(client).id
