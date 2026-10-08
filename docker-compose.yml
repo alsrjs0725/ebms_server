@@ -16,7 +16,8 @@ services:
       - --innodb_buffer_pool_size=512M
       - --max_connections=200
     volumes:
-      - mysql-data:/var/lib/mysql
+      # EBMS_MYSQL_DIR에 절대 경로(예: HDD)를 주면 그 폴더에, 비우면 docker 볼륨에 저장
+      - ${EBMS_MYSQL_DIR:-mysql-data}:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
       interval: 10s
@@ -48,7 +49,8 @@ services:
     ports:
       - "${EBMS_PORT:-8000}:8000"
     volumes:
-      - ebms-var:/app/var
+      # 로그·임포트 대기 폴더. EBMS_VAR_DIR로 위치 변경
+      - ${EBMS_VAR_DIR:-ebms-var}:/app/var
 
 volumes:
   mysql-data:

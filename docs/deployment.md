@@ -10,6 +10,26 @@
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
 - 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
 
+### 데이터를 다른 디스크(HDD)에 두기
+
+`.env`에 절대 경로를 주면 docker 볼륨 대신 그 폴더에 저장합니다. 단계별로 다른 폴더를 써야 합니다.
+
+```bash
+# /opt/ebms/release.env
+EBMS_MYSQL_DIR=/mnt/hdd/ebms/release/mysql
+EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
+```
+
+- 폴더가 없으면 docker가 만들고, MySQL 컨테이너가 소유자를 맞춥니다. HDD는 부팅 시 자동 마운트(`/etc/fstab`)되게 해 두세요. 마운트 전에 컨테이너가 뜨면 빈 폴더에 새 DB가 생깁니다.
+- 이미 docker 볼륨에 데이터가 있으면 옮긴 뒤 경로를 바꿉니다.
+
+  ```bash
+  docker compose -p ebms-release --env-file /opt/ebms/release.env down
+  sudo mkdir -p /mnt/hdd/ebms/release/mysql
+  docker run --rm -v ebms-release_mysql-data:/from -v /mnt/hdd/ebms/release/mysql:/to alpine cp -a /from/. /to/
+  # release.env에 EBMS_MYSQL_DIR 추가 후 다시 up
+  ```
+
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |
