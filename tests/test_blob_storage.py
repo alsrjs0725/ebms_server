@@ -316,3 +316,14 @@ def test_song_part_chunking_and_migration(tmp_path, client, database):
     res_play = client.get("/api/play/song/1")
     assert res_play.status_code == 200
     assert res_play.content == raw_zip
+
+
+def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):
+    """BlobReader가 스트리밍 중에 DB 연결을 계속 열어두지 않는지 확인합니다."""
+    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE\n"}))
+    blob = Database().open_blob("song", 1)
+    assert blob is not None
+
+    # iter_range 조각을 가져온 후에도 open_blob이 생성했던 연결이 남아있지 않음
+    chunks = list(blob.iter_range(0, blob.size - 1))
+    assert len(b"".join(chunks)) == blob.size

@@ -27,7 +27,7 @@ MINIMUMS = {
     "refill_seconds": 1,
     "grant_seconds": 0,
     "pre_monthly_bytes": 0,
-    "pre_throttled_kbps": 1,
+    "pre_throttled_kbps": 64,
 }
 # 정수 컬럼 범위를 넘지 않도록
 MAXIMUMS = {name: 2 ** 31 - 1 for name in MINIMUMS} | {"pre_monthly_bytes": 2 ** 62}
@@ -36,6 +36,46 @@ KST = datetime.timezone(datetime.timedelta(hours=9))
 USAGE_FLUSH_BYTES = 8 * 1024 * 1024
 # 감속할 때 한 번에 보내는 크기
 THROTTLE_PIECE = 16 * 1024
+# 사용자당 최대 동시 다운로드 수
+MAX_CONCURRENT_DOWNLOADS_PER_USER = 10
+
+
+class ConcurrentDownloadTracker:
+    """사용자별 동시 다운로드 수 제한."""
+
+    def __init__(self, limit: int = MAX_CONCURRENT_DOWNLOADS_PER_USER):
+        self.limit = limit
+        self._counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, user_id: str) -> bool:
+        """다운로드 슬롯을 얻습니다. 한도를 초과하면 False."""
+        with self._lock:
+            current = self._counts.get(user_id, 0)
+            if current >= self.limit:
+                return False
+            self._counts[user_id] = current + 1
+            return True
+
+    def release(self, user_id: str) -> None:
+        """다운로드 슬롯을 반납합니다."""
+        with self._lock:
+            current = self._counts.get(user_id, 0)
+            if current <= 1:
+                self._counts.pop(user_id, None)
+            else:
+                self._counts[user_id] = current - 1
+
+
+_download_tracker = ConcurrentDownloadTracker()
+
+
+def acquire_download_slot(user_id: str) -> bool:
+    return _download_tracker.acquire(user_id)
+
+
+def release_download_slot(user_id: str) -> None:
+    _download_tracker.release(user_id)
 
 
 def validate(name: str, value) -> int:
