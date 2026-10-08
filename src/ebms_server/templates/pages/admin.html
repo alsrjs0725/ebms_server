@@ -49,7 +49,7 @@
                 <br><small class="text-muted">{{ u.email or "" }} · {{ u.oauths | join(", ") }} · <code>{{ u.id }}</code></small>
             </div>
             {% if u.id != user.id %}
-            <button class="btn btn-sm {{ 'btn-outline-success' if u.status != 'active' else 'btn-outline-danger' }}" type="button" data-status="{{ 'active' if u.status != 'active' else 'banned' }}">{{ "정지 해제" if u.status != "active" else "정지" }}</button>
+            <button class="btn btn-sm {{ 'btn-outline-success' if u.status != 'active' else 'btn-outline-danger' }}" type="button" data-status="{{ 'active' if u.status != 'active' else 'banned' }}" aria-label="{{ u.display_name or '이름 없는 사용자' }} {{ '정지 해제' if u.status != 'active' else '정지' }}">{{ "정지 해제" if u.status != "active" else "정지" }}</button>
             {% endif %}
         </div>
         <p class="small mb-2">
@@ -77,8 +77,8 @@
             </div>
         </div>
         <div class="mt-2 d-flex gap-2">
-            <button class="btn btn-sm btn-primary" type="submit">저장</button>
-            <button class="btn btn-sm btn-outline-primary" type="button" data-refill>티켓 충전</button>
+            <button class="btn btn-sm btn-primary" type="submit" aria-label="{{ u.display_name or '이름 없는 사용자' }} 설정 저장">저장</button>
+            <button class="btn btn-sm btn-outline-primary" type="button" data-refill aria-label="{{ u.display_name or '이름 없는 사용자' }} 티켓 충전">티켓 충전</button>
         </div>
     </div>
 </form>
