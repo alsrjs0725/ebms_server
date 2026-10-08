@@ -6,10 +6,19 @@ BMS 곡·차트를 저장하고 클라이언트에 배포하는 서버입니다.
 
 ### Docker (서버 + MySQL 올인원)
 
+빌드된 이미지(`ghcr.io/alsrjs0725/ebms_server`, amd64·arm64)를 받아 실행합니다. 소스는 필요 없습니다.
+
 ```bash
-cp .env.example .env   # 비밀번호 등 수정
-docker compose up -d --build
+mkdir ebms && cd ebms
+base=https://raw.githubusercontent.com/alsrjs0725/ebms_server/main
+curl -fsSLO $base/docker-compose.yml
+curl -fsSL $base/.env.example -o .env   # 비밀번호 등 수정
+docker compose up -d
 ```
+
+- 이미지 태그: `latest`(정식), `<버전>`(예: `0.1.0`), `stage`(스테이지). `.env`의 `EBMS_IMAGE`로 고릅니다.
+- 업데이트: `docker compose pull && docker compose up -d`
+- 소스에서 직접 빌드하려면 저장소를 받은 뒤 `docker compose up -d --build`
 
 - 서버: http://localhost:8000 (`EBMS_PORT`로 변경)
 - 로그인(OAuth) 설정은 [docs/auth.md](docs/auth.md)를 보세요.

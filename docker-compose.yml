@@ -25,6 +25,8 @@ services:
       start_period: 30s
 
   ebms:
+    # 배포된 이미지를 받아 실행. 소스에서 직접 빌드하려면 `docker compose up -d --build`
+    image: ${EBMS_IMAGE:-ghcr.io/alsrjs0725/ebms_server:latest}
     build: .
     restart: unless-stopped
     depends_on:
