@@ -1,0 +1,42 @@
+name: Deploy
+
+# main(release) / stage 브랜치에 병합되면 홈서버의 self-hosted runner에서 배포
+on:
+  push:
+    branches: [main, stage]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run pytest
+
+  deploy:
+    needs: test
+    runs-on: [self-hosted, ebms]
+    env:
+      STAGE: ${{ github.ref_name == 'main' && 'release' || 'stage' }}
+      # 홈서버에서 단계별 env 파일을 두는 폴더 (저장소 변수 EBMS_ENV_DIR로 변경)
+      EBMS_ENV_DIR: ${{ vars.EBMS_ENV_DIR || '/opt/ebms' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose up
+        run: |
+          env_file="$EBMS_ENV_DIR/$STAGE.env"
+          if [ ! -f "$env_file" ]; then
+            echo "::error::$env_file 이 없습니다. docs/deployment.md의 홈서버 세팅을 보세요."
+            exit 1
+          fi
+          docker compose -p "ebms-$STAGE" --env-file "$env_file" \
+            up -d --build --remove-orphans --wait --wait-timeout 300
+      - name: 오래된 이미지 정리
+        if: always()
+        run: docker image prune -f
