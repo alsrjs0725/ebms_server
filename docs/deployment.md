@@ -10,15 +10,35 @@
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
 - 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
 
+### 데이터를 다른 디스크(HDD)에 두기
+
+`.env`에 절대 경로를 주면 docker 볼륨 대신 그 폴더에 저장합니다. 단계별로 다른 폴더를 써야 합니다.
+
+```bash
+# /opt/ebms/release.env
+EBMS_MYSQL_DIR=/mnt/hdd/ebms/release/mysql
+EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
+```
+
+- 폴더가 없으면 docker가 만들고, MySQL 컨테이너가 소유자를 맞춥니다. HDD는 부팅 시 자동 마운트(`/etc/fstab`)되게 해 두세요. 마운트 전에 컨테이너가 뜨면 빈 폴더에 새 DB가 생깁니다.
+- 이미 docker 볼륨에 데이터가 있으면 옮긴 뒤 경로를 바꿉니다.
+
+  ```bash
+  docker compose -p ebms-release --env-file /opt/ebms/release.env down
+  sudo mkdir -p /mnt/hdd/ebms/release/mysql
+  docker run --rm -v ebms-release_mysql-data:/from -v /mnt/hdd/ebms/release/mysql:/to alpine cp -a /from/. /to/
+  # release.env에 EBMS_MYSQL_DIR 추가 후 다시 up
+  ```
+
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |
 | --- | --- | --- |
 | `develop` | DEVELOP | 테스트만 실행 |
 | `stage` | STAGE | 테스트 후 홈서버에 `ebms-stage`로 배포 |
-| `main` | RELEASE | 테스트 후 홈서버에 `ebms-release`로 배포 |
+| `release` | RELEASE | 테스트 후 홈서버에 `ebms-release`로 배포 |
 
-작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `main` 순서로 올립니다. 배포는 `.github/workflows/deploy.yml`이 홈서버의 self-hosted runner에서 `docker compose -p ebms-<단계> --env-file <단계>.env up -d --build`로 실행합니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
+작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `release` 순서로 올립니다. `stage`·`release`에 병합되면 `.github/workflows/deploy.yml`이 이미지를 빌드해 GHCR(`ghcr.io/alsrjs0725/ebms_server`)에 올리고(`stage` / `latest`·`<버전>` 태그, 커밋마다 `sha-<커밋>`), 홈서버의 self-hosted runner가 그 커밋의 이미지를 받아 `docker compose -p ebms-<단계> --env-file <단계>.env up -d`로 띄웁니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
 
 ### 홈서버 초기 세팅 (한 번만)
 
@@ -35,7 +55,7 @@
 
    OAuth 앱의 리다이렉트 주소도 단계별 `EBMS_PUBLIC_URL`에 맞춰 각각 등록합니다([auth.md](auth.md)).
 
-4. 처음 한 번은 저장소 **Actions → Deploy → Run workflow**로 `stage`, `main`을 각각 실행해 확인합니다.
+4. 처음 한 번은 저장소 **Actions → Deploy → Run workflow**로 `stage`, `release`를 각각 실행해 확인합니다.
 
 수동으로 다루려면 같은 이름을 씁니다: `docker compose -p ebms-stage --env-file /opt/ebms/stage.env logs -f ebms`.
 

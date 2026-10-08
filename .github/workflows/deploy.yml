@@ -1,14 +1,18 @@
 name: Deploy
 
-# main(release) / stage 브랜치에 병합되면 홈서버의 self-hosted runner에서 배포
+# release / stage 브랜치에 병합되면 이미지를 GHCR에 올리고,
+# 홈서버의 self-hosted runner에서 그 이미지로 배포
 on:
   push:
-    branches: [main, stage]
+    branches: [release, stage]
   workflow_dispatch:
 
 concurrency:
   group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   test:
@@ -19,15 +23,63 @@ jobs:
       - run: uv sync --frozen
       - run: uv run pytest
 
-  deploy:
+  image:
     needs: test
-    runs-on: [self-hosted, ebms]
-    env:
-      STAGE: ${{ github.ref_name == 'main' && 'release' || 'stage' }}
-      # 홈서버에서 단계별 env 파일을 두는 폴더 (저장소 변수 EBMS_ENV_DIR로 변경)
-      EBMS_ENV_DIR: ${{ vars.EBMS_ENV_DIR || '/opt/ebms' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ env.IMAGE }}:sha-${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
+      - id: version
+        run: echo "version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=raw,value=stage,enable=${{ github.ref_name == 'stage' }}
+            type=raw,value=latest,enable=${{ github.ref_name == 'release' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ github.ref_name == 'release' }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    runs-on: [self-hosted, ebms]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      STAGE: ${{ github.ref_name }}
+      # 홈서버에서 단계별 env 파일을 두는 폴더 (저장소 변수 EBMS_ENV_DIR로 변경)
+      EBMS_ENV_DIR: ${{ vars.EBMS_ENV_DIR || '/opt/ebms' }}
+      # 이번 커밋으로 만든 이미지를 그대로 배포
+      EBMS_IMAGE: ${{ needs.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: docker compose up
         run: |
           env_file="$EBMS_ENV_DIR/$STAGE.env"
@@ -35,8 +87,9 @@ jobs:
             echo "::error::$env_file 이 없습니다. docs/deployment.md의 홈서버 세팅을 보세요."
             exit 1
           fi
-          docker compose -p "ebms-$STAGE" --env-file "$env_file" \
-            up -d --build --remove-orphans --wait --wait-timeout 300
+          compose="docker compose -p ebms-$STAGE --env-file $env_file"
+          $compose pull ebms
+          $compose up -d --no-build --remove-orphans --wait --wait-timeout 300
       - name: 오래된 이미지 정리
         if: always()
         run: docker image prune -f
