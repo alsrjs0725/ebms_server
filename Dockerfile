@@ -22,7 +22,7 @@ RUN mkdir -p var/log var/tmp
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/charthash', timeout=3)" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/version', timeout=3)" || exit 1
 
 CMD ["fastapi", "run", "--entrypoint", "ebms_server.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \

@@ -325,3 +325,10 @@ def test_session_cookie_renewed(client, monkeypatch):
     # 비로그인 요청에는 쿠키를 싣지 않음
     client.cookies.clear()
     assert "set-cookie" not in client.get("/login").headers
+
+
+def test_docker_healthcheck_url_is_public(client):
+    # Dockerfile HEALTHCHECK가 부르는 경로는 로그인 없이 200이어야 배포가 healthy가 됩니다.
+    dockerfile = (constant.BASE_DIR / "Dockerfile").read_text(encoding="utf-8")
+    path = re.search(r"http://127\.0\.0\.1:8000(/[^'\"]*)", dockerfile).group(1)
+    assert client.get(path).status_code == 200, path
