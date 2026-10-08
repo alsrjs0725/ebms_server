@@ -278,3 +278,41 @@ def test_add_missing_columns(database):
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT folder, files FROM song")
         assert cur.fetchall() == ()
+
+
+def test_song_part_chunking_and_migration(tmp_path, client, database):
+    song = make_song(tmp_path, "s_part", {"a.bms": b"#TITLE\n#BANNER banner.bmp\n", "banner.bmp": os.urandom(2000)})
+    database.insert_song(song)
+
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT data FROM song WHERE id = 1")
+        song_data = cur.fetchone()[0]
+        assert song_data is None  # song.data should be NULL
+
+        cur.execute("SELECT COUNT(*) FROM song_part WHERE song_id = 1")
+        part_count = cur.fetchone()[0]
+        assert part_count > 0  # Parts exist in song_part
+
+    # Test downloading pre-file using data_offset
+    res = client.get("/api/pre/song/1/file?path=banner.bmp")
+    assert res.status_code == 200
+    assert len(res.content) == 2000
+
+    # Test migration of old song.data row to song_part
+    raw_zip = database.get_song_data(1)
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM song_part WHERE song_id = 1")
+        cur.execute("UPDATE song SET data = %s WHERE id = 1", (raw_zip,))
+        con.commit()
+
+    database.backfill_manifest()
+
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT data FROM song WHERE id = 1")
+        assert cur.fetchone()[0] is None
+        cur.execute("SELECT COUNT(*) FROM song_part WHERE song_id = 1")
+        assert cur.fetchone()[0] == part_count
+
+    res_play = client.get("/api/play/song/1")
+    assert res_play.status_code == 200
+    assert res_play.content == raw_zip
