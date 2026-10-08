@@ -33,7 +33,7 @@
 
 <h2 class="h5">사용자</h2>
 <form class="d-flex gap-2 mb-3" method="get" action="/admin">
-    <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="이름, 이메일, 계정 ID">
+    <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="이름, 이메일, 계정 ID" aria-label="사용자 검색">
     <button class="btn btn-outline-secondary" type="submit">검색</button>
 </form>
 {% if users | length >= limit %}<p class="text-muted small">최근 로그인 순으로 {{ limit }}명까지 보여줍니다.</p>{% endif %}
@@ -60,20 +60,20 @@
         </p>
         <div class="row g-2 align-items-end">
             <div class="col-6 col-md-3">
-                <label class="form-label small">최대 티켓</label>
-                <input class="form-control form-control-sm" type="number" min="0" step="1" name="max_tickets" value="{{ u.overrides.max_tickets if u.overrides.max_tickets is not none else '' }}" placeholder="기본 {{ settings.max_tickets }}">
+                <label class="form-label small" for="u-{{ u.id }}-max_tickets">최대 티켓</label>
+                <input class="form-control form-control-sm" type="number" min="0" step="1" id="u-{{ u.id }}-max_tickets" name="max_tickets" value="{{ u.overrides.max_tickets if u.overrides.max_tickets is not none else '' }}" placeholder="기본 {{ settings.max_tickets }}">
             </div>
             <div class="col-6 col-md-3">
-                <label class="form-label small">리필(초)</label>
-                <input class="form-control form-control-sm" type="number" min="1" step="1" name="refill_seconds" value="{{ u.overrides.refill_seconds if u.overrides.refill_seconds is not none else '' }}" placeholder="기본 {{ settings.refill_seconds }}">
+                <label class="form-label small" for="u-{{ u.id }}-refill_seconds">리필(초)</label>
+                <input class="form-control form-control-sm" type="number" min="1" step="1" id="u-{{ u.id }}-refill_seconds" name="refill_seconds" value="{{ u.overrides.refill_seconds if u.overrides.refill_seconds is not none else '' }}" placeholder="기본 {{ settings.refill_seconds }}">
             </div>
             <div class="col-6 col-md-3">
-                <label class="form-label small">월 한도(GB)</label>
-                <input class="form-control form-control-sm" type="number" min="0" step="any" name="pre_monthly_bytes" data-gb value="{{ u.overrides.pre_monthly_bytes / 1073741824 if u.overrides.pre_monthly_bytes is not none else '' }}" placeholder="기본 {{ settings.pre_monthly_bytes / 1073741824 }}">
+                <label class="form-label small" for="u-{{ u.id }}-pre_monthly_bytes">월 한도(GB)</label>
+                <input class="form-control form-control-sm" type="number" min="0" step="any" id="u-{{ u.id }}-pre_monthly_bytes" name="pre_monthly_bytes" data-gb value="{{ u.overrides.pre_monthly_bytes / 1073741824 if u.overrides.pre_monthly_bytes is not none else '' }}" placeholder="기본 {{ settings.pre_monthly_bytes / 1073741824 }}">
             </div>
             <div class="col-6 col-md-3">
-                <label class="form-label small">초과 후(Kbps)</label>
-                <input class="form-control form-control-sm" type="number" min="1" step="1" name="pre_throttled_kbps" value="{{ u.overrides.pre_throttled_kbps if u.overrides.pre_throttled_kbps is not none else '' }}" placeholder="기본 {{ settings.pre_throttled_kbps }}">
+                <label class="form-label small" for="u-{{ u.id }}-pre_throttled_kbps">초과 후(Kbps)</label>
+                <input class="form-control form-control-sm" type="number" min="1" step="1" id="u-{{ u.id }}-pre_throttled_kbps" name="pre_throttled_kbps" value="{{ u.overrides.pre_throttled_kbps if u.overrides.pre_throttled_kbps is not none else '' }}" placeholder="기본 {{ settings.pre_throttled_kbps }}">
             </div>
         </div>
         <div class="mt-2 d-flex gap-2">
