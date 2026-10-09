@@ -7,6 +7,7 @@ import posixpath
 import hashlib
 import logging
 import shutil
+import stat
 import struct
 import zipfile
 import threading
@@ -340,6 +341,61 @@ def is_pre_chunk_entry(entry: dict) -> bool:
 def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
     """chart chunk 안의 항목 이름. 곡마다 같은 파일명이 있을 수 있어 sha256을 이름으로 씁니다."""
     return f"{sha256}{path.suffix.lower()}"
+
+
+def _safe_entry(path: pathlib.Path, root: pathlib.Path, is_dir: bool) -> bool:
+    """곡 폴더(root, resolve된 경로) 안의 항목을 곡에 넣어도 되는지 봅니다.
+
+    심볼릭 링크는 따라가지 않고 건너뜁니다. 링크가 서버의 다른 파일(/proc/self/environ 등)을 가리키면
+    그 내용이 곡 zip·차트 청크에 들어가 배포되기 때문입니다. 일반 파일·폴더가 아니거나(FIFO 등)
+    실제 경로가 곡 폴더 밖이면 역시 건너뜁니다. 건너뛴 항목은 경고 로그를 남깁니다.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as e:
+        logger.warning(f"import: skipped unreadable entry[{path}]: {e}")
+        return False
+    if stat.S_ISLNK(mode):
+        logger.warning(f"import: skipped symlink[{path}]")
+        return False
+    if not (stat.S_ISDIR(mode) if is_dir else stat.S_ISREG(mode)):
+        logger.warning(f"import: skipped non-regular entry[{path}]")
+        return False
+    if not path.resolve().is_relative_to(root):
+        logger.warning(f"import: skipped entry outside song folder[{path}]")
+        return False
+    return True
+
+
+def song_dir_entries(source_dir: os.PathLike) -> list[tuple[pathlib.Path, bool]]:
+    """곡 폴더 안의 (경로, 폴더 여부) 목록. 심볼릭 링크는 파일·폴더 모두 따라가지 않고 건너뜁니다."""
+    root = pathlib.Path(source_dir).resolve()
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(root):  # followlinks=False
+        base = pathlib.Path(dirpath)
+        keep = []
+        for name in sorted(dirnames):
+            if _safe_entry(base / name, root, is_dir=True):
+                keep.append(name)
+                entries.append((base / name, True))
+        dirnames[:] = keep
+        for name in sorted(filenames):
+            if _safe_entry(base / name, root, is_dir=False):
+                entries.append((base / name, False))
+    return entries
+
+
+def chart_files(source_dir: os.PathLike) -> list[pathlib.Path]:
+    """곡 폴더 바로 아래의 차트 파일. 심볼릭 링크 등 곡에 넣지 않는 항목은 뺍니다."""
+    root = pathlib.Path(source_dir)
+    resolved = root.resolve()
+    return [
+        root / name
+        for name in sorted(os.listdir(root))
+        if pathlib.Path(name).suffix.lower() in constant.BMS_FORMAT
+        and _safe_entry(root / name, resolved, is_dir=False)
+    ]
 
 
 class BlobReader:
@@ -861,11 +917,7 @@ class Database:
     def _find_bms_files_and_existing_song(self, root: pathlib.Path, cur) -> tuple[list, int | None]:
         bms_files = []
         song_id = None
-        for file in os.listdir(root):
-            file_path = root / file
-            if file_path.suffix.lower() not in constant.BMS_FORMAT:
-                continue
-
+        for file_path in chart_files(root):
             with open(file_path, "rb") as fos:
                 sha256 = hashlib.sha256(fos.read()).hexdigest()
             size = os.path.getsize(file_path)
@@ -981,10 +1033,10 @@ class Database:
 
             return info
 
-        def _add_entry(path: pathlib.Path, zf: zipfile.ZipFile) -> None:
+        def _add_entry(path: pathlib.Path, is_dir: bool, zf: zipfile.ZipFile) -> None:
             arcname = get_arcname(path)
 
-            if path.is_dir():
+            if is_dir:
                 # 빈 디렉터리는 명시적으로 저장
                 try:
                     next(path.iterdir())
@@ -995,7 +1047,7 @@ class Database:
                     )
                     zf.writestr(info, b"")
 
-            elif path.is_file():
+            else:
                 info = make_zipinfo(arcname)
                 info.compress_type = zipfile.ZIP_DEFLATED
 
@@ -1015,8 +1067,9 @@ class Database:
             compresslevel=6,
         ) as zf:
 
-            for path in source_dir.rglob("*"):
-                _add_entry(path, zf)
+            # 심볼릭 링크는 따라가지 않습니다(곡 폴더 밖의 파일이 곡에 들어가지 않도록).
+            for path, is_dir in song_dir_entries(source_dir):
+                _add_entry(path, is_dir, zf)
 
         return buf.getvalue()
 
@@ -1155,7 +1208,7 @@ class SongBatch:
         if not root.is_dir():
             self.logger.warning(f"insert_song failed: Path isn't directory[{root}]")
             return None
-        if not any(pathlib.Path(name).suffix.lower() in constant.BMS_FORMAT for name in os.listdir(root)):
+        if not chart_files(root):
             self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
             return None
 
