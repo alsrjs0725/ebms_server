@@ -302,7 +302,7 @@ def test_api_requires_login(client):
             checked += 1
     assert checked >= 10
     assert client.get("/api/version").status_code == 200
-    assert client.get("/api/version").json()["api"] == 2
+    assert client.get("/api/version").json()["api"] == constant.API_VERSION
     # 기존 공개 다운로드 경로는 없어짐
     for path in ("/api/charthash", "/api/files/chart/0", "/api/manifest/hash", "/api/manifest/0",
                  "/api/files/song/id/1", "/api/files/song/" + "0" * 64):

@@ -37,6 +37,9 @@ class SQLiteCursor:
         if "CREATE TABLE IF NOT EXISTS chart_chunk" in sql:
             sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
             sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)
+        if "CREATE TABLE IF NOT EXISTS pre_chunk(" in sql:
+            sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
+            sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)
         if "CREATE TABLE IF NOT EXISTS manifest_chunk" in sql:
             sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
             sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)

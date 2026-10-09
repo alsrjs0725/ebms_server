@@ -2,6 +2,7 @@ import importlib.metadata
 import logging
 import logging.handlers
 import shutil
+import threading
 from contextlib import asynccontextmanager
 
 from .db import Database
@@ -37,12 +38,21 @@ def configure_logging() -> None:
     )
 
 
+def backfill_pre_chunks() -> None:
+    try:
+        Database().backfill_pre_chunks()
+    except Exception:
+        logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     logging.getLogger(__name__).info("DB is now loading...")
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
+    # 이전 버전에서 넣은 곡의 사전 청크는 시간이 걸리므로 뒤에서 만든다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받는다.
+    threading.Thread(target=backfill_pre_chunks, name="backfill_pre_chunks", daemon=True).start()
     if not constant.SECRET_KEY:
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
     if not auth.configured_oauths():

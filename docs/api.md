@@ -4,6 +4,8 @@
 
 API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manifest/*`, `/api/files/*`)를 없앴습니다. [사전/플레이 API](download.md)를 쓰세요.
 
+API 버전 3에서 사전 청크(`/api/pre/assethash`, `/api/pre/asset/{chunk_id}`)를 추가했습니다. 클라이언트는 동기화 때 곡들의 배너·프리뷰 등을 이것으로 미리 받습니다.
+
 | 메서드 | 경로 | 설명 |
 | --- | --- | --- |
 | GET | `/` | 웹 메인 페이지 (HTML) |
@@ -11,6 +13,8 @@ API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manife
 | GET | `/api/version` | API 버전. `auth`에 로그인 가능한 OAuth 목록(예: `["google", "discord"]`) |
 | GET | `/api/pre/charthash` | 차트 청크별 SHA-256 목록 |
 | GET | `/api/pre/chart/{chunk_id}` | 차트 청크 zip 다운로드 |
+| GET | `/api/pre/assethash` | 사전 청크별 SHA-256 목록 |
+| GET | `/api/pre/asset/{chunk_id}` | 사전 청크 zip 다운로드 |
 | GET | `/api/pre/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |
 | GET | `/api/pre/manifest/{chunk_id}` | 곡 매니페스트 (JSON) |
 | GET | `/api/pre/song/{song_id}/file?path=` | 곡의 사전 파일 하나 |
@@ -18,7 +22,7 @@ API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manife
 
 ## 파일 다운로드 공통 헤더
 
-`/api/pre/chart/...`, `/api/play/song/...` 응답은 모두 아래를 지원합니다.
+`/api/pre/chart/...`, `/api/pre/asset/...`, `/api/play/song/...` 응답은 모두 아래를 지원합니다.
 
 - `X-Content-SHA256`, `ETag: "<sha256>"`: 파일 전체의 SHA-256 (부분 응답에도 전체 기준 값)
 - `Range: bytes=a-b` / `bytes=a-` / `bytes=-n` (단일 범위): `206 Partial Content` + `Content-Range`. 범위 밖이면 `416` + `Content-Range: bytes */<크기>`. 여러 범위는 무시하고 `200`으로 전체를 보냅니다.
@@ -28,7 +32,7 @@ API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manife
 ## `GET /api/version`
 
 ```json
-{"api": 2, "server": "0.1.0", "auth": ["google", "discord"]}
+{"api": 3, "server": "0.1.0", "auth": ["google", "discord"]}
 ```
 
 `api`는 호환되지 않는 변경이 있을 때 올라갑니다. `server`는 알 수 없으면 `null`입니다. 로그인 없이 쓸 수 있는 유일한 API라, 클라이언트는 서버를 추가할 때 이것으로 호환 여부를 확인합니다.
@@ -55,6 +59,21 @@ zip 안 항목 이름은 `{차트 sha256}{확장자 소문자}` (예: `3f1c...e9
 - 오류
   - `404` `File not found`: 없는 청크 번호
   - `422`: `chunk_id`가 정수가 아님
+
+## `GET /api/pre/assethash`
+
+사전 청크 번호와 SHA-256 맵. 형식은 `/api/pre/charthash`와 같습니다.
+
+## `GET /api/pre/asset/{chunk_id}`
+
+곡들의 사전 파일(`kind`가 `pre`인 파일 중 차트를 뺀 것: 배너·스테이지파일·프리뷰 등)을 묶은 청크 zip(무압축)을 내려줍니다. 청크 `n`에는 `song_id`가 `n*32` 이상 `(n+1)*32` 미만인 곡이 들어가고, 그 구간에 곡이 추가되면 해당 청크만 다시 만들어집니다. 사전 파일이 없는 구간도 빈 zip이 있습니다.
+
+zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`)이고, 내용·크기·crc32는 매니페스트 `files`의 항목과 같습니다.
+
+- 응답 `200`/`206` (`application/zip`): `pre_chunk_{chunk_id:05d}.zip`
+- 오류: `404` `File not found`, `422` `chunk_id`가 정수가 아님
+
+이전 버전에서 등록한 곡의 사전 청크는 서버를 시작한 뒤 뒤에서 만듭니다. 아직 없는 곡은 `/api/pre/song/{song_id}/file`로 받으면 됩니다.
 
 ## `GET /api/pre/manifest/hash`
 
