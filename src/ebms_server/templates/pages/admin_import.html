@@ -15,42 +15,166 @@
 <p class="text-muted small">
     차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 등록합니다. zip 하나에 곡 여러 개가 있어도 되고,
     zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다. 같은 차트가 이미 있으면 기존 곡에 연결됩니다.
+    큰 파일도 조각으로 나눠 올리고, 등록은 서버에서 이어서 진행되므로 다 올린 뒤에는 페이지를 닫아도 됩니다.
 </p>
 <form id="upload" class="mb-5">
     <div class="mb-3">
         <label class="form-label" for="files">zip 파일(여러 개 선택 가능)</label>
         <input class="form-control" type="file" id="files" name="files" accept=".zip,application/zip" multiple required>
     </div>
-    <div class="progress mb-3 d-none" role="progressbar" aria-label="업로드 진행률">
-        <div class="progress-bar" style="width: 0%"></div>
+    <div class="mb-3 d-none" id="upload-state">
+        <div class="small mb-1" id="upload-label"></div>
+        <div class="progress" role="progressbar" aria-label="업로드 진행률">
+            <div class="progress-bar" style="width: 0%"></div>
+        </div>
     </div>
     <button class="btn btn-primary" type="submit">업로드하고 등록</button>
+    <button class="btn btn-outline-secondary d-none" type="button" id="cancel">업로드 취소</button>
 </form>
 
 <h2 class="h5">var/tmp 가져오기</h2>
 <p class="text-muted small">서버의 <code>var/tmp/</code> 아래 곡을 지금 등록합니다(서버 시작 시와 같음). 등록한 곡 폴더는 지웁니다.</p>
 <button class="btn btn-outline-primary mb-5" type="button" id="scan">var/tmp 가져오기</button>
 
-<div id="result" class="d-none">
-    <h2 class="h5">결과</h2>
-    <p id="summary" class="small"></p>
-    <div id="rows"></div>
-</div>
+<h2 class="h5">등록 작업</h2>
+<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다.</p>
+<div id="jobs"><p class="text-muted small">작업이 없습니다.</p></div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+const MB = 1024 * 1024;
+const MIN_CHUNK = MB / 4;
+let chunkSize = 32 * MB;  // 프록시가 413을 주면 줄입니다.
+let cancelled = false;
+let currentUpload = null;
+
 const form = document.getElementById("upload");
 const scan = document.getElementById("scan");
-const progress = form.querySelector(".progress");
-const bar = progress.querySelector(".progress-bar");
+const cancel = document.getElementById("cancel");
+const state = document.getElementById("upload-state");
+const label = document.getElementById("upload-label");
+const bar = state.querySelector(".progress-bar");
 
-function busy(on, label) {
-    form.querySelectorAll("input, button").forEach((el) => (el.disabled = on));
-    scan.disabled = on;
-    const submit = form.querySelector("button[type=submit]");
-    submit.textContent = on && label ? label : "업로드하고 등록";
+function gb(n) { return (n / 1024 ** 3).toFixed(2) + "GB"; }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function detail(res) {
+    const text = await res.text().catch(() => "");
+    try { return JSON.parse(text).detail || text; } catch { return text || `HTTP ${res.status}`; }
 }
+
+async function postJson(url, body) {
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(await detail(res));
+    return res.json();
+}
+
+function progress(file, sent, index, count) {
+    const pct = file.size ? Math.floor((sent / file.size) * 100) : 100;
+    bar.style.width = `${pct}%`;
+    bar.textContent = `${pct}%`;
+    label.textContent = `${index + 1}/${count} ${file.name}: ${gb(sent)} / ${gb(file.size)}`;
+}
+
+async function uploadFile(file, index, count) {
+    const upload = await postJson("/api/admin/import/uploads", { filename: file.name, size: file.size });
+    currentUpload = upload.id;
+    let offset = 0;
+    let failures = 0;
+    while (offset < file.size) {
+        if (cancelled) throw new Error("취소했습니다.");
+        const end = Math.min(offset + chunkSize, file.size);
+        let res;
+        try {
+            res = await fetch(`/api/admin/import/uploads/${upload.id}?offset=${offset}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/octet-stream" },
+                body: file.slice(offset, end),
+            });
+        } catch (e) {
+            // 연결이 끊기면 잠시 뒤 받은 곳부터 다시 보냅니다. 큰 요청을 프록시가 끊는 경우도 있어 조각을 줄입니다.
+            chunkSize = Math.max(MIN_CHUNK, chunkSize / 2);
+            if (++failures > 8) throw new Error("연결이 계속 끊깁니다. 다시 시도하세요.");
+            await sleep(1000 * Math.min(30, 2 ** failures));
+            continue;
+        }
+        if (res.status === 413 && chunkSize > MIN_CHUNK) {
+            chunkSize = Math.max(MIN_CHUNK, chunkSize / 2);
+            continue;
+        }
+        if (res.status === 409) {
+            // 서버가 받은 크기에 맞춰 이어서 보냅니다.
+            const m = /offset must be (\d+)/.exec(await detail(res));
+            if (!m) throw new Error("업로드 위치가 맞지 않습니다.");
+            offset = Number(m[1]);
+            continue;
+        }
+        if (!res.ok) {
+            if (res.status >= 500 && ++failures <= 8) {
+                await sleep(1000 * Math.min(30, 2 ** failures));
+                continue;
+            }
+            throw new Error(res.status === 413 ? "프록시가 업로드를 막습니다. 요청 크기 제한을 1MB 이상으로 올리세요." : await detail(res));
+        }
+        failures = 0;
+        offset = (await res.json()).received;
+        progress(file, offset, index, count);
+    }
+    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish`);
+    currentUpload = null;
+    return job;
+}
+
+function busy(on) {
+    form.querySelectorAll("input, button[type=submit]").forEach((el) => (el.disabled = on));
+    scan.disabled = on;
+    cancel.classList.toggle("d-none", !on);
+    state.classList.toggle("d-none", !on);
+}
+
+form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const files = [...document.getElementById("files").files];
+    if (!files.length) return;
+    cancelled = false;
+    busy(true);
+    const errors = [];
+    for (const [i, file] of files.entries()) {
+        progress(file, 0, i, files.length);
+        try {
+            await uploadFile(file, i, files.length);
+            refreshJobs();
+        } catch (err) {
+            errors.push(`${file.name}: ${err.message}`);
+            if (currentUpload) fetch(`/api/admin/import/uploads/${currentUpload}`, { method: "DELETE" });
+            currentUpload = null;
+            if (cancelled) break;
+        }
+    }
+    busy(false);
+    form.reset();
+    refreshJobs();
+    if (errors.length) alert("업로드하지 못한 파일이 있습니다.\n" + errors.join("\n"));
+});
+
+cancel.addEventListener("click", () => { cancelled = true; });
+
+scan.addEventListener("click", async () => {
+    scan.disabled = true;
+    try {
+        await postJson("/api/admin/import/tmp");
+    } catch (err) {
+        alert(err.message);
+    } finally {
+        scan.disabled = false;
+        refreshJobs();
+    }
+});
 
 function songLine(song) {
     const li = document.createElement("li");
@@ -70,97 +194,86 @@ function songLine(song) {
     return li;
 }
 
-function show(groups) {
-    const rows = document.getElementById("rows");
-    rows.replaceChildren();
-    let ok = 0, fail = 0;
-    for (const group of groups) {
-        const card = document.createElement("div");
-        card.className = "card mb-2";
-        const body = document.createElement("div");
-        body.className = "card-body py-2";
-        if (group.file !== undefined) {
-            const title = document.createElement("strong");
-            title.textContent = group.file;
-            body.append(title);
-        }
-        if (group.error) {
-            const err = document.createElement("div");
-            err.className = "text-danger small";
-            err.textContent = group.error;
-            body.append(err);
-            fail++;
-        }
-        const list = document.createElement("ul");
-        list.className = "small mb-0";
-        for (const song of group.songs) {
-            list.append(songLine(song));
-            song.error ? fail++ : ok++;
-        }
-        if (group.songs.length) body.append(list);
-        card.append(body);
-        rows.append(card);
+function songList(songs, summary, open) {
+    const details = document.createElement("details");
+    details.open = open;
+    const s = document.createElement("summary");
+    s.className = "small";
+    s.textContent = summary;
+    const ul = document.createElement("ul");
+    ul.className = "small mb-0";
+    songs.forEach((song) => ul.append(songLine(song)));
+    details.append(s, ul);
+    return details;
+}
+
+function jobCard(job) {
+    const card = document.createElement("div");
+    card.className = "card mb-2";
+    const body = document.createElement("div");
+    body.className = "card-body py-2";
+    const title = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = job.kind === "tmp" ? "var/tmp" : job.name;
+    const badge = document.createElement("span");
+    badge.className = "badge ms-2 " + ({ running: "text-bg-primary", done: "text-bg-success", failed: "text-bg-danger" })[job.status];
+    badge.textContent = ({ running: "등록 중", done: "완료", failed: "실패" })[job.status];
+    title.append(name, badge);
+    body.append(title);
+
+    const failed = job.songs.filter((s) => s.error);
+    const ok = job.songs.length - failed.length;
+    const line = document.createElement("div");
+    line.className = "small";
+    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 실패 ${failed.length}`;
+    body.append(line);
+    if (job.status === "running" && job.total) {
+        const p = document.createElement("div");
+        p.className = "progress my-1";
+        p.style.height = "6px";
+        const b = document.createElement("div");
+        b.className = "progress-bar";
+        b.style.width = `${Math.floor((job.done / job.total) * 100)}%`;
+        p.append(b);
+        body.append(p);
     }
-    document.getElementById("summary").textContent = `성공 ${ok}곡 · 실패 ${fail}건`;
-    document.getElementById("result").classList.remove("d-none");
+    if (job.error) {
+        const err = document.createElement("div");
+        err.className = "text-danger small";
+        err.textContent = job.error;
+        body.append(err);
+    }
+    if (failed.length) body.append(songList(failed, `실패 ${failed.length}곡`, true));
+    if (ok) body.append(songList(job.songs.filter((s) => !s.error), `성공 ${ok}곡`, false));
+    card.append(body);
+    return card;
 }
 
-async function failMessage(status, text) {
-    try { return JSON.parse(text).detail || `실패했습니다 (${status})`; }
-    catch { return `실패했습니다 (${status})`; }
-}
-
-form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const data = new FormData(form);
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/admin/import");
-    xhr.upload.addEventListener("progress", (ev) => {
-        if (!ev.lengthComputable) return;
-        const pct = Math.round((ev.loaded / ev.total) * 100);
-        bar.style.width = `${pct}%`;
-        bar.textContent = `${pct}%`;
-        if (pct >= 100) busy(true, "등록 중…");
-    });
-    xhr.addEventListener("load", async () => {
-        busy(false);
-        progress.classList.add("d-none");
-        if (xhr.status !== 200) {
-            alert(await failMessage(xhr.status, xhr.responseText));
-            return;
-        }
-        form.reset();
-        show(JSON.parse(xhr.responseText));
-    });
-    xhr.addEventListener("error", () => {
-        busy(false);
-        progress.classList.add("d-none");
-        alert("업로드하지 못했습니다. 연결을 확인하세요.");
-    });
-    bar.style.width = "0%";
-    bar.textContent = "";
-    progress.classList.remove("d-none");
-    xhr.send(data);
-    busy(true, "업로드 중…");
-});
-
-scan.addEventListener("click", async () => {
-    busy(true);
-    scan.textContent = "가져오는 중…";
+let timer = null;
+async function refreshJobs() {
+    clearTimeout(timer);
+    let jobs;
     try {
-        const res = await fetch("/api/admin/import/tmp", { method: "POST" });
-        const text = await res.text();
-        if (!res.ok) {
-            alert(await failMessage(res.status, text));
-            return;
-        }
-        const songs = JSON.parse(text);
-        show(songs.length ? [{ songs }] : []);
-        if (!songs.length) document.getElementById("summary").textContent = "가져올 곡이 없습니다.";
-    } finally {
-        busy(false);
-        scan.textContent = "var/tmp 가져오기";
+        const res = await fetch("/api/admin/import/jobs");
+        if (!res.ok) return;
+        jobs = await res.json();
+    } catch {
+        timer = setTimeout(refreshJobs, 5000);
+        return;
     }
-});
+    const box = document.getElementById("jobs");
+    // 펼쳐 둔 목록은 새로 그려도 유지합니다.
+    const opened = new Set([...box.querySelectorAll("details[open]")].map((d) => d.dataset.key));
+    box.replaceChildren(...jobs.map(jobCard));
+    box.querySelectorAll(".card").forEach((card, i) => {
+        card.querySelectorAll("details").forEach((d, j) => {
+            d.dataset.key = `${jobs[i].id}:${j}`;
+            if (opened.has(d.dataset.key)) d.open = true;
+        });
+    });
+    if (!jobs.length) box.innerHTML = '<p class="text-muted small">작업이 없습니다.</p>';
+    if (jobs.some((j) => j.status === "running")) timer = setTimeout(refreshJobs, 2000);
+}
+refreshJobs();
 </script>
 {% endblock %}
