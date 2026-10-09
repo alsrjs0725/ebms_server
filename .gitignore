@@ -16,4 +16,6 @@ var/log/*
 var/tmp/*
 !var/tmp/.gitkeep
 
+var/import/
+
 var/ebms.db

@@ -13,6 +13,8 @@ DB_USER = os.environ.get("EBMS_DB_USER", "ebms")
 DB_PASSWORD = os.environ.get("EBMS_DB_PASSWORD", "")
 DB_NAME = os.environ.get("EBMS_DB_NAME", "ebms")
 TMP_DIR = BASE_DIR / "var" / "tmp"
+# 관리자 페이지에서 올린 zip을 풀어두는 임시 폴더. 등록이 끝나면 지웁니다.
+IMPORT_DIR = BASE_DIR / "var" / "import"
 LOG_DIR = BASE_DIR / "var" / "log"
 BYTE_PER_CHUNK = 64 * 1024 * 1024
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
