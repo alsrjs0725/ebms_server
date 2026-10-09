@@ -1,0 +1,148 @@
+{% extends "auth_base.html" %}
+
+{% block title %}공지 - EBMS{% endblock %}
+
+{% macro notice_fields(n, prefix) %}
+<div class="row g-2">
+    <div class="col-12">
+        <label class="form-label small" for="{{ prefix }}-title">제목</label>
+        <input class="form-control" type="text" id="{{ prefix }}-title" name="title" maxlength="255" value="{{ n.title if n else '' }}" required>
+    </div>
+    <div class="col-12">
+        <label class="form-label small" for="{{ prefix }}-body">내용</label>
+        <textarea class="form-control" id="{{ prefix }}-body" name="body" rows="4" maxlength="20000">{{ n.body if n else '' }}</textarea>
+    </div>
+    <div class="col-6 col-md-3">
+        <label class="form-label small" for="{{ prefix }}-level">종류</label>
+        <select class="form-select" id="{{ prefix }}-level" name="level">
+            <option value="info"{% if n and n.level == "info" %} selected{% endif %}>안내</option>
+            <option value="warning"{% if n and n.level == "warning" %} selected{% endif %}>중요</option>
+        </select>
+    </div>
+    <div class="col-6 col-md-4">
+        <label class="form-label small" for="{{ prefix }}-starts_at">시작(비우면 바로)</label>
+        <input class="form-control" type="datetime-local" id="{{ prefix }}-starts_at" name="starts_at" data-unix="{{ n.starts_at if n and n.starts_at is not none else '' }}">
+    </div>
+    <div class="col-6 col-md-4">
+        <label class="form-label small" for="{{ prefix }}-ends_at">종료(비우면 계속)</label>
+        <input class="form-control" type="datetime-local" id="{{ prefix }}-ends_at" name="ends_at" data-unix="{{ n.ends_at if n and n.ends_at is not none else '' }}">
+    </div>
+    <div class="col-6 col-md-1 d-flex align-items-end">
+        <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="{{ prefix }}-published" name="published"{% if not n or n.published %} checked{% endif %}>
+            <label class="form-check-label small" for="{{ prefix }}-published">게시</label>
+        </div>
+    </div>
+</div>
+{% endmacro %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">공지</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">공지</h1>
+<p class="text-muted small">
+    게시 중이고 시작·종료 시각 안에 있는 공지를 클라이언트가 켜질 때 띄웁니다. 사용자가 확인한 공지는 다시 띄우지 않으며,
+    공지를 고치면 다시 띄웁니다. 시각은 이 브라우저의 시간대 기준입니다.
+</p>
+
+<h2 class="h5">새 공지</h2>
+<form id="create" class="card mb-5">
+    <div class="card-body">
+        {{ notice_fields(none, "new") }}
+        <button class="btn btn-primary mt-3" type="submit">등록</button>
+    </div>
+</form>
+
+<h2 class="h5">공지 목록</h2>
+{% for n in notices %}
+{% set live = n.published and (n.starts_at is none or n.starts_at <= now) and (n.ends_at is none or n.ends_at > now) %}
+<form class="card mb-3 notice" data-id="{{ n.id }}">
+    <div class="card-body">
+        <p class="small mb-2">
+            {% if live %}<span class="badge text-bg-success">표시 중</span>
+            {% elif not n.published %}<span class="badge text-bg-secondary">게시 안 함</span>
+            {% elif n.ends_at is not none and n.ends_at <= now %}<span class="badge text-bg-secondary">종료</span>
+            {% else %}<span class="badge text-bg-info">예약</span>{% endif %}
+            <span class="text-muted">#{{ n.id }} · 수정 <span data-time="{{ n.updated_at }}"></span></span>
+        </p>
+        {{ notice_fields(n, "n" ~ n.id) }}
+        <div class="mt-3 d-flex gap-2">
+            <button class="btn btn-sm btn-primary" type="submit">저장</button>
+            <button class="btn btn-sm btn-outline-danger" type="button" data-delete>삭제</button>
+        </div>
+    </div>
+</form>
+{% else %}
+<p class="text-muted">공지가 없습니다.</p>
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function pad(n) { return String(n).padStart(2, "0"); }
+
+// unix 초 <-> datetime-local 값(브라우저 시간대)
+function toLocal(unix) {
+    const d = new Date(unix * 1000);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+document.querySelectorAll("input[data-unix]").forEach((input) => {
+    if (input.dataset.unix) input.value = toLocal(Number(input.dataset.unix));
+});
+document.querySelectorAll("[data-time]").forEach((el) => {
+    el.textContent = new Date(Number(el.dataset.time) * 1000).toLocaleString();
+});
+
+function values(form) {
+    const unix = (name) => {
+        const v = form.querySelector(`[name=${name}]`).value;
+        return v ? Math.floor(new Date(v).getTime() / 1000) : null;
+    };
+    return {
+        title: form.querySelector("[name=title]").value,
+        body: form.querySelector("[name=body]").value,
+        level: form.querySelector("[name=level]").value,
+        published: form.querySelector("[name=published]").checked,
+        starts_at: unix("starts_at"),
+        ends_at: unix("ends_at"),
+    };
+}
+
+async function send(method, url, body) {
+    const res = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("\n") : data.detail;
+        alert(detail || `실패했습니다 (${res.status})`);
+        return false;
+    }
+    return true;
+}
+
+document.getElementById("create").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (await send("POST", "/api/admin/notices", values(e.target))) location.reload();
+});
+
+document.querySelectorAll("form.notice").forEach((form) => {
+    const url = `/api/admin/notices/${form.dataset.id}`;
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        if (await send("PUT", url, values(form))) location.reload();
+    });
+    form.querySelector("[data-delete]").addEventListener("click", async () => {
+        if (!confirm("이 공지를 삭제할까요?")) return;
+        if (await send("DELETE", url)) location.reload();
+    });
+});
+</script>
+{% endblock %}

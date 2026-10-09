@@ -288,9 +288,9 @@ def test_signed_cookie():
 
 
 def test_api_requires_login(client):
-    # /api/version 과 세션키를 받는 /api/auth/client/token 외의 API는 모두 로그인 필요
+    # /api/version, 공지(/api/notices), 세션키를 받는 /api/auth/client/token 외의 API는 모두 로그인 필요
     from ebms_server.main import app
-    public = {"/api/version", "/api/auth/client/token"}
+    public = {"/api/version", "/api/notices", "/api/auth/client/token"}
     checked = 0
     for path, methods in app.openapi()["paths"].items():
         if not path.startswith("/api/") or path in public:
