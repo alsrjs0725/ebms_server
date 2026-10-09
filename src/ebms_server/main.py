@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from .db import Database
 from . import admin, auth, constant, downloads
 from .templating import templates
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from typing import Annotated
 
 
 def configure_logging() -> None:
@@ -68,10 +69,11 @@ app.include_router(admin.router)
 app.middleware("http")(auth.refresh_session_cookie)
 
 @app.get("/", response_class=HTMLResponse)
-def read_root(request: Request):
+def read_root(request: Request, session: Annotated[tuple | None, Depends(auth.optional_session)]):
     return templates.TemplateResponse(
         request=request,
         name="pages/root.html",
+        context={"user": session[0] if session else None},
     )
 
 @app.get("/api/version")

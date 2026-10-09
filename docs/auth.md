@@ -27,11 +27,12 @@
 
 | 메서드 | 경로 | 설명 |
 | --- | --- | --- |
+| GET | `/` | 홈. 로그인 상태에 따라 로그인/가입 또는 설정·관리자 홈 링크 |
 | GET | `/login?next=<경로>` | 로그인 수단 선택. 로그인 후 `next`(같은 사이트 경로만, 기본 `/account`)로 이동 |
 | GET | `/auth/{oauth}/start` | OAuth 로그인 화면으로 이동. `?link=1`이면 로그인한 계정에 연결 |
 | GET | `/auth/{oauth}/callback` | OAuth가 돌아오는 주소. 계정을 찾거나 만들고 웹 세션 쿠키(`ebms_session`, 30일, 쓸 때마다 연장)를 발급 |
 | POST | `/auth/logout` | 현재 웹 세션 종료 |
-| GET | `/account` | 내 계정: 연결된 로그인 수단(연결·해제), 로그인된 기기(로그아웃) |
+| GET | `/account` | 설정(내 계정): 연결된 로그인 수단(연결·해제), 로그인된 기기(로그아웃) |
 | DELETE | `/api/account/identities/{id}` | 로그인 수단 연결 해제. 마지막 1개면 `409` |
 | DELETE | `/api/account/sessions/{id}` | 해당 기기 로그아웃. 없으면 `404` |
 
