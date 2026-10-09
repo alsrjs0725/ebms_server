@@ -17,6 +17,9 @@ TMP_DIR = BASE_DIR / "var" / "tmp"
 IMPORT_DIR = BASE_DIR / "var" / "import"
 LOG_DIR = BASE_DIR / "var" / "log"
 BYTE_PER_CHUNK = 64 * 1024 * 1024
+# 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
+IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
+IMPORT_BATCH_SONGS = 500
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 SONGS_PER_MANIFEST_CHUNK = 1000

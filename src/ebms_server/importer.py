@@ -62,16 +62,18 @@ class Job:
         }
 
 
-def _insert(song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
-    """곡 하나를 등록하고 결과를 반환합니다. 실패해도 예외를 내지 않습니다."""
+def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
+    """곡 하나를 배치에 넣고 결과를 반환합니다. 실패해도 예외를 내지 않습니다.
+    반환한 결과는 나중에 배치 커밋이 실패하면 "error"가 채워집니다."""
     try:
-        info = Database().insert_song(song_dir, remove=remove)
+        info = batch.add(song_dir, remove=remove)
     except Exception as e:
         logger.exception(f"import failed[{song_dir}]")
         return {"folder": folder, "error": str(e) or type(e).__name__}
     if info is None:
         return {"folder": folder, "error": "등록하지 못했습니다(곡 크기가 DB 패킷 한도를 넘었을 수 있습니다). 서버 로그를 보세요."}
-    return {"folder": folder, **info}
+    info["folder"] = folder
+    return info
 
 
 def import_tree(root: pathlib.Path, remove: bool, job: Job | None = None) -> list[dict]:
@@ -85,8 +87,9 @@ def import_tree(root: pathlib.Path, remove: bool, job: Job | None = None) -> lis
         if child.is_dir():
             song_dirs.extend(find_song_dirs(child))
     job.total = len(song_dirs)
-    for song_dir in song_dirs:
-        job.songs.append(_insert(song_dir, song_dir.relative_to(root).as_posix(), remove))
+    with Database().batch() as batch:
+        for song_dir in song_dirs:
+            job.songs.append(_insert(batch, song_dir, song_dir.relative_to(root).as_posix(), remove))
     return job.songs
 
 
@@ -162,13 +165,13 @@ def _song_groups(zf: zipfile.ZipFile) -> dict[tuple[str, ...], list[tuple[zipfil
 
 
 def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> list[dict]:
-    """zip 하나에서 곡을 하나씩 풀어 등록합니다(디스크에는 zip과 곡 하나만 더 필요).
+    """zip 하나에서 곡을 하나씩 풀어 등록합니다(디스크에는 zip과 곡 하나만 더 필요). 청크는 배치마다 갱신합니다.
     zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다. zip이 아니면 zipfile.BadZipFile."""
     job = job or Job("zip", filename)
     stem = pathlib.PurePath(filename.replace("\\", "/")).stem
     if stem in ("", ".", ".."):
         stem = "song"
-    with zipfile.ZipFile(path) as zf:
+    with zipfile.ZipFile(path) as zf, Database().batch() as batch:
         groups = _song_groups(zf)
         job.total = (job.total or 0) + len(groups)
         for root, members in groups.items():
@@ -181,7 +184,8 @@ def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> lis
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info) as fin, open(target, "wb") as fout:
                         shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
-                job.songs.append(_insert(song_dir, "/".join((stem, *root)), remove=False))
+                # 곡 데이터는 배치 트랜잭션과 메모리에 들어가므로 풀어둔 폴더는 바로 지워도 됩니다.
+                job.songs.append(_insert(batch, song_dir, "/".join((stem, *root)), remove=False))
             except Exception as e:
                 logger.exception(f"import failed[{filename}:{'/'.join(root)}]")
                 job.songs.append({"folder": "/".join((stem, *root)), "error": str(e) or type(e).__name__})
