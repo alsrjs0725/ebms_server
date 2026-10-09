@@ -156,6 +156,22 @@ def test_import_tmp(client, monkeypatch):
     assert wait(client, client.post("/api/admin/import/tmp").json())["songs"] == []
 
 
+def test_import_tmp_zip(client, monkeypatch):
+    """내부망으로 서버에 직접 복사한 zip도 var/tmp에서 등록합니다."""
+    admin_login(client, monkeypatch)
+    (constant.TMP_DIR / "pack.zip").write_bytes(make_zip({"p/s1/a.bms": b"#TITLE 1\n", "p/s2/b.bms": b"#TITLE 2\n"}))
+    (constant.TMP_DIR / "copying.zip").write_bytes(b"PK\x03\x04partial")  # 아직 복사 중인 zip
+
+    job = wait(client, client.post("/api/admin/import/tmp").json())
+    assert job["status"] == "done" and job["total"] == 2
+    assert [s["folder"] for s in job["songs"]] == ["copying.zip", "pack/p/s1", "pack/p/s2"]
+    assert job["songs"][0]["error"]
+    assert job["songs"][1]["new_song"] and job["songs"][2]["new_song"]
+    # 다 등록한 zip은 지우고, 읽지 못한 zip은 남깁니다.
+    assert not (constant.TMP_DIR / "pack.zip").exists()
+    assert (constant.TMP_DIR / "copying.zip").exists()
+
+
 def test_safe_parts():
     assert importer._safe_parts("a/b.bms") == ["a", "b.bms"]
     assert importer._safe_parts("a\\.\\b.bms") == ["a", "b.bms"]
