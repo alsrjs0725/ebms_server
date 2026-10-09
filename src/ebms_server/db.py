@@ -10,6 +10,7 @@ import shutil
 import struct
 import zipfile
 import threading
+import zlib
 from collections import defaultdict
 from collections.abc import Iterator
 
@@ -71,6 +72,26 @@ SCHEMA = [
             data LONGBLOB NOT NULL,
 
             PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 사전 청크. song id 구간(SONGS_PER_PRE_CHUNK)마다 곡들의 사전 파일(차트 제외)을 무압축 zip으로 묶습니다.
+    # 항목 이름은 "{song_id}/{곡 zip 안 경로}"이고, 데이터는 pre_chunk_part에 BLOB_READ_SIZE씩 나눠 둡니다.
+    """
+        CREATE TABLE IF NOT EXISTS pre_chunk(
+            id INT UNSIGNED NOT NULL,
+            size BIGINT UNSIGNED NOT NULL,
+            sha256 CHAR(64) NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    """
+        CREATE TABLE IF NOT EXISTS pre_chunk_part(
+            chunk_id INT UNSIGNED NOT NULL,
+            seq INT UNSIGNED NOT NULL,
+            data LONGBLOB NOT NULL,
+
+            PRIMARY KEY (chunk_id, seq)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 계정. OAuth와 무관하게 내부 UUID로만 구분합니다. 시각은 모두 unix 초(UTC)입니다.
@@ -303,6 +324,19 @@ def zip_entries(data: bytes) -> list[dict]:
         return entries
 
 
+def pre_arcname(song_id: int, path: str) -> str:
+    """사전 청크 안의 항목 이름."""
+    return f"{song_id}/{path}"
+
+
+def is_pre_chunk_entry(entry: dict) -> bool:
+    """사전 청크에 넣을 항목인지. 차트는 차트 청크로 받으므로 뺍니다."""
+    return (
+        entry.get("kind") == "pre"
+        and pathlib.PurePosixPath(entry["path"]).suffix.lower() not in constant.BMS_FORMAT
+    )
+
+
 def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
     """chart chunk 안의 항목 이름. 곡마다 같은 파일명이 있을 수 있어 sha256을 이름으로 씁니다."""
     return f"{sha256}{path.suffix.lower()}"
@@ -375,6 +409,17 @@ class BlobReader:
                         row = cur.fetchone()
                     if row is not None:
                         yield row[0]
+        elif self.table == "pre_chunk":
+            for seq in range(start // step, end // step + 1):
+                with connect() as con, con.cursor() as cur:
+                    cur.execute(
+                        "SELECT data FROM pre_chunk_part WHERE chunk_id = %s AND seq = %s",
+                        (self.row_id, seq),
+                    )
+                    row = cur.fetchone()
+                if row is not None:
+                    chunk_start = seq * step
+                    yield row[0][max(0, start - chunk_start) : end + 1 - chunk_start]
         elif self.table == "chart_chunk":
             for pos in range(start + 1, end + 2, step):
                 with connect() as con, con.cursor() as cur:
@@ -577,6 +622,112 @@ class Database:
             (chunk_no, hashlib.sha256(body).hexdigest(), data),
         )
 
+    def _read_song_range(self, cur, song_id: int, start: int, length: int) -> bytes:
+        """곡 zip의 start부터 length 바이트. 같은 트랜잭션에서 넣은 곡도 읽도록 cur를 씁니다."""
+        if length <= 0:
+            return b""
+        step = constant.BLOB_READ_SIZE
+        start_seq, end_seq = start // step, (start + length - 1) // step
+        cur.execute(
+            "SELECT data FROM song_part WHERE song_id = %s AND seq >= %s AND seq <= %s ORDER BY seq",
+            (song_id, start_seq, end_seq),
+        )
+        rows = cur.fetchall()
+        if rows:
+            buf = b"".join(r[0] for r in rows)
+            offset = start - start_seq * step
+            return buf[offset : offset + length]
+        cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, song_id))
+        row = cur.fetchone()
+        return row[0] if row and row[0] else b""
+
+    def _read_song_member(self, cur, song_id: int, entry: dict) -> bytes:
+        """곡 zip에서 항목 하나를 압축을 풀어 읽습니다. 곡 전체를 읽지 않습니다."""
+        if "data_offset" in entry:
+            start = entry["data_offset"]
+        else:
+            head = self._read_song_range(cur, song_id, entry["offset"], 30)
+            if len(head) != 30 or head[:4] != b"PK\x03\x04":
+                raise ValueError(f"song {song_id}: bad local file header for {entry['path']}")
+            name_len, extra_len = struct.unpack("<HH", head[26:30])
+            start = entry["offset"] + 30 + name_len + extra_len
+        raw = self._read_song_range(cur, song_id, start, entry["comp_size"])
+        if entry["method"] == zipfile.ZIP_STORED:
+            data = raw
+        elif entry["method"] == zipfile.ZIP_DEFLATED:
+            data = zlib.decompress(raw, -15)
+        else:
+            raise ValueError(f"song {song_id}: unsupported compression {entry['method']} for {entry['path']}")
+        if len(data) != entry["size"] or f"{zlib.crc32(data):08x}" != entry["crc32"]:
+            raise ValueError(f"song {song_id}: {entry['path']} does not match its manifest entry")
+        return data
+
+    def _rebuild_pre_chunk(self, cur, chunk_no: int) -> None:
+        """chunk_no에 속한 곡들의 사전 파일을 다시 묶어 저장합니다. 곡이 사전 파일이 없어도 빈 zip을 둡니다."""
+        lo = chunk_no * constant.SONGS_PER_PRE_CHUNK
+        hi = lo + constant.SONGS_PER_PRE_CHUNK
+        cur.execute("SELECT id, files FROM song WHERE id >= %s AND id < %s ORDER BY id", (lo, hi))
+        songs = cur.fetchall()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
+            for song_id, files in songs:
+                entries = sorted(
+                    (e for e in (json.loads(files) if files else []) if is_pre_chunk_entry(e)),
+                    key=lambda e: e["path"],
+                )
+                for entry in entries:
+                    try:
+                        data = self._read_song_member(cur, song_id, entry)
+                    except (ValueError, zlib.error) as e:
+                        # 깨진 항목은 빼고, 클라이언트는 파일별 사전 API로 받다가 오류를 봅니다.
+                        self.logger.warning(f"pre chunk {chunk_no}: skipped broken entry: {e}")
+                        continue
+                    # 날짜를 고정해 같은 내용이면 같은 해시가 나오게 합니다.
+                    info = zipfile.ZipInfo(pre_arcname(song_id, entry["path"]), date_time=(1980, 1, 1, 0, 0, 0))
+                    zf.writestr(info, data)
+        data = buf.getvalue()
+
+        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
+        step = constant.BLOB_READ_SIZE
+        for seq, pos in enumerate(range(0, len(data), step)):
+            cur.execute(
+                "INSERT INTO pre_chunk_part (chunk_id, seq, data) VALUES (%s, %s, %s)",
+                (chunk_no, seq, data[pos : pos + step]),
+            )
+        cur.execute(
+            """
+            INSERT INTO pre_chunk (id, size, sha256) VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256)
+            """,
+            (chunk_no, len(data), hashlib.sha256(data).hexdigest()),
+        )
+
+    def backfill_pre_chunks(self) -> int:
+        """곡은 있는데 사전 청크가 없는 구간(이전 버전에서 넣은 곡)의 사전 청크를 만듭니다. 만든 청크 수를 반환합니다.
+        청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 남은 청크부터 이어서 만듭니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM song")
+            wanted = {row[0] // constant.SONGS_PER_PRE_CHUNK for row in cur.fetchall()}
+            cur.execute("SELECT id FROM pre_chunk")
+            missing = sorted(wanted - {row[0] for row in cur.fetchall()})
+        if missing:
+            self.logger.info(f"backfill_pre_chunks: Building {len(missing)} pre chunks.")
+        for i, chunk_no in enumerate(missing, 1):
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT id FROM pre_chunk WHERE id = %s", (chunk_no,))
+                    if cur.fetchone() is None:
+                        self._rebuild_pre_chunk(cur, chunk_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            if i % 100 == 0:
+                self.logger.info(f"backfill_pre_chunks: {i}/{len(missing)}")
+        if missing:
+            self.logger.info(f"backfill_pre_chunks: Built {len(missing)} pre chunks.")
+        return len(missing)
+
     def get_song_data(self, song_id: int) -> bytes | None:
         """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
         with connect() as con, con.cursor() as cur:
@@ -731,6 +882,8 @@ class Database:
                     self._append_charts_to_chunk(cur, new_charts)
                 if new_song or new_charts:
                     self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                if new_song:
+                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
                 con.commit()
             except Exception:
                 con.rollback()
@@ -921,6 +1074,11 @@ class Database:
             return None
         return json.loads(row[0]) if row[0] else []
 
+    def get_pre_chunk_hash(self) -> dict[int, str]:
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id, sha256 FROM pre_chunk ORDER BY id")
+            return {row[0]: row[1] for row in cur.fetchall()}
+
     def get_manifest_hash(self) -> dict[int, str]:
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT id, sha256 FROM manifest_chunk ORDER BY id")
@@ -934,20 +1092,22 @@ class Database:
             return row[0] if row else None
 
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
-        """song / chart_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
+        """song / chart_chunk / pre_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
 
         전송 중 DB 연결과 트랜잭션을 잡지 않도록 단기 연결을 사용합니다.
 
         Returns:
             BlobReader. 존재하지 않는 id의 경우 None을 반환합니다.
         """
-        if table not in ("song", "chart_chunk"):
+        if table not in ("song", "chart_chunk", "pre_chunk"):
             raise ValueError(table)
         with connect() as con, con.cursor() as cur:
             if table == "song":
                 cur.execute("SELECT size, sha256 FROM song WHERE id = %s", (row_id,))
             elif table == "chart_chunk":
                 cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
+            elif table == "pre_chunk":
+                cur.execute("SELECT size, sha256 FROM pre_chunk WHERE id = %s", (row_id,))
             row = cur.fetchone()
         if row is None:
             return None

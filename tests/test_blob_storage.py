@@ -327,3 +327,71 @@ def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):
     # iter_range 조각을 가져온 후에도 open_blob이 생성했던 연결이 남아있지 않음
     chunks = list(blob.iter_range(0, blob.size - 1))
     assert len(b"".join(chunks)) == blob.size
+
+
+def test_pre_chunk(tmp_path, client, database, monkeypatch):
+    monkeypatch.setattr(constant, "SONGS_PER_PRE_CHUNK", 2)
+    chart = b"#TITLE\n#BANNER banner.png\n#PREVIEW pv.wav\n"
+    song = make_song(tmp_path, "s1", {"a.bms": chart})
+    banner, preview = os.urandom(3000), b"RIFF" * 500
+    (song / "banner.png").write_bytes(banner)
+    (song / "pv.ogg").write_bytes(preview)
+    (song / "preview_x.ogg").write_bytes(b"pv2")
+    database.insert_song(song)
+
+    hashes = client.get("/api/pre/assethash").json()
+    assert list(hashes) == ["0"]
+    res = client.get("/api/pre/asset/0")
+    assert res.status_code == 200
+    assert sha(res.content) == hashes["0"] == res.headers["x-content-sha256"]
+    with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+        # 차트와 플레이 파일(sound.wav, bga)은 빠지고, 확장자가 달라도 #PREVIEW가 가리키는 파일은 들어갑니다.
+        assert sorted(zf.namelist()) == ["1/banner.png", "1/preview_x.ogg", "1/pv.ogg"]
+        assert all(i.compress_type == zipfile.ZIP_STORED for i in zf.infolist())
+        assert zf.read("1/banner.png") == banner
+        assert zf.read("1/pv.ogg") == preview
+
+    # 다음 구간(song 2, 3)은 새 청크이고, 같은 구간에 곡이 추가되면 그 청크만 바뀝니다.
+    database.insert_song(make_song(tmp_path, "s2", {"b.bms": b"#B"}))
+    after = client.get("/api/pre/assethash").json()
+    assert sorted(after) == ["0", "1"] and after["0"] == hashes["0"]
+    with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/asset/1").content)) as zf:
+        assert zf.namelist() == []
+    s3 = make_song(tmp_path, "s3", {"c.bms": b"#C"})
+    (s3 / "preview.ogg").write_bytes(b"p3")
+    database.insert_song(s3)
+    last = client.get("/api/pre/assethash").json()
+    assert last["0"] == hashes["0"] and last["1"] != after["1"]
+    with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/asset/1").content)) as zf:
+        assert zf.namelist() == ["3/preview.ogg"]
+
+    # Range 이어받기
+    part = client.get("/api/pre/asset/0", headers={"Range": "bytes=10-"})
+    assert part.status_code == 206
+    assert part.content == client.get("/api/pre/asset/0").content[10:]
+    assert client.get("/api/pre/asset/9").status_code == 404
+
+
+def test_pre_chunk_backfill(tmp_path, client, database):
+    song = make_song(tmp_path, "s1", {"a.bms": b"#TITLE\n#STAGEFILE st.bmp\n"})
+    (song / "st.bmp").write_bytes(os.urandom(5000))
+    database.insert_song(song)
+    built = client.get("/api/pre/asset/0").content
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM pre_chunk_part")
+        cur.execute("DELETE FROM pre_chunk")
+        con.commit()
+    assert client.get("/api/pre/assethash").json() == {}
+
+    assert database.backfill_pre_chunks() == 1
+    assert client.get("/api/pre/asset/0").content == built
+    assert database.backfill_pre_chunks() == 0
+
+
+def test_pre_chunk_is_metered(tmp_path, client, database):
+    song = make_song(tmp_path, "s1", {"a.bms": b"#TITLE\n"})
+    (song / "preview.ogg").write_bytes(os.urandom(4000))
+    database.insert_song(song)
+    before = client.get("/api/me").json()["pre"]["used_bytes"]
+    body = client.get("/api/pre/asset/0").content
+    assert client.get("/api/me").json()["pre"]["used_bytes"] == before + len(body)

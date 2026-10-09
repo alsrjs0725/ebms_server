@@ -1,6 +1,6 @@
 """곡 임포트. 폴더 트리에서 차트 파일이 있는 폴더를 곡 하나로 보고 DB에 등록합니다.
 
-- 서버 시작 시와 관리자 페이지의 "var/tmp 가져오기"는 `var/tmp/`를 훑고, 등록한 곡 폴더는 지웁니다.
+- 서버 시작 시와 관리자 페이지의 "var/tmp 가져오기"는 `var/tmp/`의 곡 폴더와 zip을 등록하고, 등록한 것은 지웁니다.
 - 관리자 페이지는 zip을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 하나씩 풀어 등록합니다. 작업 상태는 메모리에만 둡니다.
 """
@@ -91,8 +91,22 @@ def import_tree(root: pathlib.Path, remove: bool, job: Job | None = None) -> lis
 
 
 def import_tmp(job: Job | None = None) -> list[dict]:
-    """`var/tmp/` 아래 곡을 등록하고 등록한 곡 폴더는 지웁니다."""
-    return import_tree(constant.TMP_DIR, remove=True, job=job)
+    """`var/tmp/` 아래 곡 폴더와 zip을 등록합니다. 등록한 곡 폴더는 지우고, zip은 모든 곡을 등록하면 지웁니다.
+    내부망에서 큰 zip을 웹 업로드 대신 서버에 직접 복사해 넣을 때 씁니다."""
+    job = job or Job("tmp", "var/tmp")
+    import_tree(constant.TMP_DIR, remove=True, job=job)
+    for path in sorted(p for p in constant.TMP_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".zip"):
+        start = len(job.songs)
+        try:
+            import_zip(path, path.name, job)
+        except (zipfile.BadZipFile, OSError) as e:
+            logger.warning(f"import_tmp: cannot read zip[{path}]: {e}")
+            job.songs.append({"folder": path.name, "error": f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}"})
+            continue
+        songs = job.songs[start:]
+        if songs and not any("error" in song for song in songs):
+            path.unlink(missing_ok=True)
+    return job.songs
 
 
 def _entry_name(info: zipfile.ZipInfo) -> str:
@@ -156,7 +170,7 @@ def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> lis
         stem = "song"
     with zipfile.ZipFile(path) as zf:
         groups = _song_groups(zf)
-        job.total = len(groups)
+        job.total = (job.total or 0) + len(groups)
         for root, members in groups.items():
             name = root[-1] if root else stem
             work = constant.IMPORT_DIR / uuid.uuid4().hex
@@ -260,6 +274,11 @@ def cancel_upload(upload_id: str) -> None:
 
 
 def start_tmp_job() -> Job:
+    """var/tmp 임포트를 시작합니다. 이미 돌고 있으면 그 작업을 반환합니다(같은 파일을 두 번 처리하지 않도록)."""
+    with _lock:
+        running = next((j for j in _jobs.values() if j.kind == "tmp" and j.status == "running"), None)
+    if running is not None:
+        return running
     job = Job("tmp", "var/tmp")
     return _start(job, lambda: import_tmp(job))
 

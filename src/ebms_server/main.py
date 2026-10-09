@@ -2,6 +2,7 @@ import importlib.metadata
 import logging
 import logging.handlers
 import shutil
+import threading
 from contextlib import asynccontextmanager
 
 from .db import Database
@@ -37,20 +38,30 @@ def configure_logging() -> None:
     )
 
 
+def backfill_pre_chunks() -> None:
+    try:
+        Database().backfill_pre_chunks()
+    except Exception:
+        logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     logging.getLogger(__name__).info("DB is now loading...")
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
+    # 이전 버전에서 넣은 곡의 사전 청크는 시간이 걸리므로 뒤에서 만든다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받는다.
+    threading.Thread(target=backfill_pre_chunks, name="backfill_pre_chunks", daemon=True).start()
     if not constant.SECRET_KEY:
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
     if not auth.configured_oauths():
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
-    # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 import_tmp가 만들어 둔다
-    importer.import_tmp()
     # 이전 실행에서 임포트 도중 꺼졌다면 남은 임시 폴더를 지운다
     shutil.rmtree(constant.IMPORT_DIR, ignore_errors=True)
+    # var/tmp 임포트는 큰 zip이 있으면 오래 걸리므로 백그라운드로 돌려 시작(헬스체크)을 막지 않는다.
+    # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 import_tmp가 만들어 둔다
+    importer.start_tmp_job()
     yield
 
 
