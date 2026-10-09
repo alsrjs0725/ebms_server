@@ -8,7 +8,7 @@
 | `EBMS_SECRET_KEY` | 쿠키 서명용 임의 문자열. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `EBMS_GOOGLE_CLIENT_ID`, `EBMS_GOOGLE_CLIENT_SECRET` | Google OAuth 클라이언트 |
 | `EBMS_DISCORD_CLIENT_ID`, `EBMS_DISCORD_CLIENT_SECRET` | Discord OAuth 앱 |
-| `EBMS_ADMIN_EMAILS` | 이 이메일(OAuth가 확인한 것만)로 로그인하면 관리자로 지정. 쉼표로 구분 |
+| `EBMS_ADMIN_EMAILS` | 이 이메일(OAuth가 확인한 것만)로 로그인하면 관리자로 지정. 쉼표로 구분. 승격만 하므로 목록에서 빼도 강등되지 않음(관리자 페이지에서 강등) |
 
 ## Google
 

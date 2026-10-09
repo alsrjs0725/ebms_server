@@ -114,8 +114,12 @@ def _login(profile: Profile) -> User:
                     (user_id, profile.name, profile.email if profile.email_verified else None, now),
                 )
                 _insert_identity(cur, user_id, profile, now)
-            role = "admin" if _is_admin_email(profile) else "user"
-            cur.execute("UPDATE user SET role = %s, last_login_at = %s WHERE id = %s", (role, now, user_id))
+            # EBMS_ADMIN_EMAILS는 승격만 합니다. 아니면 role을 건드리지 않아, 관리자 페이지에서 바꾼 role과
+            # 다른 로그인 수단(이메일이 다른 계정)으로 들어온 관리자가 그대로 유지됩니다.
+            if _is_admin_email(profile):
+                cur.execute("UPDATE user SET role = 'admin', last_login_at = %s WHERE id = %s", (now, user_id))
+            else:
+                cur.execute("UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id))
             con.commit()
         except Exception:
             con.rollback()
