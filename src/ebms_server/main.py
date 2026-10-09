@@ -1,11 +1,11 @@
 import importlib.metadata
 import logging
 import logging.handlers
-import os
+import shutil
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, auth, constant, downloads
+from . import admin, auth, constant, downloads, importer
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -47,12 +47,10 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
     if not auth.configured_oauths():
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
-    # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 만들어 둔다
-    constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
-    for folder in os.listdir(constant.TMP_DIR):
-        cur_path = constant.TMP_DIR / folder
-        if cur_path.is_file(): continue
-        Database().insert_songs(cur_path, True, True)
+    # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 import_tmp가 만들어 둔다
+    importer.import_tmp()
+    # 이전 실행에서 임포트 도중 꺼졌다면 남은 임시 폴더를 지운다
+    shutil.rmtree(constant.IMPORT_DIR, ignore_errors=True)
     yield
 
 

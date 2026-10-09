@@ -2,19 +2,23 @@
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
+- 곡 임포트: zip 업로드, `var/tmp/` 가져오기
 """
+import logging
 import time
+import zipfile
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import accounts, auth, db, quota
+from . import accounts, auth, constant, db, importer, quota
 from .accounts import User
 from .templating import templates
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 ROLES = ("user", "admin")
 STATUSES = ("active", "banned")
@@ -97,7 +101,7 @@ def admin_page(
         return auth._login_redirect(request)
     user = session[0]
     if not user.is_admin:
-        return auth._message(request, "권한 없음", "관리자만 볼 수 있는 페이지입니다.", 403, back="/account")
+        return _forbidden(request)
     return templates.TemplateResponse(
         request=request,
         name="pages/admin.html",
@@ -110,6 +114,26 @@ def admin_page(
             "now": int(time.time()),
         },
     )
+
+
+@router.get("/admin/import", response_class=HTMLResponse)
+def import_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
+):
+    if session is None:
+        return auth._login_redirect(request)
+    if not session[0].is_admin:
+        return _forbidden(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/admin_import.html",
+        context={"user": session[0], "formats": constant.BMS_FORMAT},
+    )
+
+
+def _forbidden(request: Request):
+    return auth._message(request, "권한 없음", "관리자만 볼 수 있는 페이지입니다.", 403, back="/account")
 
 
 # ---- API ----
@@ -190,3 +214,30 @@ def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
     get_user_detail(user_id)
     quota.refill_tickets(user_id)
     return get_user_detail(user_id)
+
+
+@router.post("/api/admin/import")
+def import_zips(admin: Annotated[User, Depends(web_admin)], files: Annotated[list[UploadFile], File()]):
+    """올린 zip마다 곡을 등록합니다. zip 하나가 깨져도 나머지는 계속합니다."""
+    results = []
+    for upload in files:
+        name = upload.filename or "upload.zip"
+        try:
+            songs = importer.import_zip(upload.file, name)
+        except zipfile.BadZipFile:
+            results.append({"file": name, "error": "zip 파일이 아닙니다.", "songs": []})
+            continue
+        except Exception as e:
+            logger.exception(f"import failed[{name}]")
+            results.append({"file": name, "error": str(e) or type(e).__name__, "songs": []})
+            continue
+        error = None if songs else "차트 파일(" + ", ".join(constant.BMS_FORMAT) + ")이 있는 폴더가 없습니다."
+        results.append({"file": name, "error": error, "songs": songs})
+    logger.info(f"import by {admin.id}: {len(files)} files")
+    return results
+
+
+@router.post("/api/admin/import/tmp")
+def import_tmp(admin: Annotated[User, Depends(web_admin)]):
+    """`var/tmp/` 아래 곡을 등록하고 등록한 곡 폴더는 지웁니다(서버 시작 시와 같음)."""
+    return importer.import_tmp()

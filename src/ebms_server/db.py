@@ -674,26 +674,29 @@ class Database:
         self.logger.info(f"migrate_chart_chunk_names: Rewrote {changed} of {len(chunk_ids)} chunks.")
         return changed
 
-    def insert_song(self, song_path:os.PathLike, remove=False) -> None:
+    def insert_song(self, song_path:os.PathLike, remove=False) -> dict | None:
         """BMS 노래 한 곡을 DB에 추가할 수 있는 함수입니다
 
         Args:
             song_path (os.PathLike): bms 파일을 포함한 에셋들이 담겨있는 폴더의 경로
+
+        Returns:
+            등록한 곡 정보 {"song_id", "new_song", "charts", "new_charts"}. 등록하지 못하면 None.
         """
         root = pathlib.Path(song_path)
         if (not os.path.exists(root)):
             self.logger.warning(f"insert_song failed: Path doesn't exist[{str(root)}]")
-            return
+            return None
         if (not os.path.isdir(root)):
             self.logger.warning("insert_song failed: Path isn't directory")
-            return
+            return None
         for file_name in os.listdir(song_path):
             full_path = root / file_name
             if full_path.suffix.lower() in constant.BMS_FORMAT:
                 break
         else:
             self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
-            return
+            return None
 
         with self._write_lock, connect() as con, con.cursor() as cur:
             bms_files, song_id = self._find_bms_files_and_existing_song(root, cur)
@@ -703,7 +706,7 @@ class Database:
                 if (song_id is None):
                     song_id = self._insert_new_song(root, cur)
                     if song_id is None:
-                        return
+                        return None
                     new_song = True
 
                 new_charts = self._insert_or_update_charts(root, bms_files, song_id, cur)
@@ -720,6 +723,12 @@ class Database:
 
         if remove:
             shutil.rmtree(song_path)
+        return {
+            "song_id": song_id,
+            "new_song": new_song,
+            "charts": len(bms_files),
+            "new_charts": len(new_charts),
+        }
 
     def _find_bms_files_and_existing_song(self, root: pathlib.Path, cur) -> tuple[list, int | None]:
         bms_files = []

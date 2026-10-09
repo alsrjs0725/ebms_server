@@ -1,0 +1,166 @@
+{% extends "auth_base.html" %}
+
+{% block title %}곡 임포트 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">곡 임포트</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">곡 임포트</h1>
+
+<h2 class="h5">zip 업로드</h2>
+<p class="text-muted small">
+    차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 등록합니다. zip 하나에 곡 여러 개가 있어도 되고,
+    zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다. 같은 차트가 이미 있으면 기존 곡에 연결됩니다.
+</p>
+<form id="upload" class="mb-5">
+    <div class="mb-3">
+        <label class="form-label" for="files">zip 파일(여러 개 선택 가능)</label>
+        <input class="form-control" type="file" id="files" name="files" accept=".zip,application/zip" multiple required>
+    </div>
+    <div class="progress mb-3 d-none" role="progressbar" aria-label="업로드 진행률">
+        <div class="progress-bar" style="width: 0%"></div>
+    </div>
+    <button class="btn btn-primary" type="submit">업로드하고 등록</button>
+</form>
+
+<h2 class="h5">var/tmp 가져오기</h2>
+<p class="text-muted small">서버의 <code>var/tmp/</code> 아래 곡을 지금 등록합니다(서버 시작 시와 같음). 등록한 곡 폴더는 지웁니다.</p>
+<button class="btn btn-outline-primary mb-5" type="button" id="scan">var/tmp 가져오기</button>
+
+<div id="result" class="d-none">
+    <h2 class="h5">결과</h2>
+    <p id="summary" class="small"></p>
+    <div id="rows"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const form = document.getElementById("upload");
+const scan = document.getElementById("scan");
+const progress = form.querySelector(".progress");
+const bar = progress.querySelector(".progress-bar");
+
+function busy(on, label) {
+    form.querySelectorAll("input, button").forEach((el) => (el.disabled = on));
+    scan.disabled = on;
+    const submit = form.querySelector("button[type=submit]");
+    submit.textContent = on && label ? label : "업로드하고 등록";
+}
+
+function songLine(song) {
+    const li = document.createElement("li");
+    const name = document.createElement("code");
+    name.textContent = song.folder;
+    li.append(name, " ");
+    const badge = document.createElement("span");
+    if (song.error) {
+        badge.className = "badge text-bg-danger";
+        badge.textContent = "실패";
+        li.append(badge, " " + song.error);
+    } else {
+        badge.className = song.new_song ? "badge text-bg-success" : "badge text-bg-secondary";
+        badge.textContent = song.new_song ? `새 곡 #${song.song_id}` : `기존 곡 #${song.song_id}`;
+        li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
+    }
+    return li;
+}
+
+function show(groups) {
+    const rows = document.getElementById("rows");
+    rows.replaceChildren();
+    let ok = 0, fail = 0;
+    for (const group of groups) {
+        const card = document.createElement("div");
+        card.className = "card mb-2";
+        const body = document.createElement("div");
+        body.className = "card-body py-2";
+        if (group.file !== undefined) {
+            const title = document.createElement("strong");
+            title.textContent = group.file;
+            body.append(title);
+        }
+        if (group.error) {
+            const err = document.createElement("div");
+            err.className = "text-danger small";
+            err.textContent = group.error;
+            body.append(err);
+            fail++;
+        }
+        const list = document.createElement("ul");
+        list.className = "small mb-0";
+        for (const song of group.songs) {
+            list.append(songLine(song));
+            song.error ? fail++ : ok++;
+        }
+        if (group.songs.length) body.append(list);
+        card.append(body);
+        rows.append(card);
+    }
+    document.getElementById("summary").textContent = `성공 ${ok}곡 · 실패 ${fail}건`;
+    document.getElementById("result").classList.remove("d-none");
+}
+
+async function failMessage(status, text) {
+    try { return JSON.parse(text).detail || `실패했습니다 (${status})`; }
+    catch { return `실패했습니다 (${status})`; }
+}
+
+form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const data = new FormData(form);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/admin/import");
+    xhr.upload.addEventListener("progress", (ev) => {
+        if (!ev.lengthComputable) return;
+        const pct = Math.round((ev.loaded / ev.total) * 100);
+        bar.style.width = `${pct}%`;
+        bar.textContent = `${pct}%`;
+        if (pct >= 100) busy(true, "등록 중…");
+    });
+    xhr.addEventListener("load", async () => {
+        busy(false);
+        progress.classList.add("d-none");
+        if (xhr.status !== 200) {
+            alert(await failMessage(xhr.status, xhr.responseText));
+            return;
+        }
+        form.reset();
+        show(JSON.parse(xhr.responseText));
+    });
+    xhr.addEventListener("error", () => {
+        busy(false);
+        progress.classList.add("d-none");
+        alert("업로드하지 못했습니다. 연결을 확인하세요.");
+    });
+    bar.style.width = "0%";
+    bar.textContent = "";
+    progress.classList.remove("d-none");
+    xhr.send(data);
+    busy(true, "업로드 중…");
+});
+
+scan.addEventListener("click", async () => {
+    busy(true);
+    scan.textContent = "가져오는 중…";
+    try {
+        const res = await fetch("/api/admin/import/tmp", { method: "POST" });
+        const text = await res.text();
+        if (!res.ok) {
+            alert(await failMessage(res.status, text));
+            return;
+        }
+        const songs = JSON.parse(text);
+        show(songs.length ? [{ songs }] : []);
+        if (!songs.length) document.getElementById("summary").textContent = "가져올 곡이 없습니다.";
+    } finally {
+        busy(false);
+        scan.textContent = "var/tmp 가져오기";
+    }
+});
+</script>
+{% endblock %}
