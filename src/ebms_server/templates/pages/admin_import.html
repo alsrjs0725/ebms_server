@@ -191,6 +191,13 @@ function songLine(song) {
         badge.className = song.new_song ? "badge text-bg-success" : "badge text-bg-secondary";
         badge.textContent = song.new_song ? `새 곡 #${song.song_id}` : `기존 곡 #${song.song_id}`;
         li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
+        if (song.added_files) li.append(`, 기존 곡에 파일 ${song.added_files.length}개 추가`);
+        if (song.conflicts) {
+            const warn = document.createElement("span");
+            warn.className = "text-warning-emphasis";
+            warn.textContent = ` · 내용이 달라 넣지 않은 파일(기존 유지, 폴더는 남김): ${song.conflicts.join(", ")}`;
+            li.append(warn);
+        }
     }
     return li;
 }

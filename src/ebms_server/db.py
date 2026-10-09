@@ -398,6 +398,19 @@ def chart_files(source_dir: os.PathLike) -> list[pathlib.Path]:
     ]
 
 
+def _song_zipinfo(name: str) -> zipfile.ZipInfo:
+    """곡 zip 파일 항목. create_zip과 같은 형식(권한 정보 없음, 날짜 고정)입니다."""
+    info = zipfile.ZipInfo(name)
+    info.create_system = 0
+    info.external_attr = 0
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info
+
+
+class AmbiguousSongError(ValueError):
+    """새 폴더의 차트가 기존 곡 여러 개와 겹쳐 어느 곡에 넣을지 정할 수 없습니다. 등록하지 않고 폴더는 남깁니다."""
+
+
 class BlobReader:
     """BLOB을 나눠 읽습니다. 전송 중에 연결을 유지하지 않고 매 chunk 읽기마다 단기 연결을 씁니다."""
 
@@ -904,7 +917,9 @@ class Database:
             song_path (os.PathLike): bms 파일을 포함한 에셋들이 담겨있는 폴더의 경로
 
         Returns:
-            등록한 곡 정보 {"song_id", "new_song", "charts", "new_charts"}. 등록하지 못하면 None.
+            등록한 곡 정보 {"song_id", "new_song", "charts", "new_charts"}. 기존 곡에 파일을 더했으면 "added_files",
+            내용이 달라 넣지 못한 파일이 있으면 "conflicts"(경로 목록)가 붙습니다. 등록하지 못하면 None.
+            차트가 기존 곡 여러 개와 겹치면 AmbiguousSongError.
         """
         with self.batch() as batch:
             info = batch.add(song_path, remove=remove)
@@ -914,9 +929,11 @@ class Database:
         """곡 여러 개를 묶어 넣는 배치. 여러 곡을 넣을 때는 insert_song을 반복하지 말고 이것을 씁니다."""
         return SongBatch(self)
 
-    def _find_bms_files_and_existing_song(self, root: pathlib.Path, cur) -> tuple[list, int | None]:
+    def _find_bms_files_and_existing_songs(self, root: pathlib.Path, cur) -> tuple[list, list[int]]:
+        """폴더의 차트 (경로, 크기, sha256) 목록과, 같은 차트(sha256+크기)가 이미 있는 곡 id 목록(정렬)을 반환합니다.
+        같은 트랜잭션(배치)에서 앞서 넣은 곡도 보도록 cur를 씁니다."""
         bms_files = []
-        song_id = None
+        song_ids = set()
         for file_path in chart_files(root):
             with open(file_path, "rb") as fos:
                 sha256 = hashlib.sha256(fos.read()).hexdigest()
@@ -932,11 +949,11 @@ class Database:
             )
 
             row = cur.fetchone()
-            if (row is not None):
-                song_id = row[0]
+            if row is not None and row[0] is not None:
+                song_ids.add(row[0])
 
             bms_files.append((file_path, size, sha256))
-        return bms_files, song_id
+        return bms_files, sorted(song_ids)
 
     def _insert_new_song(self, root: pathlib.Path, cur) -> tuple[int | None, int]:
         """곡 zip을 넣고 (song_id, zip 크기)를 반환합니다. 패킷 한도를 넘으면 (None, 0)."""
@@ -958,6 +975,11 @@ class Database:
             ),
         )
         song_id = cur.lastrowid
+        self._insert_song_parts(cur, song_id, data)
+        self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
+        return song_id, len(data)
+
+    def _insert_song_parts(self, cur, song_id: int, data: bytes) -> None:
         step = constant.BLOB_READ_SIZE
         for seq, pos in enumerate(range(0, len(data), step)):
             part = data[pos : pos + step]
@@ -965,8 +987,62 @@ class Database:
                 "INSERT INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
                 (song_id, seq, part),
             )
-        self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
-        return song_id, len(data)
+
+    def _merge_into_song(self, root: pathlib.Path, song_id: int, cur) -> tuple[int, list[str], list[str]] | None:
+        """새 폴더에서 기존 곡 zip에 없는 파일을 그 곡 zip에 더합니다(겹치는 차트로 같은 곡이라고 본 경우).
+
+        같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 두고 충돌로 돌려줍니다.
+        (새 zip 크기, 더한 경로, 충돌 경로)를 반환합니다. 더할 파일이 없으면 크기는 0이고 곡은 그대로입니다.
+        새 zip이 패킷 한도를 넘으면 None.
+        """
+        data = self._get_song_data_with_cur(cur, song_id)
+        if data is None:
+            raise ValueError(f"song {song_id}: zip data not found")
+        resolved = root.resolve()
+        new_files: list[tuple[str, bytes]] = []
+        conflicts: list[str] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            existing = {info.filename.rstrip("/").lower(): info for info in zf.infolist()}
+            for path, is_dir in song_dir_entries(root):
+                if is_dir:
+                    continue
+                arcname = path.relative_to(resolved).as_posix()
+                content = path.read_bytes()
+                info = existing.get(arcname.lower())
+                if info is None:
+                    new_files.append((arcname, content))
+                elif info.is_dir() or info.file_size != len(content) or zf.read(info) != content:
+                    conflicts.append(arcname)
+        conflicts.sort()
+        if conflicts:
+            self.logger.warning(
+                f"insert_song: Song[{song_id}] kept existing files; skipped different ones {conflicts}[{root}]"
+            )
+        if not new_files:
+            return 0, [], conflicts
+
+        buf = io.BytesIO(data)
+        # 기존 항목은 그대로 두고 뒤에 붙입니다(기존 항목의 위치·압축 데이터가 바뀌지 않음).
+        with zipfile.ZipFile(buf, mode="a") as zf:
+            for arcname, content in new_files:
+                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+        data = buf.getvalue()
+        if not self._fits_packet(len(data)):
+            self.logger.error(
+                f"insert_song failed: merged song zip ({len(data)} bytes) exceeds "
+                f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
+            )
+            return None
+
+        cur.execute(
+            "UPDATE song SET size = %s, sha256 = %s, files = %s, data = NULL WHERE id = %s",
+            (len(data), hashlib.sha256(data).hexdigest(), json.dumps(zip_entries(data)), song_id),
+        )
+        cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
+        self._insert_song_parts(cur, song_id, data)
+        added = sorted(arcname for arcname, _ in new_files)
+        self.logger.info(f"insert_song: Merged {len(added)} files into song[{song_id}, {len(data)} bytes]")
+        return len(data), added, conflicts
 
     def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> list:
         new_charts = []
@@ -1216,15 +1292,32 @@ class SongBatch:
         cur = self._cur
         cur.execute("SAVEPOINT song")
         try:
-            bms_files, song_id = self.db._find_bms_files_and_existing_song(root, cur)
+            bms_files, existing = self.db._find_bms_files_and_existing_songs(root, cur)
+            if len(existing) > 1:
+                raise AmbiguousSongError(
+                    f"차트가 기존 곡 여러 개({', '.join(map(str, existing))})와 겹쳐 어느 곡에 넣을지 정할 수 없어 "
+                    "등록하지 않았습니다. 폴더를 정리한 뒤 다시 임포트하세요."
+                )
             new_song = False
             song_bytes = 0
-            if song_id is None:
+            added: list[str] = []
+            conflicts: list[str] = []
+            if not existing:
                 song_id, song_bytes = self.db._insert_new_song(root, cur)
                 if song_id is None:
                     cur.execute("ROLLBACK TO SAVEPOINT song")
                     return None
                 new_song = True
+            else:
+                # 겹치는 차트가 있는 기존 곡에 새 파일(키음·BGA 등)을 더합니다.
+                song_id = existing[0]
+                merged = self.db._merge_into_song(root, song_id, cur)
+                if merged is None:
+                    cur.execute("ROLLBACK TO SAVEPOINT song")
+                    return None
+                song_bytes, added, conflicts = merged
+                # 내용이 달라 곡 zip에 넣지 못한 차트는 등록하지 않습니다(zip의 같은 경로 파일과 어긋나므로).
+                bms_files = [f for f in bms_files if f[0].relative_to(root).as_posix() not in conflicts]
             new_charts = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
             cur.execute("RELEASE SAVEPOINT song")
         except Exception:
@@ -1235,12 +1328,15 @@ class SongBatch:
         self._chart_bytes += sum(len(content) for _, content in new_charts)
         self._song_bytes += song_bytes
         self._songs += 1
-        if new_song or new_charts:
+        if new_song or new_charts or added:
             self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
-        if new_song:
+        if new_song or added:
             self._pre_chunks.add(song_id // constant.SONGS_PER_PRE_CHUNK)
-        if remove:
+        if remove and not conflicts:
             self._remove.append(root)
+        elif remove:
+            # 곡에 넣지 못한 파일이 있으므로 원본 폴더는 지우지 않습니다.
+            self.logger.warning(f"insert_song: Kept folder with conflicting files[{root}]")
         self.logger.info(f"insert_song: Song[{song_id}] with {len(new_charts)} new charts.")
         info = {
             "song_id": song_id,
@@ -1248,6 +1344,10 @@ class SongBatch:
             "charts": len(bms_files),
             "new_charts": len(new_charts),
         }
+        if added:
+            info["added_files"] = added
+        if conflicts:
+            info["conflicts"] = conflicts
         self._infos.append(info)
 
         if (

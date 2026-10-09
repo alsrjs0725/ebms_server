@@ -101,8 +101,9 @@ def test_import_zip(client, monkeypatch):
     assert multi["status"] == "done" and multi["error"] is None
     assert multi["songs"] == [
         {"folder": "multi/pack/曲1", "song_id": 2, "new_song": True, "charts": 1, "new_charts": 1},
-        # 같은 차트(a.bms)가 있어 기존 곡 1에 연결됩니다.
-        {"folder": "multi/pack/曲2", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1},
+        # 같은 차트(a.bms)가 있어 기존 곡 1에 연결되고, 곡 1의 zip에 없는 파일은 그 zip에 더합니다.
+        {"folder": "multi/pack/曲2", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1,
+         "added_files": ["c.bms", "c2.bms"]},
     ]
 
     bad = upload(client, "bad.zip", b"not a zip")

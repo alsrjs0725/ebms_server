@@ -15,7 +15,7 @@ import zipfile
 from collections import OrderedDict
 
 from . import constant
-from .db import Database
+from .db import AmbiguousSongError, Database
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,9 @@ def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
     반환한 결과는 나중에 배치 커밋이 실패하면 "error"가 채워집니다."""
     try:
         info = batch.add(song_dir, remove=remove)
+    except AmbiguousSongError as e:
+        logger.warning(f"import skipped[{song_dir}]: {e}")
+        return {"folder": folder, "error": str(e)}
     except Exception as e:
         logger.exception(f"import failed[{song_dir}]")
         return {"folder": folder, "error": str(e) or type(e).__name__}

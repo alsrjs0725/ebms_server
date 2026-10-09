@@ -23,4 +23,4 @@
 | POST | `/api/admin/import/tmp` | `var/tmp/`의 곡 폴더와 zip을 등록하는 작업 시작(등록한 폴더와, 모든 곡을 등록한 zip은 지움). 이미 돌고 있으면 그 작업을 반환 → 작업 |
 | GET·POST | `/api/admin/notices` | 공지 목록(최근 순)·새 공지. 본문 `{title, body, level(info/warning), published, starts_at, ends_at}`(시각은 unix 초, null이면 제한 없음). 틀리면 `422` |
 | PUT·DELETE | `/api/admin/notices/{id}` | 공지 수정(본문은 POST와 같음, 전체를 바꿈)·삭제 |
-| GET | `/api/admin/import/jobs`, `/api/admin/import/jobs/{id}` | 작업(최근 순). `{id, kind, name, status(running/done/failed), total, done, songs, error}`, 곡마다 `{folder, song_id, new_song, charts, new_charts}` 또는 `{folder, error}` |
+| GET | `/api/admin/import/jobs`, `/api/admin/import/jobs/{id}` | 작업(최근 순). `{id, kind, name, status(running/done/failed), total, done, songs, error}`, 곡마다 `{folder, song_id, new_song, charts, new_charts}`(기존 곡에 병합했으면 `added_files`·`conflicts` 경로 목록이 붙음) 또는 `{folder, error}` |
