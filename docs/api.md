@@ -1,6 +1,6 @@
 # HTTP API
 
-모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 로그인하지 않으면 `/api/version`(과 세션키를 받는 `/api/auth/client/token`) 외의 모든 API가 `401`입니다. 곡 목록(차트 해시, 매니페스트)도 마찬가지입니다.
+모든 오류 응답은 FastAPI 기본 형식인 JSON `{"detail": "<메시지>"}` 입니다. 로그인하지 않으면 `/api/version`, `/api/notices`(와 세션키를 받는 `/api/auth/client/token`) 외의 모든 API가 `401`입니다. 곡 목록(차트 해시, 매니페스트)도 마찬가지입니다.
 
 API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manifest/*`, `/api/files/*`)를 없앴습니다. [사전/플레이 API](download.md)를 쓰세요.
 
@@ -9,6 +9,7 @@ API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manife
 | GET | `/` | 웹 메인 페이지 (HTML) |
 | GET | `/static/{path}` | 정적 파일 (CSS/JS/아이콘) |
 | GET | `/api/version` | API 버전. `auth`에 로그인 가능한 OAuth 목록(예: `["google", "discord"]`) |
+| GET | `/api/notices` | 지금 게시 중인 공지 (로그인 불필요) |
 | GET | `/api/pre/charthash` | 차트 청크별 SHA-256 목록 |
 | GET | `/api/pre/chart/{chunk_id}` | 차트 청크 zip 다운로드 |
 | GET | `/api/pre/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |
@@ -32,6 +33,18 @@ API 버전 2에서 기존 공개 다운로드 API(`/api/charthash`, `/api/manife
 ```
 
 `api`는 호환되지 않는 변경이 있을 때 올라갑니다. `server`는 알 수 없으면 `null`입니다. 로그인 없이 쓸 수 있는 유일한 API라, 클라이언트는 서버를 추가할 때 이것으로 호환 여부를 확인합니다.
+
+## `GET /api/notices`
+
+관리자가 `/admin/notices`에서 쓴 공지 중 지금 보여줄 것(게시 중이고 `starts_at` ≤ 지금 < `ends_at`)을 최근에 만든 순으로 반환합니다. 로그인 없이 씁니다. 클라이언트는 켜질 때 이것을 받아 아직 확인하지 않은 공지를 띄웁니다. `(id, updated_at)`이 같으면 같은 공지로 보면 됩니다.
+
+```json
+[{"id": 3, "title": "점검 안내", "body": "오늘 밤 2시~4시 점검합니다.", "level": "warning", "starts_at": null, "ends_at": 1791561600, "updated_at": 1791500000}]
+```
+
+- `level`: `info`(안내) 또는 `warning`(중요)
+- `starts_at`, `ends_at`, `updated_at`: unix 초. `starts_at`·`ends_at`이 `null`이면 제한 없음
+- `body`는 일반 텍스트입니다(HTML 아님).
 
 ## `GET /api/pre/charthash`
 

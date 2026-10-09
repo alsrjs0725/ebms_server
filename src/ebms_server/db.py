@@ -187,6 +187,22 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 클라이언트에 띄울 공지. starts_at·ends_at이 NULL이면 제한 없음입니다.
+    """
+        CREATE TABLE IF NOT EXISTS notice(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            title VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            body MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            level VARCHAR(16) NOT NULL DEFAULT 'info',
+            published TINYINT NOT NULL DEFAULT 1,
+            starts_at BIGINT UNSIGNED,
+            ends_at BIGINT UNSIGNED,
+            created_at BIGINT UNSIGNED NOT NULL,
+            updated_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼

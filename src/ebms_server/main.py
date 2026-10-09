@@ -5,7 +5,7 @@ import shutil
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, auth, constant, downloads, importer
+from . import admin, auth, constant, downloads, importer, notices
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -64,6 +64,7 @@ app.mount(
 app.include_router(auth.router)
 app.include_router(downloads.router)
 app.include_router(admin.router)
+app.include_router(notices.router)
 app.middleware("http")(auth.refresh_session_cookie)
 
 @app.get("/", response_class=HTMLResponse)
