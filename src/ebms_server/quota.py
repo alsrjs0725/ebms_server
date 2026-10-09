@@ -348,12 +348,13 @@ async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIte
 
     chunks는 동기 iterator(DB 읽기)라 스레드에서 꺼내고, 감속 대기는 스레드를 붙잡지 않습니다.
     """
-    limits = await run_in_threadpool(limits_for, user_id)
-    used = await run_in_threadpool(pre_used, user_id)
-    rate = limits.pre_throttled_kbps * 1000 / 8
-    bucket = Throttle.for_user(user_id)
     pending = 0
     try:
+        # 한도 조회도 try 안에서 합니다. 여기서 취소되거나 DB 오류가 나도 close()가 불려야 합니다.
+        limits = await run_in_threadpool(limits_for, user_id)
+        used = await run_in_threadpool(pre_used, user_id)
+        rate = limits.pre_throttled_kbps * 1000 / 8
+        bucket = Throttle.for_user(user_id)
         while True:
             chunk = await run_in_threadpool(next, chunks, None)
             if chunk is None:
