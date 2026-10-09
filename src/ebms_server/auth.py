@@ -397,6 +397,17 @@ def logout(session: Annotated[tuple[User, int] | None, Depends(optional_session)
     return response
 
 
+def web_user(session: Annotated[tuple[User, int, str], Depends(api_session)]) -> User:
+    """웹 세션(쿠키)으로 로그인한 사용자. 클라이언트 세션키(Bearer)면 403.
+
+    계정 조작(로그인 수단 해제·다른 기기 로그아웃)은 웹에서만 합니다. 유출된 세션키 하나로
+    로그인 수단을 끊거나 웹 세션까지 폐기하지 못하도록 합니다.
+    """
+    if session[2] != "web":
+        raise HTTPException(status_code=403, detail="web session required")
+    return session[0]
+
+
 @router.get("/account", response_class=HTMLResponse)
 def account_page(request: Request, session: Annotated[tuple[User, int] | None, Depends(optional_session)]):
     if session is None:
@@ -420,7 +431,7 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
 
 
 @router.delete("/api/account/identities/{identity_id}", status_code=204)
-def delete_identity(identity_id: int, user: Annotated[User, Depends(current_user)]):
+def delete_identity(identity_id: int, user: Annotated[User, Depends(web_user)]):
     result = accounts.unlink(user.id, identity_id)
     if result == "not_found":
         raise HTTPException(status_code=404, detail="identity not found")
@@ -430,7 +441,7 @@ def delete_identity(identity_id: int, user: Annotated[User, Depends(current_user
 
 
 @router.delete("/api/account/sessions/{session_id}", status_code=204)
-def delete_session(session_id: int, user: Annotated[User, Depends(current_user)]):
+def delete_session(session_id: int, user: Annotated[User, Depends(web_user)]):
     if not accounts.revoke_session(user.id, session_id):
         raise HTTPException(status_code=404, detail="session not found")
     return Response(status_code=204)
