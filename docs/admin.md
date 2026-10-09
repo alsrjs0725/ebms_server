@@ -18,5 +18,5 @@
 | PUT | `/api/admin/import/uploads/{id}?offset=` | 본문(바이트)을 이어 씀 → `{received}`. `offset`이 받은 크기와 다르면 `409`(`detail`에 현재 위치), 선언한 크기를 넘으면 `400` |
 | DELETE | `/api/admin/import/uploads/{id}` | 업로드 취소(받은 파일 삭제) |
 | POST | `/api/admin/import/uploads/{id}/finish` | 다 받은 zip의 등록 작업을 시작 → 작업. 덜 받았으면 `409` |
-| POST | `/api/admin/import/tmp` | `var/tmp/` 아래 곡을 등록하는 작업 시작(등록한 곡 폴더는 지움) → 작업 |
+| POST | `/api/admin/import/tmp` | `var/tmp/`의 곡 폴더와 zip을 등록하는 작업 시작(등록한 폴더와, 모든 곡을 등록한 zip은 지움). 이미 돌고 있으면 그 작업을 반환 → 작업 |
 | GET | `/api/admin/import/jobs`, `/api/admin/import/jobs/{id}` | 작업(최근 순). `{id, kind, name, status(running/done/failed), total, done, songs, error}`, 곡마다 `{folder, song_id, new_song, charts, new_charts}` 또는 `{folder, error}` |
