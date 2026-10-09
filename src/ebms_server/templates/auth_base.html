@@ -1,17 +1,31 @@
 {% extends "base.html" %}
 
 {% block body %}
-<nav class="navbar navbar-dark bg-dark">
+{#- 페이지가 user를 넘기지 않아도(메시지 페이지 등) 로그인 상태를 메뉴에 반영합니다. -#}
+{% set nav_user = user if user is defined and user else request.state.user %}
+{% set path = request.url.path %}
+<nav class="navbar navbar-expand-sm navbar-dark bg-dark">
     <div class="container px-4">
         <a class="navbar-brand" href="/">EBMS</a>
-        {% if user %}
-        <div class="d-flex align-items-center gap-3">
-            <a class="nav-link text-white" href="/account">{{ user.display_name or "내 계정" }}</a>
-            <form method="post" action="/auth/logout" class="m-0">
-                <button type="submit" class="btn btn-sm btn-outline-light">로그아웃</button>
-            </form>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainMenu" aria-controls="mainMenu" aria-expanded="false" aria-label="메뉴 열기"><span class="navbar-toggler-icon"></span></button>
+        <div class="collapse navbar-collapse" id="mainMenu">
+            <ul class="navbar-nav ms-auto align-items-sm-center gap-sm-2">
+                {% if nav_user %}
+                <li class="nav-item"><a class="nav-link{% if path == '/account' %} active{% endif %}" href="/account">설정</a></li>
+                {% if nav_user.is_admin %}
+                <li class="nav-item"><a class="nav-link{% if path == '/admin' %} active{% endif %}" href="/admin">관리자</a></li>
+                {% endif %}
+                <li class="nav-item"><span class="navbar-text">{{ nav_user.display_name or "내 계정" }}</span></li>
+                <li class="nav-item">
+                    <form method="post" action="/auth/logout" class="m-0">
+                        <button type="submit" class="btn btn-sm btn-outline-light">로그아웃</button>
+                    </form>
+                </li>
+                {% else %}
+                <li class="nav-item"><a class="btn btn-sm btn-outline-light" href="/login">로그인 / 가입</a></li>
+                {% endif %}
+            </ul>
         </div>
-        {% endif %}
     </div>
 </nav>
 <main class="container px-4 py-5" style="max-width: 720px">

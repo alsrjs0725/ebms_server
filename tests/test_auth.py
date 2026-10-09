@@ -332,3 +332,22 @@ def test_docker_healthcheck_url_is_public(client):
     dockerfile = (constant.BASE_DIR / "Dockerfile").read_text(encoding="utf-8")
     path = re.search(r"http://127\.0\.0\.1:8000(/[^'\"]*)", dockerfile).group(1)
     assert client.get(path).status_code == 200, path
+
+
+def test_menu(client, monkeypatch):
+    """상단 메뉴: 비로그인은 로그인/가입, 로그인은 설정·로그아웃, 관리자는 관리자 홈까지."""
+    r = client.get("/")
+    assert "로그인 / 가입" in r.text and 'href="/account"' not in r.text
+
+    oauth(client, monkeypatch, "google", "u1", email="u@example.com", name="Bob")
+    for path in ("/", "/account", "/login"):
+        text = client.get(path).text
+        assert 'href="/account">설정' in text and "로그아웃" in text and 'href="/admin"' not in text, path
+    # user를 넘기지 않는 메시지 페이지도 로그인 상태로 보임
+    text = client.get("/admin").text
+    assert "권한 없음" in text and 'href="/account">설정' in text
+
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "google", "a1", email="admin@example.com", name="Ad")
+    for path in ("/", "/account", "/admin"):
+        assert 'href="/admin"' in client.get(path).text, path

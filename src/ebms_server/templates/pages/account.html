@@ -1,9 +1,9 @@
 {% extends "auth_base.html" %}
 
-{% block title %}내 계정 - EBMS{% endblock %}
+{% block title %}설정 - EBMS{% endblock %}
 
 {% block content %}
-<h1 class="h3 mb-4">내 계정</h1>
+<h1 class="h3 mb-4">설정</h1>
 <dl class="row">
     <dt class="col-sm-3">이름</dt><dd class="col-sm-9">{{ user.display_name }}</dd>
     {% if user.email %}<dt class="col-sm-3">이메일</dt><dd class="col-sm-9">{{ user.email }}</dd>{% endif %}

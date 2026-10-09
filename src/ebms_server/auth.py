@@ -207,6 +207,8 @@ def optional_session(request: Request) -> tuple[User, int] | None:
     if session is not None:
         # DB의 만료 시각이 연장되므로 쿠키 유효기간도 응답에서 같이 연장합니다(refresh_session_cookie).
         request.state.web_session_token = token
+        # 페이지 상단 메뉴(auth_base.html)가 로그인 상태를 알 수 있게 둡니다.
+        request.state.user = session[0]
     return session
 
 
