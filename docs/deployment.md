@@ -4,11 +4,48 @@
 
 | 포트 | 서비스 | 외부 공개 | 비고 |
 | --- | --- | --- | --- |
-| 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 필요 | 방화벽/리버스 프록시에서 열어야 하는 유일한 포트 |
+| 443/tcp | TLS 리버스 프록시 (HTTPS) | 필요 | Caddy·nginx 등. 외부에 여는 유일한 포트. 아래 [TLS 리버스 프록시](#tls-리버스-프록시-필수) 참고 |
+| 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 금지 | 호스트의 `127.0.0.1`에만 바인딩. 같은 호스트의 리버스 프록시만 접근 |
 | 3306/tcp | MySQL | 불필요 | 호스트에 바인딩하지 않음. compose 내부 네트워크에서 `ebms` 컨테이너만 접근 |
 
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
 - 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
+
+## TLS 리버스 프록시 (필수)
+
+EBMS 서버는 평문 HTTP만 말합니다. 웹 세션 쿠키(30일), OAuth 콜백 코드, 클라이언트 세션키(90일, `Authorization: Bearer`)가 오가므로 **외부에는 반드시 TLS 리버스 프록시(https)를 거쳐 공개**합니다.
+
+- `docker-compose.yml`은 서버 포트를 `127.0.0.1:${EBMS_PORT}`에만 엽니다. 같은 호스트의 프록시가 `http://127.0.0.1:<EBMS_PORT>`로 넘기게 하세요.
+- `EBMS_PUBLIC_URL`은 `https://` 주소로 둡니다. 그래야 세션 쿠키에 `Secure`가 붙고 OAuth 리다이렉트 주소도 https가 됩니다. localhost가 아닌 `http://` 주소면 서버가 시작할 때 경고 로그를 남깁니다.
+- 프록시 헤더(`X-Forwarded-For`·`X-Forwarded-Proto`)는 `EBMS_FORWARDED_ALLOW_IPS`(쉼표 구분, 기본 `127.0.0.1`)에서 온 요청만 믿습니다. 호스트의 프록시가 게시된 포트로 접속하면 컨테이너에서는 **docker 브리지 게이트웨이 주소**(예: `172.18.0.1`)로 보이므로, 그 주소를 넣어야 실제 접속 IP·https가 반영됩니다. 확인: `docker network inspect <프로젝트>_default --format '{{(index .IPAM.Config 0).Gateway}}'` (`<프로젝트>`는 `ebms-release` 등). `*`(전부 믿음)는 쓰지 마세요.
+
+Caddy 예시(인증서 자동 발급):
+
+```
+ebms.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+nginx 예시:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ebms.example.com;
+    # ssl_certificate ... ; ssl_certificate_key ... ;
+    client_max_body_size 64m;   # 곡 임포트 조각(최대 32MB)보다 크게
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;    # 큰 다운로드를 바로 흘려보냄
+    }
+}
+```
+
+> **호환성 주의(이전 배포에서 올릴 때)**: 예전 `docker-compose.yml`은 8000 포트를 모든 인터페이스에 열었습니다. 이제는 `127.0.0.1`에만 열리므로, 클라이언트나 브라우저가 `http://<서버>:8000`으로 직접 접속하던 배포는 업데이트 후 접속되지 않습니다. 리버스 프록시를 먼저 세우고 `EBMS_PUBLIC_URL`을 `https://` 주소로 바꾼 뒤(OAuth 앱의 리다이렉트 주소도 함께) 올리세요. 클라이언트에 등록한 서버 주소도 https 주소로 바꿔야 합니다.
 
 ### 데이터를 다른 디스크(HDD)에 두기
 

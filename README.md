@@ -20,7 +20,7 @@ docker compose up -d
 - 업데이트: `docker compose pull && docker compose up -d`
 - 소스에서 직접 빌드하려면 저장소를 받은 뒤 `docker compose up -d --build`
 
-- 서버: http://localhost:8000 (`EBMS_PORT`로 변경)
+- 서버: http://localhost:8000 (`EBMS_PORT`로 변경). 호스트의 `127.0.0.1`에만 열리며, 외부에는 TLS 리버스 프록시(https)로 공개해야 합니다([docs/deployment.md](docs/deployment.md#tls-리버스-프록시-필수)).
 - 로그인(OAuth) 설정은 [docs/auth.md](docs/auth.md)를 보세요.
 
 ## 문서

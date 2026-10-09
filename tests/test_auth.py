@@ -376,3 +376,14 @@ def test_menu(client, monkeypatch):
     oauth(client, monkeypatch, "google", "a1", email="admin@example.com", name="Ad")
     for path in ("/", "/account", "/admin"):
         assert 'href="/admin"' in client.get(path).text, path
+
+
+def test_insecure_public_url():
+    """https가 아니고 루프백도 아닌 EBMS_PUBLIC_URL은 시작할 때 경고합니다(#28)."""
+    from ebms_server.main import insecure_public_url
+
+    assert insecure_public_url("http://example.com")
+    assert insecure_public_url("http://192.168.0.10:8000")
+    assert not insecure_public_url("https://ebms.example.com")
+    for url in ("http://localhost:8000", "http://127.0.0.1:1234", "http://[::1]:8000"):
+        assert not insecure_public_url(url), url
