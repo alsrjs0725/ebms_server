@@ -2,14 +2,14 @@
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
-- 곡 임포트: zip 업로드, `var/tmp/` 가져오기
+- 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 """
 import logging
 import time
-import zipfile
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -216,28 +216,59 @@ def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
     return get_user_detail(user_id)
 
 
-@router.post("/api/admin/import")
-def import_zips(admin: Annotated[User, Depends(web_admin)], files: Annotated[list[UploadFile], File()]):
-    """올린 zip마다 곡을 등록합니다. zip 하나가 깨져도 나머지는 계속합니다."""
-    results = []
-    for upload in files:
-        name = upload.filename or "upload.zip"
-        try:
-            songs = importer.import_zip(upload.file, name)
-        except zipfile.BadZipFile:
-            results.append({"file": name, "error": "zip 파일이 아닙니다.", "songs": []})
-            continue
-        except Exception as e:
-            logger.exception(f"import failed[{name}]")
-            results.append({"file": name, "error": str(e) or type(e).__name__, "songs": []})
-            continue
-        error = None if songs else "차트 파일(" + ", ".join(constant.BMS_FORMAT) + ")이 있는 폴더가 없습니다."
-        results.append({"file": name, "error": error, "songs": songs})
-    logger.info(f"import by {admin.id}: {len(files)} files")
-    return results
+class UploadStart(BaseModel):
+    filename: str
+    size: int
+
+
+def _upload_call(fn, *args):
+    try:
+        return fn(*args)
+    except importer.UploadError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+@router.post("/api/admin/import/uploads")
+def start_upload(body: UploadStart, admin: Annotated[User, Depends(web_admin)]):
+    """zip 조각 업로드를 시작합니다. 디스크가 모자라면 507."""
+    return _upload_call(importer.start_upload, body.filename, body.size)
+
+
+@router.put("/api/admin/import/uploads/{upload_id}")
+async def put_chunk(upload_id: str, offset: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
+    """본문(바이트)을 offset 위치에 이어 씁니다. offset이 받은 크기와 다르면 409."""
+    data = await request.body()
+    return await run_in_threadpool(_upload_call, importer.write_chunk, upload_id, offset, data)
+
+
+@router.delete("/api/admin/import/uploads/{upload_id}")
+def cancel_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
+    importer.cancel_upload(upload_id)
+    return {"ok": True}
+
+
+@router.post("/api/admin/import/uploads/{upload_id}/finish")
+def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다."""
+    job = _upload_call(importer.finish_upload, upload_id)
+    logger.info(f"import job {job.id} by {admin.id}: {job.name}")
+    return job.json()
 
 
 @router.post("/api/admin/import/tmp")
 def import_tmp(admin: Annotated[User, Depends(web_admin)]):
-    """`var/tmp/` 아래 곡을 등록하고 등록한 곡 폴더는 지웁니다(서버 시작 시와 같음)."""
-    return importer.import_tmp()
+    """`var/tmp/` 아래 곡을 등록하는 작업을 백그라운드로 시작합니다(등록한 곡 폴더는 지움)."""
+    return importer.start_tmp_job().json()
+
+
+@router.get("/api/admin/import/jobs")
+def list_jobs(admin: Annotated[User, Depends(web_admin)]):
+    return [job.json() for job in importer.list_jobs()]
+
+
+@router.get("/api/admin/import/jobs/{job_id}")
+def get_job(job_id: str, admin: Annotated[User, Depends(web_admin)]):
+    job = importer.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.json()
