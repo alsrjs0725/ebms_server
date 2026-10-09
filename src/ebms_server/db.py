@@ -543,8 +543,8 @@ class Database:
     def _fits_packet(self, size: int) -> bool:
         return size + constant.PACKET_OVERHEAD <= self.max_allowed_packet
 
-    def _append_charts_to_chunk(self, cur, chart_files: list[tuple[pathlib.Path, str]]) -> None:
-        """mutable한 chart chunk에 chart 파일들을 추가합니다. chunk가 BYTE_PER_CHUNK를 넘었다면 새 chunk를 만듭니다."""
+    def _append_charts_to_chunk(self, cur, charts: list[tuple[str, bytes]]) -> None:
+        """mutable한 chart chunk에 chart (항목 이름, 내용)들을 추가합니다. chunk가 BYTE_PER_CHUNK를 넘었다면 새 chunk를 만듭니다."""
         cur.execute("SELECT id, size FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE")
         row = cur.fetchone()
         if row is None:
@@ -558,8 +558,8 @@ class Database:
 
         buf = io.BytesIO(data)
         with zipfile.ZipFile(buf, mode="a", compression=zipfile.ZIP_STORED) as zf:
-            for chart_file_path, sha256 in chart_files:
-                zf.write(chart_file_path, arcname=chart_arcname(sha256, chart_file_path))
+            for arcname, content in charts:
+                zf.writestr(zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0)), content)
         data = buf.getvalue()
 
         if not self._fits_packet(len(data)):
@@ -850,54 +850,13 @@ class Database:
         Returns:
             등록한 곡 정보 {"song_id", "new_song", "charts", "new_charts"}. 등록하지 못하면 None.
         """
-        root = pathlib.Path(song_path)
-        if (not os.path.exists(root)):
-            self.logger.warning(f"insert_song failed: Path doesn't exist[{str(root)}]")
-            return None
-        if (not os.path.isdir(root)):
-            self.logger.warning("insert_song failed: Path isn't directory")
-            return None
-        for file_name in os.listdir(song_path):
-            full_path = root / file_name
-            if full_path.suffix.lower() in constant.BMS_FORMAT:
-                break
-        else:
-            self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
-            return None
+        with self.batch() as batch:
+            info = batch.add(song_path, remove=remove)
+        return info
 
-        with self._write_lock, connect() as con, con.cursor() as cur:
-            bms_files, song_id = self._find_bms_files_and_existing_song(root, cur)
-
-            new_song = False
-            try:
-                if (song_id is None):
-                    song_id = self._insert_new_song(root, cur)
-                    if song_id is None:
-                        return None
-                    new_song = True
-
-                new_charts = self._insert_or_update_charts(root, bms_files, song_id, cur)
-
-                if new_charts:
-                    self._append_charts_to_chunk(cur, new_charts)
-                if new_song or new_charts:
-                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
-                if new_song:
-                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
-                con.commit()
-            except Exception:
-                con.rollback()
-                raise
-            self.logger.info(f"insert_song: Inserted {len(new_charts)} charts.")
-
-        if remove:
-            shutil.rmtree(song_path)
-        return {
-            "song_id": song_id,
-            "new_song": new_song,
-            "charts": len(bms_files),
-            "new_charts": len(new_charts),
-        }
+    def batch(self) -> "SongBatch":
+        """곡 여러 개를 묶어 넣는 배치. 여러 곡을 넣을 때는 insert_song을 반복하지 말고 이것을 씁니다."""
+        return SongBatch(self)
 
     def _find_bms_files_and_existing_song(self, root: pathlib.Path, cur) -> tuple[list, int | None]:
         bms_files = []
@@ -927,14 +886,15 @@ class Database:
             bms_files.append((file_path, size, sha256))
         return bms_files, song_id
 
-    def _insert_new_song(self, root: pathlib.Path, cur) -> int | None:
+    def _insert_new_song(self, root: pathlib.Path, cur) -> tuple[int | None, int]:
+        """곡 zip을 넣고 (song_id, zip 크기)를 반환합니다. 패킷 한도를 넘으면 (None, 0)."""
         data = self.create_zip(root)
         if not self._fits_packet(len(data)):
             self.logger.error(
                 f"insert_song failed: song zip ({len(data)} bytes) exceeds "
                 f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
             )
-            return None
+            return None, 0
 
         cur.execute(
             "INSERT INTO song (size, sha256, folder, files) VALUES (%s, %s, %s, %s)",
@@ -954,7 +914,7 @@ class Database:
                 (song_id, seq, part),
             )
         self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
-        return song_id
+        return song_id, len(data)
 
     def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> list:
         new_charts = []
@@ -965,7 +925,7 @@ class Database:
                 (str(sha256), song_id, size, filename),
             )
             if cur.rowcount == 1:
-                new_charts.append((chart_file_path, sha256))
+                new_charts.append((chart_arcname(sha256, chart_file_path), chart_file_path.read_bytes()))
             elif song_id is not None:
                 cur.execute(
                     "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
@@ -1112,3 +1072,161 @@ class Database:
         if row is None:
             return None
         return BlobReader(table, row_id, row[0], row[1])
+
+
+class SongBatch:
+    """곡 여러 개를 한 트랜잭션으로 넣고, 청크(차트·매니페스트·사전)는 커밋 직전에 배치마다 한 번씩만 갱신합니다.
+
+    곡마다 청크를 읽고 다시 쓰면 대량 임포트에서 같은 청크를 수천 번 읽고 쓰게 되므로 묶어서 처리합니다.
+    곡과 청크 갱신이 같은 트랜잭션이라 도중에 꺼지면 배치 전체가 롤백되고, 다시 임포트하면 처음부터 들어갑니다.
+    곡 하나가 실패하면 SAVEPOINT로 그 곡만 되돌리고 배치는 이어갑니다.
+    새 차트가 BYTE_PER_CHUNK, 곡 데이터가 IMPORT_BATCH_BYTES, 곡 수가 IMPORT_BATCH_SONGS에 이르면 커밋합니다.
+    배치가 열려 있는 동안(커밋 전까지)만 쓰기 잠금을 잡습니다.
+
+    with db.batch() as batch:
+        info = batch.add(song_dir)          # 등록 정보 또는 None. 실패하면 예외(그 곡만 되돌림)
+    # with를 빠져나갈 때 남은 곡을 커밋합니다. 커밋 전에 예외가 나면 배치 전체를 롤백합니다.
+    """
+
+    def __init__(self, db: "Database"):
+        self.db = db
+        self.logger = db.logger
+        self._con = None
+        self._cur = None
+        self._reset()
+
+    def _reset(self) -> None:
+        self._charts: list[tuple[str, bytes]] = []
+        self._chart_bytes = 0
+        self._song_bytes = 0
+        self._songs = 0
+        self._manifest_chunks: set[int] = set()
+        self._pre_chunks: set[int] = set()
+        self._remove: list[pathlib.Path] = []
+        self._infos: list[dict] = []
+
+    def __enter__(self) -> "SongBatch":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if exc_type is None:
+            self.flush()
+        else:
+            self._abort()
+
+    def _begin(self) -> None:
+        if self._con is not None:
+            return
+        self.db._write_lock.acquire()
+        try:
+            self._con = connect()
+            self._cur = self._con.cursor()
+        except Exception:
+            self._con = None
+            self.db._write_lock.release()
+            raise
+
+    def _close(self) -> None:
+        try:
+            if self._cur is not None:
+                self._cur.close()
+            if self._con is not None:
+                self._con.close()
+        finally:
+            self._con = self._cur = None
+            self.db._write_lock.release()
+            self._reset()
+
+    def _abort(self) -> None:
+        """커밋하지 않은 곡을 모두 되돌립니다. 이 배치에서 돌려준 등록 정보에는 error를 채웁니다."""
+        if self._con is None:
+            return
+        for info in self._infos:
+            info["error"] = "배치를 커밋하지 못해 등록이 취소됐습니다. 다시 임포트하세요."
+        try:
+            self._con.rollback()
+        finally:
+            self._close()
+
+    def add(self, song_path: os.PathLike, remove: bool = False) -> dict | None:
+        """곡 하나를 배치에 넣습니다. 등록 정보를 반환하고, 넣지 못하면 None.
+        반환한 dict는 배치 커밋이 실패하면 "error" 키가 채워집니다."""
+        root = pathlib.Path(song_path)
+        if not root.is_dir():
+            self.logger.warning(f"insert_song failed: Path isn't directory[{root}]")
+            return None
+        if not any(pathlib.Path(name).suffix.lower() in constant.BMS_FORMAT for name in os.listdir(root)):
+            self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
+            return None
+
+        self._begin()
+        cur = self._cur
+        cur.execute("SAVEPOINT song")
+        try:
+            bms_files, song_id = self.db._find_bms_files_and_existing_song(root, cur)
+            new_song = False
+            song_bytes = 0
+            if song_id is None:
+                song_id, song_bytes = self.db._insert_new_song(root, cur)
+                if song_id is None:
+                    cur.execute("ROLLBACK TO SAVEPOINT song")
+                    return None
+                new_song = True
+            new_charts = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
+            cur.execute("RELEASE SAVEPOINT song")
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT song")
+            raise
+
+        self._charts.extend(new_charts)
+        self._chart_bytes += sum(len(content) for _, content in new_charts)
+        self._song_bytes += song_bytes
+        self._songs += 1
+        if new_song or new_charts:
+            self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+        if new_song:
+            self._pre_chunks.add(song_id // constant.SONGS_PER_PRE_CHUNK)
+        if remove:
+            self._remove.append(root)
+        self.logger.info(f"insert_song: Song[{song_id}] with {len(new_charts)} new charts.")
+        info = {
+            "song_id": song_id,
+            "new_song": new_song,
+            "charts": len(bms_files),
+            "new_charts": len(new_charts),
+        }
+        self._infos.append(info)
+
+        if (
+            self._chart_bytes >= constant.BYTE_PER_CHUNK
+            or self._song_bytes >= constant.IMPORT_BATCH_BYTES
+            or self._songs >= constant.IMPORT_BATCH_SONGS
+        ):
+            self.flush()
+        return info
+
+    def flush(self) -> None:
+        """모은 차트를 청크에 붙이고, 바뀐 매니페스트·사전 청크를 한 번씩 다시 만든 뒤 커밋합니다."""
+        if self._con is None:
+            return
+        cur = self._cur
+        try:
+            if self._charts:
+                self.db._append_charts_to_chunk(cur, self._charts)
+            for chunk_no in sorted(self._manifest_chunks):
+                self.db._rebuild_manifest_chunk(cur, chunk_no)
+            for chunk_no in sorted(self._pre_chunks):
+                self.db._rebuild_pre_chunk(cur, chunk_no)
+            self._con.commit()
+        except Exception:
+            self.logger.exception("song batch commit failed")
+            self._abort()
+            raise
+        self.logger.info(
+            f"song batch: Committed {self._songs} songs, {len(self._charts)} charts, "
+            f"{self._song_bytes} song bytes."
+        )
+        remove = self._remove
+        self._close()
+        for path in remove:
+            shutil.rmtree(path, ignore_errors=True)
