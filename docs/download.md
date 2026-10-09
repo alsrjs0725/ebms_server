@@ -1,5 +1,9 @@
 # 다운로드 API (사전 / 플레이)
 
+클라이언트 입장에서 다운로드는 두 단계입니다.
+- **사전 다운로드(= 동기화)**: 차트 청크, 매니페스트, 사전 청크(배너·스테이지파일·프리뷰 등)를 바뀐 청크만 미리 받습니다.
+- **플레이 다운로드**: 곡을 처음 플레이할 때 곡 zip 전체를 받습니다.
+
 다운로드는 두 갈래이고 둘 다 로그인(Bearer 세션키 또는 웹 쿠키)이 필요합니다. 없거나 만료된 세션은 `401`입니다. 서버는 경로만 보고 어느 할당량에서 뺄지 정합니다.
 
 | 구분 | 메서드·경로 | 설명 |
@@ -7,14 +11,15 @@
 | 사전 | GET `/api/pre/charthash` | 차트 청크별 SHA-256 |
 | 사전 | GET `/api/pre/chart/{chunk_id}` | 차트 청크 zip (Range 지원) |
 | 사전 | GET `/api/pre/manifest/hash`, `/api/pre/manifest/{chunk_id}` | 매니페스트. `files`의 각 항목에 `kind`(`pre`/`play`) |
-| 사전 | GET `/api/pre/song/{song_id}/file?path=<zip 안 경로>` | 곡의 사전 파일 하나를 압축을 풀어 보냅니다. `ETag`/`If-None-Match` 지원. `kind`가 `pre`가 아니면 `403` `not a pre-download file`, 없으면 `404` |
+| 사전 | GET `/api/pre/assethash`, `/api/pre/asset/{chunk_id}` | 사전 청크. 32곡 단위로 사전 파일(차트 제외)을 묶은 zip (Range 지원) |
+| 사전 | GET `/api/pre/song/{song_id}/file?path=<zip 안 경로>` | 사전 청크가 아직 없을 때 쓰는 대체 경로. 곡의 사전 파일 하나를 압축을 풀어 보냅니다. `ETag`/`If-None-Match` 지원. `kind`가 `pre`가 아니면 `403` `not a pre-download file`, 없으면 `404` |
 | 플레이 | GET `/api/play/song/{song_id}` | 곡 zip 전체(Range 이어받기 지원). 본문을 보낼 때 티켓 1개 |
 
 **사전/플레이 판정**: 곡을 등록할 때(기존 곡은 서버 시작 시) 정합니다. 차트 파일, 차트 헤더 `#BANNER`·`#STAGEFILE`·`#BACKBMP`·`#PREVIEW`가 가리키는 파일, 이름이 `preview`로 시작하는 파일은 `pre`, 나머지(키음, BGA 등)는 `play`입니다. 헤더 경로는 대소문자·`\`를 무시하고, 확장자가 달라도 같은 종류(이미지끼리, 오디오끼리)면 같은 파일로 봅니다.
 
 **플레이 티켓**: 곡 1개당 1개를 쓰고, 차감 후 `grant_seconds`(기본 30분) 동안 같은 곡은 다시 받아도 차감하지 않습니다. 티켓은 `refill_seconds`(기본 60초)마다 1개씩 `max_tickets`(기본 5개)까지 찹니다. 티켓이 없으면 `429` + `Retry-After: <다음 티켓까지 초>` + `{"detail": "no download ticket"}`입니다. `304`·`416`·`404`는 차감하지 않습니다.
 
-**사전 다운로드 사용량**: 실제 보낸 바이트(매니페스트는 gzip이면 압축된 크기)를 월별로 더합니다. 월 경계는 KST 1일 0시입니다. 이번 달 사용량이 `pre_monthly_bytes`(기본 10GB)를 넘으면 끊지 않고 `pre_throttled_kbps`(기본 500Kbps)로 감속합니다. 같은 사용자의 동시 요청은 이 속도를 나눠 씁니다(프로세스 메모리, 워커 1개 전제). 해시 목록(`/hash`, `/charthash`)은 세지 않습니다.
+**사전 다운로드 사용량**: 실제 보낸 바이트(매니페스트는 gzip이면 압축된 크기)를 월별로 더합니다. 월 경계는 KST 1일 0시입니다. 이번 달 사용량이 `pre_monthly_bytes`(기본 10GB)를 넘으면 끊지 않고 `pre_throttled_kbps`(기본 500Kbps)로 감속합니다. 같은 사용자의 동시 요청은 이 속도를 나눠 씁니다(프로세스 메모리, 워커 1개 전제). 해시 목록(`/hash`, `/charthash`, `/assethash`)은 세지 않습니다. 첫 동기화는 모든 곡의 사전 파일을 받으므로 곡이 많으면 한 번에 한도를 넘을 수 있고, 넘은 뒤에는 감속된 속도로 마저 받습니다.
 
 `/api/me`에 남은 양이 나옵니다.
 

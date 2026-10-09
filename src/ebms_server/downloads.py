@@ -1,6 +1,6 @@
 """다운로드 API. 사전(/api/pre/*)과 플레이(/api/play/*) 두 갈래로, 둘 다 로그인이 필요합니다.
 
-- 사전: 차트 청크, 매니페스트, 곡의 사전 파일(배너·스테이지파일·프리뷰 등). 이번 달 사용량에 더하고 한도를 넘으면 감속.
+- 사전: 차트 청크, 매니페스트, 사전 청크(곡들의 배너·스테이지파일·프리뷰 등 묶음), 곡의 사전 파일 하나. 이번 달 사용량에 더하고 한도를 넘으면 감속.
 - 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안 같은 곡은 재차감 없음), 티켓이 없으면 429.
 """
 import gzip
@@ -184,6 +184,24 @@ def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User, Depen
         "chart_chunk",
         chunk_id,
         constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
+        "File not found",
+        user_id=user.id,
+        meter_user=user.id,
+    )
+
+
+@router.get("/api/pre/assethash")
+def pre_asset_hash(user: Annotated[User, Depends(current_user)]):
+    return Database().get_pre_chunk_hash()
+
+
+@router.get("/api/pre/asset/{chunk_id}")
+def pre_asset_chunk(chunk_id: int, request: Request, user: Annotated[User, Depends(current_user)]):
+    return blob_response(
+        request,
+        "pre_chunk",
+        chunk_id,
+        constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
         "File not found",
         user_id=user.id,
         meter_user=user.id,
