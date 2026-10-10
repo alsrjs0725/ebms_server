@@ -3,7 +3,11 @@ import datetime
 import io
 import json
 import os
+import threading
 import zipfile
+
+import anyio
+import anyio.to_thread
 
 from ebms_server import constant, db as db_module, quota
 from ebms_server.db import Database, file_kinds
@@ -577,3 +581,50 @@ def test_min_throttled_kbps_validation():
         quota.validate("pre_throttled_kbps", 10)
 
     assert quota.validate("pre_throttled_kbps", 64) == 64
+
+
+# ---- 다운로드 스레드 (#41) ----
+
+def test_metered_reads_in_download_limiter_and_writes_usage_off_loop_when_cancelled(monkeypatch):
+    """본문 조각은 다운로드 전용 스레드 한도에서 읽고, 취소돼도 사용량은 이벤트 루프 밖 스레드에서 기록합니다."""
+    limits = quota.Limits(5, 60, 1800, 0, 500)  # 한도 0 → 감속(500Kbps)
+    monkeypatch.setattr(quota, "limits_for", lambda user_id: limits)
+    monkeypatch.setattr(quota, "pre_used", lambda user_id: 0)
+    writes = []
+    monkeypatch.setattr(
+        quota, "add_pre_usage", lambda user_id, nbytes: writes.append((user_id, nbytes, threading.get_ident()))
+    )
+    closed = []
+
+    async def main():
+        loop_thread = threading.get_ident()
+        limiter = quota.download_limiter()
+        default = anyio.to_thread.current_default_thread_limiter()
+        tokens = []
+
+        def chunks():
+            tokens.append((limiter.borrowed_tokens, default.borrowed_tokens, threading.get_ident()))
+            yield b"x" * (2 * quota.THROTTLE_PIECE)
+
+        got = []
+
+        async def consume():
+            async for piece in quota.metered("u-cancel", chunks(), close=lambda: closed.append(True)):
+                got.append(piece)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(consume)
+            with anyio.fail_after(5):
+                while not got:
+                    await anyio.sleep(0.01)
+            # 두 번째 조각은 감속 대기(약 0.26초) 중. 여기서 취소합니다(연결 끊김).
+            await anyio.sleep(0.05)
+            tg.cancel_scope.cancel()
+        return loop_thread, tokens, got
+
+    loop_thread, tokens, got = anyio.run(main)
+    assert tokens == [(1, 0, tokens[0][2])] and tokens[0][2] != loop_thread
+    assert len(got) == 1
+    assert closed == [True]
+    assert [(u, n) for u, n, _ in writes] == [("u-cancel", quota.THROTTLE_PIECE)]
+    assert writes[0][2] != loop_thread

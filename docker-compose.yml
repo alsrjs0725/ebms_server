@@ -46,6 +46,8 @@ services:
       EBMS_DISCORD_CLIENT_ID: ${EBMS_DISCORD_CLIENT_ID:-}
       EBMS_DISCORD_CLIENT_SECRET: ${EBMS_DISCORD_CLIENT_SECRET:-}
       EBMS_ADMIN_EMAILS: ${EBMS_ADMIN_EMAILS:-}
+      # 다운로드 본문 읽기 스레드 수 한도(API용 스레드와 따로 셈)
+      EBMS_DOWNLOAD_THREADS: ${EBMS_DOWNLOAD_THREADS:-16}
       # 프록시 헤더를 믿을 앞단 프록시 주소(쉼표 구분). 호스트의 프록시는 docker 브리지 게이트웨이로 보입니다.
       EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
