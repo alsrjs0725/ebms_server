@@ -28,6 +28,9 @@ SONGS_PER_PRE_CHUNK = 32
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
 API_VERSION = 3
+# 다운로드 본문(BLOB 조각) 읽기에 쓰는 스레드 수 한도. API·로그인이 쓰는 기본 스레드 한도(40)와 따로 셉니다.
+# 큰 곡을 동시에 많이 받아도 다른 요청이 스레드를 기다리지 않게 합니다. 늘리면 MySQL 동시 연결도 그만큼 늘어납니다.
+DOWNLOAD_THREADS = int(os.environ.get("EBMS_DOWNLOAD_THREADS", "16"))
 # BLOB 다운로드 시 한 번에 읽어오는 크기
 BLOB_READ_SIZE = 1024 * 1024
 # INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트
