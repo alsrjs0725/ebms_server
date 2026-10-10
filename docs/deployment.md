@@ -5,7 +5,7 @@
 | 포트 | 서비스 | 외부 공개 | 비고 |
 | --- | --- | --- | --- |
 | 443/tcp | TLS 리버스 프록시 (HTTPS) | 필요 | Caddy·nginx 등. 외부에 여는 유일한 포트. 아래 [TLS 리버스 프록시](#tls-리버스-프록시-필수) 참고 |
-| 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 금지 | 호스트의 `127.0.0.1`에만 바인딩. 같은 호스트의 리버스 프록시만 접근 |
+| 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 금지 | 기본은 호스트의 `127.0.0.1`에만 바인딩(`EBMS_BIND_ADDR`). 같은 호스트의 리버스 프록시만 접근 |
 | 3306/tcp | MySQL | 불필요 | 호스트에 바인딩하지 않음. compose 내부 네트워크에서 `ebms` 컨테이너만 접근 |
 
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
@@ -15,7 +15,8 @@
 
 EBMS 서버는 평문 HTTP만 말합니다. 웹 세션 쿠키(30일), OAuth 콜백 코드, 클라이언트 세션키(90일, `Authorization: Bearer`)가 오가므로 **외부에는 반드시 TLS 리버스 프록시(https)를 거쳐 공개**합니다.
 
-- `docker-compose.yml`은 서버 포트를 `127.0.0.1:${EBMS_PORT}`에만 엽니다. 같은 호스트의 프록시가 `http://127.0.0.1:<EBMS_PORT>`로 넘기게 하세요.
+- `docker-compose.yml`은 서버 포트를 `${EBMS_BIND_ADDR}:${EBMS_PORT}`(기본 `127.0.0.1`)에만 엽니다. 같은 호스트의 프록시가 `http://127.0.0.1:<EBMS_PORT>`로 넘기게 하세요.
+- **프록시가 docker 컨테이너인 경우**(nginx-proxy-manager, 컨테이너로 띄운 Caddy·nginx 등): 컨테이너 안의 `127.0.0.1`은 호스트가 아니므로 루프백 바인딩에 닿지 못합니다. 이때 서버는 healthy인데 웹페이지는 502가 납니다. `EBMS_BIND_ADDR`를 docker 브리지 게이트웨이(보통 `172.17.0.1`, 확인: `docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'`)로 두고, 프록시는 `http://172.17.0.1:<EBMS_PORT>`로 넘기게 하세요. 이 주소는 외부 인터페이스가 아니어서 평문 포트가 밖에 드러나지 않습니다. `0.0.0.0`은 쓰지 마세요.
 - `EBMS_PUBLIC_URL`은 `https://` 주소로 둡니다. 그래야 세션 쿠키에 `Secure`가 붙고 OAuth 리다이렉트 주소도 https가 됩니다. localhost가 아닌 `http://` 주소면 서버가 시작할 때 경고 로그를 남깁니다.
 - 프록시 헤더(`X-Forwarded-For`·`X-Forwarded-Proto`)는 `EBMS_FORWARDED_ALLOW_IPS`(쉼표 구분, 기본 `127.0.0.1`)에서 온 요청만 믿습니다. 호스트의 프록시가 게시된 포트로 접속하면 컨테이너에서는 **docker 브리지 게이트웨이 주소**(예: `172.18.0.1`)로 보이므로, 그 주소를 넣어야 실제 접속 IP·https가 반영됩니다. 확인: `docker network inspect <프로젝트>_default --format '{{(index .IPAM.Config 0).Gateway}}'` (`<프로젝트>`는 `ebms-release` 등). `*`(전부 믿음)는 쓰지 마세요.
 
