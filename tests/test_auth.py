@@ -302,6 +302,25 @@ def test_safe_next():
     assert auth.safe_next(None, default="/custom") == "/custom"
     assert auth.safe_next("", default="/custom") == "/custom"
     assert auth.safe_next("//evil.com", default="/custom") == "/custom"
+    # 브라우저는 탭·개행을 지우고 역슬래시를 /로 바꿔 //evil.com으로 해석함 (#58)
+    for bad in (
+        "/\t/evil.com", "/\n/evil.com", "/\r/evil.com", "/\x00/evil.com", "/\x7f/evil.com",
+        " //evil.com", "/ /evil.com", "/\u3000/evil.com", "/\\/evil.com", "/\t\\evil.com",
+        "/x\ty",
+    ):
+        assert auth.safe_next(bad) == "/account", repr(bad)
+    # 퍼센트 인코딩은 그대로 두면 브라우저가 경로로 해석하므로 허용
+    assert auth.safe_next("/%09/evil.com") == "/%09/evil.com"
+    assert auth.safe_next("/a/b?next=%2F%2Fx#frag") == "/a/b?next=%2F%2Fx#frag"
+
+
+def test_login_page_continue_link_rejects_control_chars(client, monkeypatch):
+    """로그인된 상태의 로그인 페이지 "계속하기" 링크에 탭이 섞인 next가 들어가지 않음 (#58)"""
+    oauth(client, monkeypatch, "google", "g1", email="a@example.com")
+    r = client.get("/login", params={"next": "/\t/evil.com"})
+    assert r.status_code == 200
+    assert '<a href="/account">계속하기</a>' in r.text
+    assert "evil.com" not in r.text
 
 
 def test_signed_cookie():

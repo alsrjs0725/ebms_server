@@ -183,10 +183,19 @@ def _secure_cookie() -> bool:
 
 
 def safe_next(next_url: str | None, default: str = "/account") -> str:
-    """로그인 후 이동할 곳. 같은 사이트의 경로만 허용합니다(오픈 리다이렉트 방지)."""
-    if next_url and next_url.startswith("/") and not next_url.startswith("//") and "\\" not in next_url:
-        return next_url
-    return default
+    """로그인 후 이동할 곳. 같은 사이트의 경로만 허용합니다(오픈 리다이렉트 방지).
+
+    브라우저는 URL을 해석할 때 탭·개행을 지우고 역슬래시를 /로 바꾸므로(`/\\t/evil.com` → `//evil.com`)
+    제어문자·공백·역슬래시가 있으면 거부하고, 남은 값이 scheme·호스트 없는 경로인지 다시 확인합니다.
+    """
+    if not next_url or not next_url.startswith("/") or next_url.startswith("//") or "\\" in next_url:
+        return default
+    if any(ord(c) < 0x20 or ord(c) == 0x7F or c.isspace() for c in next_url):
+        return default
+    parts = urllib.parse.urlsplit(next_url)
+    if parts.scheme or parts.netloc:
+        return default
+    return next_url
 
 
 # ---- 현재 사용자 ----
