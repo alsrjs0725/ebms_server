@@ -1,6 +1,7 @@
 """사전/플레이 다운로드, 티켓, 월 사용량·감속, 관리자 설정 테스트."""
 import datetime
 import io
+import json
 import os
 import zipfile
 
@@ -76,6 +77,108 @@ def test_file_kinds(tmp_path):
     data = Database.create_zip(None, song)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         assert file_kinds(zf) == EXPECTED_KINDS
+
+
+def test_file_kinds_strict_rules(tmp_path):
+    """헤더 값의 확장자가 헤더 형식이 아니거나 없으면 무시하고, preview*는 차트 폴더의 오디오만,
+    키음·BGA로 쓰는 파일은 사전 헤더가 가리키지 않는 한 play (#36)"""
+    song = tmp_path / "s"
+    (song / "sub").mkdir(parents=True)
+    (song / "a.bms").write_bytes(
+        b"#BANNER sound.wav\r\n"         # 이미지 헤더에 오디오 → 무시
+        b"#STAGEFILE bga\\movie.mp4\r\n"  # 이미지 헤더에 동영상 → 무시
+        b"#PREVIEW bgm\r\n"              # 확장자 없음 → 무시
+        b"#BACKBMP back.png\r\n"
+        b"#WAV01 sound.wav\r\n"
+        b"#WAV02 preview_full.ogg\r\n"    # preview*지만 키음
+        b"#wav03 preview_hook.wav\r\n"    # 키음이지만 #PREVIEW도 가리킴
+        b"#PREVIEW preview_hook.wav\r\n"
+        b"#BMP01 bga\\movie.mp4\r\n"
+    )
+    for name in (
+        "sound.wav", "sound.png", "bgm.ogg", "bgm.wav", "back.jpg", "back.wav",
+        "preview_full.ogg", "preview_full.wav", "preview_hook.wav", "preview.ogg",
+        "previewbga.mp4", "preview.png", "sub/preview.ogg",
+    ):
+        (song / name).write_bytes(os.urandom(100))
+    (song / "bga").mkdir()
+    (song / "bga" / "movie.mp4").write_bytes(os.urandom(100))
+    data = Database.create_zip(None, song)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert file_kinds(zf) == {
+            "a.bms": "pre",
+            "sound.wav": "play",
+            "sound.png": "play",
+            "bgm.ogg": "play",
+            "bgm.wav": "play",
+            "back.jpg": "pre",
+            "back.wav": "play",
+            "preview_full.ogg": "play",
+            "preview_full.wav": "play",
+            "preview_hook.wav": "pre",
+            "preview.ogg": "pre",
+            "previewbga.mp4": "play",
+            "preview.png": "play",
+            "sub/preview.ogg": "play",
+            "bga/movie.mp4": "play",
+        }
+
+
+def test_backfill_file_kinds_recomputes_old_rules(tmp_path, client, monkeypatch):
+    """이전 규칙으로 판정한 곡은 시작할 때 다시 판정하고, 사전 청크도 새 규칙으로 다시 만듭니다 (#36)"""
+    key, _ = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    db = Database()
+    db.backfill_pre_chunks()
+    # 이전 규칙: 키음·BGA도 pre로 판정돼 있던 상태
+    with db_module.connect() as con, con.cursor() as cur:
+        files = db.get_song_files(1)
+        cur.execute(
+            "UPDATE song SET files = %s WHERE id = 1",
+            (json.dumps([{**e, "kind": "pre"} for e in files]),),
+        )
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        con.commit()
+    with db_module.connect() as con, con.cursor() as cur:
+        db._rebuild_pre_chunk(cur, 0)
+        con.commit()
+    h = bearer(key)
+    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 200
+
+    assert db.backfill_file_kinds() == 1
+    assert {p: f["kind"] for p, f in manifest_files(client, key).items()} == EXPECTED_KINDS
+    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 403
+    # 사전 청크는 지워졌다가 뒤에서 새 규칙으로 다시 만들어짐
+    assert db.get_pre_chunk_hash() == {}
+    assert db.backfill_pre_chunks() == 1
+    asset = client.get("/api/pre/asset/0", headers=h)
+    with zipfile.ZipFile(io.BytesIO(asset.content)) as zf:
+        assert sorted(zf.namelist()) == ["1/banner.jpg", "1/preview_auto.ogg", "1/sub/PV.wav", "1/ステージ.bmp"]
+    # 버전을 기록했으므로 다음 시작 때는 다시 하지 않음
+    assert db.backfill_file_kinds() == 0
+
+
+def test_backfill_file_kinds_skips_broken_song(tmp_path, client, monkeypatch):
+    """판정하지 못한 곡은 건너뛰고 다른 곡은 고치며, 버전은 올리지 않아 다음에 다시 시도합니다 (#36)"""
+    add_songs(tmp_path, 2)
+    db = Database()
+    with db_module.connect() as con, con.cursor() as cur:
+        for song_id in (1, 2):
+            files = db.get_song_files(song_id)
+            if song_id == 1:
+                files = [{**e, "crc32": "00000000"} if e["path"] == "a.bms" else e for e in files]
+            cur.execute(
+                "UPDATE song SET files = %s WHERE id = %s",
+                (json.dumps([{**e, "kind": "pre"} for e in files]), song_id),
+            )
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        con.commit()
+    assert db.backfill_file_kinds() == 1
+    assert {e["path"]: e["kind"] for e in db.get_song_files(2)} == EXPECTED_KINDS
+    assert {e["kind"] for e in db.get_song_files(1)} == {"pre"}
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT value FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        assert cur.fetchone() is None
 
 
 def test_manifest_kind_and_backfill(tmp_path, client, monkeypatch):
