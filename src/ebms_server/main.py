@@ -55,6 +55,43 @@ def insecure_public_url(url: str) -> bool:
     return parts.hostname not in ("localhost", "127.0.0.1", "::1")
 
 
+# 모든 응답에 붙이는 보안 헤더. 페이지는 static의 스크립트·스타일만 쓰고(인라인 스크립트·style 속성 없음),
+# Bootstrap CSS의 아이콘은 data: SVG입니다. 다른 사이트의 iframe에 넣지 못하게 합니다(클릭재킹 방지).
+# HSTS는 TLS를 끝내는 리버스 프록시에서 붙입니다(docs/deployment.md).
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+
+
+class SecurityHeadersMiddleware:
+    """응답에 SECURITY_HEADERS를 붙입니다(이미 있는 헤더는 그대로 둠). 본문은 건드리지 않아 스트리밍 응답에도 씁니다."""
+
+    def __init__(self, app):
+        self.app = app
+        self.headers = [(name.lower().encode(), value.encode()) for name, value in SECURITY_HEADERS.items()]
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {name.lower() for name, _ in headers}
+                headers.extend((name, value) for name, value in self.headers if name not in present)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -92,6 +129,7 @@ app.include_router(downloads.router)
 app.include_router(admin.router)
 app.include_router(notices.router)
 app.middleware("http")(auth.refresh_session_cookie)
+app.add_middleware(SecurityHeadersMiddleware)
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request: Request, session: Annotated[tuple | None, Depends(auth.optional_session)]):

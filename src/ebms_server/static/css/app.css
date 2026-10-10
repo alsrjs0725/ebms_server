@@ -1,0 +1,16 @@
+/* 이 서버의 페이지 전용 스타일. CSP(style-src 'self')로 인라인 style 속성을 쓸 수 없어 클래스로 둡니다. */
+.mw-page {
+    max-width: 720px;
+}
+
+.mw-menu {
+    max-width: 360px;
+}
+
+.mw-login {
+    max-width: 320px;
+}
+
+.w-0 {
+    width: 0;
+}
