@@ -50,7 +50,7 @@ S3_ACCESS_KEY_ID = os.environ.get("EBMS_S3_ACCESS_KEY_ID", "")
 S3_SECRET_ACCESS_KEY = os.environ.get("EBMS_S3_SECRET_ACCESS_KEY", "")
 # R2는 auto
 S3_REGION = os.environ.get("EBMS_S3_REGION", "auto")
-# 버킷에 둘 바이트 상한. 넘으면 곡 zip을 오래 안 쓴 것부터 지웁니다(차트·사전 청크는 지우지 않음). 0이면 지우지 않습니다(전체 저장).
+# 버킷에 둘 곡 zip 바이트 상한. 넘으면 오래 안 쓴 것부터 지웁니다. 차트·사전 청크는 세지 않고 항상 둡니다. 0이면 지우지 않습니다(전체 저장).
 S3_CACHE_BYTES = int(os.environ.get("EBMS_S3_CACHE_BYTES", "0"))
 # presigned URL 유효시간(초). 이 시간 안에 받은 객체는 지우지 않습니다.
 S3_URL_SECONDS = int(os.environ.get("EBMS_S3_URL_SECONDS", "600"))

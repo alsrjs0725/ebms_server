@@ -133,9 +133,8 @@ def test_rolling_eviction(tmp_path, client, bucket):
     Database().backfill_pre_chunks()
     client.get("/api/pre/chart/0", follow_redirects=False)
     sizes = [Database().open_blob("song", i).size for i in (1, 2, 3)]
-    chart_size = sum(size for _, kind, _, size in rows() if kind == "chart")
-    # 곡 2개까지만 들어가는 크기
-    bucket.cache.cache_bytes = chart_size + sizes[0] + sizes[1] + sizes[2] // 2
+    # 곡 2개까지만 들어가는 크기(청크는 세지 않음)
+    bucket.cache.cache_bytes = sizes[0] + sizes[1] + sizes[2] // 2
 
     for i in (1, 2):
         assert client.get(f"/api/play/song/{i}", follow_redirects=False).status_code == 302

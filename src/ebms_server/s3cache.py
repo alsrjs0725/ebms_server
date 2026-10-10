@@ -5,7 +5,7 @@
 
 - 키는 내용 주소입니다: {종류}/{id}/{sha256}.zip. 내용이 바뀌면 새 키로 올리고 이전 키는 지웁니다.
 - 버킷에 없으면 백그라운드로 올리고 S3_UPLOAD_WAIT_SECONDS까지 기다립니다. 그 안에 못 올리면 None(호출자가 503).
-- S3_CACHE_BYTES > 0이면 넘을 때 곡 zip을 오래 안 쓴 것부터 지웁니다(롤링 캐시). 차트·사전 청크는 항상 둡니다.
+- S3_CACHE_BYTES > 0이면 곡 zip 합이 넘을 때 오래 안 쓴 것부터 지웁니다(롤링 캐시). 차트·사전 청크는 한도에 세지 않고 항상 둡니다.
 - 버킷에 올린 객체는 s3_object 테이블에 적어 둡니다. 서버 프로세스 1개(워커 1개)를 전제로 합니다.
 """
 import concurrent.futures
@@ -196,7 +196,9 @@ class S3Cache:
         logger.info(f"s3 deleted {key}")
 
     def evict(self) -> int:
-        """S3_CACHE_BYTES를 넘으면 곡 zip을 오래 안 쓴 것부터 지웁니다. URL 유효시간 안에 받은 것은 남깁니다.
+        """곡 zip 합이 S3_CACHE_BYTES를 넘으면 오래 안 쓴 것부터 지웁니다. URL 유효시간 안에 받은 것은 남깁니다.
+
+        차트·사전 청크는 이 한도에 세지 않습니다(항상 둠).
 
         지울 것이 없으면 잠시 넘은 채로 둡니다(무료 한도는 월평균 용량 기준). 지운 개수를 돌려줍니다.
         """
@@ -205,7 +207,7 @@ class S3Cache:
         removed = 0
         with self._evict_lock:
             with db.connect() as con, con.cursor() as cur:
-                cur.execute("SELECT COALESCE(SUM(size), 0) FROM s3_object")
+                cur.execute("SELECT COALESCE(SUM(size), 0) FROM s3_object WHERE kind = %s", (ROLLING_KIND,))
                 total = int(cur.fetchone()[0])
                 if total <= self.cache_bytes:
                     return 0
