@@ -1061,19 +1061,6 @@ class Database:
                 )
         return new_charts
 
-    def insert_songs(self, directory:os.PathLike, reculsive=False, remove=False) -> None:
-        root_dir = pathlib.Path(directory)
-        for file_name in os.listdir(root_dir):
-            cur_dir = root_dir / file_name
-            if (cur_dir).is_dir() and reculsive:
-                self.insert_songs(cur_dir, True, remove)
-                continue
-            if cur_dir.suffix.lower() in constant.BMS_FORMAT:
-                self.insert_song(root_dir)
-                if remove:
-                    shutil.rmtree(root_dir)
-                break
-
     def create_zip(self, source_dir: os.PathLike) -> bytes:
         """
         디렉터리를 ZIP으로 압축해 bytes로 반환하는 함수
