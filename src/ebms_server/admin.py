@@ -13,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import accounts, auth, constant, db, importer, quota
+from . import auth, constant, db, importer, quota
 from .accounts import User
 from .templating import templates
 
@@ -37,9 +37,12 @@ def _like(text: str) -> str:
     return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
+USER_COLUMNS = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
+
+
 def search_users(q: str = "") -> list[dict]:
     """이름·이메일·계정 ID·연결된 OAuth 이름/이메일로 찾습니다(대소문자 무시). 최근 로그인 순, 최대 SEARCH_LIMIT명."""
-    columns = "id, display_name, email, role, status, created_at, last_login_at, " + ", ".join(quota.USER_LIMITS)
+    columns = ", ".join(USER_COLUMNS)
     with db.connect() as con, con.cursor() as cur:
         if q.strip():
             # 컬럼이 _bin 콜레이션이라 대소문자를 맞춰 비교합니다.
@@ -55,38 +58,56 @@ def search_users(q: str = "") -> list[dict]:
             )
         else:
             cur.execute(f"SELECT {columns} FROM user ORDER BY last_login_at DESC, created_at DESC LIMIT {SEARCH_LIMIT}")
-        rows = cur.fetchall()
-    names = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
-    return [_with_usage(dict(zip(names, row))) for row in rows]
+        users = [dict(zip(USER_COLUMNS, row)) for row in cur.fetchall()]
+        return _with_usage(cur, users)
 
 
-def _with_usage(user: dict) -> dict:
-    limits = quota.limits_for(user["id"])
-    return {
-        "id": user["id"],
-        "display_name": user["display_name"],
-        "email": user["email"],
-        "role": user["role"],
-        "status": user["status"],
-        "created_at": user["created_at"],
-        "last_login_at": user["last_login_at"],
-        "oauths": [i.oauth for i in accounts.list_identities(user["id"])],
-        # 사용자별 값(None이면 전역 기본값)
-        "overrides": {name: user[name] for name in quota.USER_LIMITS},
-        "tickets": quota.ticket_json(quota.ticket_state(user["id"], limits)),
-        "pre": quota.pre_state(user["id"], limits),
-    }
+def _with_usage(cur, users: list[dict]) -> list[dict]:
+    """사용자 목록에 OAuth·티켓·사전 사용량을 붙입니다. 사용자 수와 상관없이 같은 연결로 쿼리 4번만 씁니다(#40)."""
+    if not users:
+        return []
+    ids = [user["id"] for user in users]
+    marks = ", ".join(["%s"] * len(ids))
+    settings = quota.get_settings(cur)
+    oauths: dict[str, list[str]] = {user_id: [] for user_id in ids}
+    cur.execute(f"SELECT user_id, oauth FROM user_identity WHERE user_id IN ({marks}) ORDER BY id", ids)
+    for user_id, oauth in cur.fetchall():
+        oauths[user_id].append(oauth)
+    cur.execute(f"SELECT user_id, tickets, updated_at FROM user_ticket WHERE user_id IN ({marks})", ids)
+    tickets = {user_id: (stored, updated_at) for user_id, stored, updated_at in cur.fetchall()}
+    month = quota.current_month()
+    cur.execute(f"SELECT user_id, bytes FROM pre_usage WHERE month = %s AND user_id IN ({marks})", (month, *ids))
+    used = {user_id: int(nbytes) for user_id, nbytes in cur.fetchall()}
+
+    now = time.time()
+    result = []
+    for user in users:
+        overrides = {name: user[name] for name in quota.USER_LIMITS}
+        limits = quota.merge_limits(settings, overrides)
+        result.append({
+            "id": user["id"],
+            "display_name": user["display_name"],
+            "email": user["email"],
+            "role": user["role"],
+            "status": user["status"],
+            "created_at": user["created_at"],
+            "last_login_at": user["last_login_at"],
+            "oauths": oauths[user["id"]],
+            # 사용자별 값(None이면 전역 기본값)
+            "overrides": overrides,
+            "tickets": quota.ticket_json(quota.ticket_state_from(tickets.get(user["id"]), limits, now)),
+            "pre": quota.pre_state_from(used.get(user["id"], 0), limits, month),
+        })
+    return result
 
 
 def get_user_detail(user_id: str) -> dict:
-    columns = "id, display_name, email, role, status, created_at, last_login_at, " + ", ".join(quota.USER_LIMITS)
     with db.connect() as con, con.cursor() as cur:
-        cur.execute(f"SELECT {columns} FROM user WHERE id = %s", (user_id,))
+        cur.execute(f"SELECT {', '.join(USER_COLUMNS)} FROM user WHERE id = %s", (user_id,))
         row = cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    names = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
-    return _with_usage(dict(zip(names, row)))
+        if row is None:
+            raise HTTPException(status_code=404, detail="user not found")
+        return _with_usage(cur, [dict(zip(USER_COLUMNS, row))])[0]
 
 
 # ---- 페이지 ----

@@ -32,6 +32,8 @@ API_VERSION = 3
 BLOB_READ_SIZE = 1024 * 1024
 # INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트
 PACKET_OVERHEAD = 1024 * 1024
+# 연결 풀에 남겨 둘 유휴 MySQL 연결 수 상한
+DB_POOL_SIZE = int(os.environ.get("EBMS_DB_POOL_SIZE", "32"))
 # 클라이언트가 보낼 수 있는 최대 패킷 크기. 서버의 max_allowed_packet과 맞춥니다.
 DB_MAX_ALLOWED_PACKET = 1024 * 1024 * 1024
 

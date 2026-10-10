@@ -91,13 +91,16 @@ def validate(name: str, value) -> int:
 
 # ---- 전역 설정 ----
 
-def get_settings() -> dict[str, int]:
+def get_settings(cur=None) -> dict[str, int]:
+    """전역 설정. cur를 주면 그 연결로 읽습니다."""
+    if cur is None:
+        with db.connect() as con, con.cursor() as cur:
+            return get_settings(cur)
     settings = dict(constant.DEFAULT_SETTINGS)
-    with db.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT name, value FROM setting")
-        for name, value in cur.fetchall():
-            if name in settings:
-                settings[name] = int(value)
+    cur.execute("SELECT name, value FROM setting")
+    for name, value in cur.fetchall():
+        if name in settings:
+            settings[name] = int(value)
     return settings
 
 
@@ -134,14 +137,17 @@ def get_overrides(cur, user_id: str) -> dict[str, int | None]:
     return dict(zip(USER_LIMITS, row)) if row else {name: None for name in USER_LIMITS}
 
 
-def limits_for(user_id: str) -> Limits:
-    settings = get_settings()
-    with db.connect() as con, con.cursor() as cur:
-        overrides = get_overrides(cur, user_id)
+def merge_limits(settings: dict[str, int], overrides: dict[str, int | None]) -> Limits:
+    """전역 설정에 사용자별 값(None이 아닌 것)을 덮어씁니다."""
     return Limits(**{
         name: overrides[name] if overrides.get(name) is not None else settings[name]
         for name in constant.DEFAULT_SETTINGS
     })
+
+
+def limits_for(user_id: str) -> Limits:
+    with db.connect() as con, con.cursor() as cur:
+        return merge_limits(get_settings(cur), get_overrides(cur, user_id))
 
 
 def set_overrides(user_id: str, values: dict) -> None:
@@ -202,6 +208,11 @@ def ticket_state(user_id: str, limits: Limits | None = None) -> TicketState:
     with db.connect() as con, con.cursor() as cur:
         cur.execute("SELECT tickets, updated_at FROM user_ticket WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
+    return ticket_state_from(row, limits, now)
+
+
+def ticket_state_from(row: tuple | None, limits: Limits, now: float) -> TicketState:
+    """user_ticket의 (tickets, updated_at) 행(없으면 None)으로 티켓 상태를 계산합니다."""
     return _state(_current_tickets(row, limits, now), limits, now)
 
 
@@ -383,7 +394,11 @@ async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIte
 def pre_state(user_id: str, limits: Limits | None = None) -> dict:
     limits = limits or limits_for(user_id)
     month = current_month()
-    used = pre_used(user_id, month)
+    return pre_state_from(pre_used(user_id, month), limits, month)
+
+
+def pre_state_from(used: int, limits: Limits, month: str) -> dict:
+    """이번 달 사용량으로 사전 다운로드 상태를 만듭니다."""
     return {
         "month": month,
         "used_bytes": used,

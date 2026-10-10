@@ -506,11 +506,75 @@ class BlobReader:
         pass
 
 
-def connect(**kwargs) -> pymysql.connections.Connection:
-    """constant.py에 정의된 MySQL 서버에 연결합니다.
+class ConnectionPool:
+    """스레드 안전한 간단한 연결 풀. 접속 정보별로 다 쓴 연결을 최대 size개까지 남겨 두고 다시 씁니다.
 
-    주의: PyMySQL Connection의 context manager는 __exit__ 시 con.close()를 부르지 않으므로
-    자동으로 connection을 닫으려면 ConnectionWrapper를 반환합니다.
+    연결마다 TLS·인증에 수십 ms가 들어 쿼리마다 새로 맺으면 요청 하나에 수백 ms가 걸리므로 재사용합니다(#40).
+    - 꺼낼 때 ping으로 끊긴 연결(서버 재시작, wait_timeout)을 걸러 내고 새로 맺습니다.
+    - 돌려받을 때 rollback해 커밋하지 않은 작업·트랜잭션 스냅숏을 버립니다(연결을 닫을 때와 같은 결과).
+      rollback이 실패하거나 남겨 둔 연결이 size개면 닫습니다.
+    - 동시에 쓰는 연결 수는 막지 않습니다(스레드 한도가 상한). size는 놀고 있는 연결 수의 상한입니다.
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+        self._idle: dict[tuple, list[pymysql.connections.Connection]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def connect(self, params: dict) -> "ConnectionWrapper":
+        key = tuple(sorted(params.items()))
+        while True:
+            with self._lock:
+                idle = self._idle.get(key)
+                con = idle.pop() if idle else None
+            if con is None:
+                return ConnectionWrapper(pymysql.connect(**params), self, key)
+            try:
+                con.ping(reconnect=False)
+            except Exception:
+                self._discard(con)
+                continue
+            return ConnectionWrapper(con, self, key)
+
+    def release(self, key: tuple, con: pymysql.connections.Connection) -> None:
+        if not con.open:
+            return
+        try:
+            con.rollback()
+        except Exception:
+            self._discard(con)
+            return
+        with self._lock:
+            idle = self._idle[key]
+            if len(idle) < self.size:
+                idle.append(con)
+                return
+        self._discard(con)
+
+    def clear(self) -> None:
+        """남겨 둔 연결을 모두 닫습니다."""
+        with self._lock:
+            cons = [con for idle in self._idle.values() for con in idle]
+            self._idle.clear()
+        for con in cons:
+            self._discard(con)
+
+    @staticmethod
+    def _discard(con: pymysql.connections.Connection) -> None:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+_pool = ConnectionPool(constant.DB_POOL_SIZE)
+
+
+def connect(**kwargs) -> "ConnectionWrapper":
+    """constant.py에 정의된 MySQL 서버에 연결합니다. 연결 풀(ConnectionPool)에서 꺼내고 다 쓰면 돌려줍니다.
+
+    with connect() as con 은 pymysql.Connection을 주고, with를 빠져나가거나 close()를 부르면
+    커밋하지 않은 작업을 rollback한 뒤 풀에 돌려줍니다.
     """
     params = dict(
         host=constant.DB_HOST,
@@ -522,25 +586,34 @@ def connect(**kwargs) -> pymysql.connections.Connection:
         max_allowed_packet=constant.DB_MAX_ALLOWED_PACKET,
     )
     params.update(kwargs)
-    con = pymysql.connect(**params)
-    return ConnectionWrapper(con)
+    return _pool.connect(params)
 
 
 class ConnectionWrapper:
-    """pymysql.Connection의 래퍼. with 문을 빠져나갈 때 연결을 확실히 닫습니다."""
+    """pymysql.Connection의 래퍼. with 문을 빠져나가거나 close()를 부르면 연결을 풀에 돌려줍니다(한 번만)."""
 
-    def __init__(self, con: pymysql.connections.Connection):
+    def __init__(self, con: pymysql.connections.Connection, pool: ConnectionPool | None = None, key: tuple = ()):
         self._con = con
+        self._pool = pool
+        self._key = key
+        self._released = False
 
     def __enter__(self):
-        return self._con.__enter__()
+        return self._con
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            return self._con.__exit__(exc_type, exc_val, exc_tb)
-        finally:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._pool is None:
             if self._con.open:
                 self._con.close()
+        else:
+            self._pool.release(self._key, self._con)
 
     def __getattr__(self, name):
         return getattr(self._con, name)
