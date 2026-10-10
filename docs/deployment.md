@@ -18,6 +18,7 @@ EBMS 서버는 평문 HTTP만 말합니다. 웹 세션 쿠키(30일), OAuth 콜�
 - `docker-compose.yml`은 서버 포트를 `127.0.0.1:${EBMS_PORT}`에만 엽니다. 같은 호스트의 프록시가 `http://127.0.0.1:<EBMS_PORT>`로 넘기게 하세요.
 - `EBMS_PUBLIC_URL`은 `https://` 주소로 둡니다. 그래야 세션 쿠키에 `Secure`가 붙고 OAuth 리다이렉트 주소도 https가 됩니다. localhost가 아닌 `http://` 주소면 서버가 시작할 때 경고 로그를 남깁니다.
 - 프록시 헤더(`X-Forwarded-For`·`X-Forwarded-Proto`)는 `EBMS_FORWARDED_ALLOW_IPS`(쉼표 구분, 기본 `127.0.0.1`)에서 온 요청만 믿습니다. 호스트의 프록시가 게시된 포트로 접속하면 컨테이너에서는 **docker 브리지 게이트웨이 주소**(예: `172.18.0.1`)로 보이므로, 그 주소를 넣어야 실제 접속 IP·https가 반영됩니다. 확인: `docker network inspect <프로젝트>_default --format '{{(index .IPAM.Config 0).Gateway}}'` (`<프로젝트>`는 `ebms-release` 등). `*`(전부 믿음)는 쓰지 마세요.
+- 서버는 모든 응답에 CSP(`frame-ancestors 'none'` 포함)·`X-Content-Type-Options`·`X-Frame-Options`·`Referrer-Policy`를 붙입니다. HSTS(`Strict-Transport-Security`)는 붙이지 않으므로 필요하면 프록시에서 붙이세요(Caddy는 기본으로 붙이지 않음, nginx는 `add_header Strict-Transport-Security "max-age=31536000" always;`).
 
 Caddy 예시(인증서 자동 발급):
 
