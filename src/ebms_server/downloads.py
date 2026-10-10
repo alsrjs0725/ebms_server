@@ -7,13 +7,16 @@ import gzip
 import mimetypes
 import re
 import struct
+import threading
 import zipfile
 import zlib
 from collections.abc import Callable
 from typing import Annotated
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from . import constant, quota
 from .accounts import User
@@ -53,6 +56,48 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, end
 
 
+def _once(fn: Callable[[], None]) -> Callable[[], None]:
+    """처음 한 번만 fn을 부르는 함수를 반환합니다(슬롯 반납이 두 번 되지 않도록)."""
+    lock = threading.Lock()
+    done = False
+
+    def call() -> None:
+        nonlocal done
+        with lock:
+            if done:
+                return
+            done = True
+        fn()
+
+    return call
+
+
+class ReleasingStreamingResponse(StreamingResponse):
+    """응답이 끝나면 on_close를 부르는 StreamingResponse.
+
+    Starlette는 본문을 시작하기 전에 연결이 끊기면 본문 이터레이터를 한 번도 돌리지 않아
+    제너레이터의 finally에 맡긴 정리가 실행되지 않습니다. 그래서 정리를 응답 수명에 묶습니다.
+    on_close는 멱등이어야 합니다(본문 쪽 finally에서도 부를 수 있음).
+    """
+
+    def __init__(self, content, *, on_close: Callable[[], None], **kwargs):
+        super().__init__(content, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                self._on_close()
+            finally:
+                # 중간에 멈춘 본문(사용량 기록 등)을 바로 마무리합니다. 취소 중이어도 끝까지 닫습니다.
+                aclose = getattr(self.body_iterator, "aclose", None)
+                if aclose is not None:
+                    with anyio.CancelScope(shield=True):
+                        await aclose()
+
+
 def _not_modified(request: Request, etag: str) -> bool:
     if_none_match = request.headers.get("if-none-match")
     return bool(if_none_match) and (
@@ -79,6 +124,7 @@ def blob_response(
     """
     if user_id and not quota.acquire_download_slot(user_id):
         raise HTTPException(status_code=429, detail="too many concurrent downloads")
+    release = _once(lambda: quota.release_download_slot(user_id) if user_id else None)
 
     try:
         blob = Database().open_blob(table, row_id)
@@ -93,8 +139,7 @@ def blob_response(
 
         if _not_modified(request, etag):
             blob.close()
-            if user_id:
-                quota.release_download_slot(user_id)
+            release()
             return Response(status_code=304, headers=headers)
 
         rng = None
@@ -127,14 +172,14 @@ def blob_response(
         headers["Content-Length"] = str(end - start + 1)
         gen = blob.iter_range(start, end)
 
+        @_once
         def cleanup():
             try:
                 if hasattr(gen, "close"):
                     gen.close()
             finally:
                 blob.close()
-                if user_id:
-                    quota.release_download_slot(user_id)
+                release()
 
         if meter_user is not None:
             body = quota.metered(meter_user, gen, close=cleanup)
@@ -146,10 +191,11 @@ def blob_response(
                     cleanup()
             body = wrapped_body()
 
-        return StreamingResponse(body, status_code=status, media_type="application/zip", headers=headers)
-    except Exception:
-        if user_id:
-            quota.release_download_slot(user_id)
+        return ReleasingStreamingResponse(
+            body, on_close=cleanup, status_code=status, media_type="application/zip", headers=headers
+        )
+    except BaseException:
+        release()
         raise
 
 
@@ -260,6 +306,7 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
     """곡의 사전 파일 하나를 압축을 풀어 내려줍니다. 사전 파일이 아니면 403."""
     if not quota.acquire_download_slot(user.id):
         raise HTTPException(status_code=429, detail="too many concurrent downloads")
+    release = _once(lambda: quota.release_download_slot(user.id))
 
     try:
         files = Database().get_song_files(song_id)
@@ -275,7 +322,7 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
         headers = {"ETag": etag, "Content-Length": str(entry["size"])}
         if _not_modified(request, etag):
             del headers["Content-Length"]
-            quota.release_download_slot(user.id)
+            release()
             return Response(status_code=304, headers=headers)
 
         blob = Database().open_blob("song", song_id)
@@ -289,20 +336,22 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
         body = _iter_member(blob, start, entry["comp_size"], decompressor)
         media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
 
+        @_once
         def cleanup():
             try:
                 body.close()
             finally:
                 blob.close()
-                quota.release_download_slot(user.id)
+                release()
 
-        return StreamingResponse(
+        return ReleasingStreamingResponse(
             quota.metered(user.id, body, close=cleanup),
+            on_close=cleanup,
             media_type=media_type,
             headers=headers,
         )
-    except Exception:
-        quota.release_download_slot(user.id)
+    except BaseException:
+        release()
         raise
 
 

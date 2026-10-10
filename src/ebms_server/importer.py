@@ -15,7 +15,7 @@ import zipfile
 from collections import OrderedDict
 
 from . import constant
-from .db import Database
+from .db import AmbiguousSongError, Database
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,18 @@ ZIP_NAME_ENCODINGS = ("utf-8", "cp932", "cp949")
 def find_song_dirs(root: pathlib.Path) -> list[pathlib.Path]:
     """차트 파일이 바로 아래 있는 폴더 목록. 곡 폴더 안의 하위 폴더(bga 등)는 곡의 일부로 보고 더 들어가지 않습니다."""
     songs = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        if any(pathlib.Path(f).suffix.lower() in constant.BMS_FORMAT for f in filenames):
+    # 심볼릭 링크는 폴더·파일 모두 따라가지 않습니다(var/tmp 밖의 파일이 곡에 들어가지 않도록).
+    for dirpath, dirnames, filenames in os.walk(root):  # followlinks=False
+        if any(
+            pathlib.Path(f).suffix.lower() in constant.BMS_FORMAT and not os.path.islink(os.path.join(dirpath, f))
+            for f in filenames
+        ):
             songs.append(pathlib.Path(dirpath))
             dirnames.clear()
         else:
+            for name in [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+                logger.warning(f"import: skipped symlink[{os.path.join(dirpath, name)}]")
+                dirnames.remove(name)
             dirnames.sort()
     return songs
 
@@ -67,6 +74,9 @@ def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
     반환한 결과는 나중에 배치 커밋이 실패하면 "error"가 채워집니다."""
     try:
         info = batch.add(song_dir, remove=remove)
+    except AmbiguousSongError as e:
+        logger.warning(f"import skipped[{song_dir}]: {e}")
+        return {"folder": folder, "error": str(e)}
     except Exception as e:
         logger.exception(f"import failed[{song_dir}]")
         return {"folder": folder, "error": str(e) or type(e).__name__}
@@ -84,7 +94,9 @@ def import_tree(root: pathlib.Path, remove: bool, job: Job | None = None) -> lis
     root.mkdir(parents=True, exist_ok=True)
     song_dirs = []
     for child in sorted(root.iterdir()):
-        if child.is_dir():
+        if child.is_symlink():
+            logger.warning(f"import: skipped symlink[{child}]")
+        elif child.is_dir():
             song_dirs.extend(find_song_dirs(child))
     job.total = len(song_dirs)
     with Database().batch() as batch:
@@ -98,7 +110,12 @@ def import_tmp(job: Job | None = None) -> list[dict]:
     내부망에서 큰 zip을 웹 업로드 대신 서버에 직접 복사해 넣을 때 씁니다."""
     job = job or Job("tmp", "var/tmp")
     import_tree(constant.TMP_DIR, remove=True, job=job)
-    for path in sorted(p for p in constant.TMP_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".zip"):
+    zips = sorted(p for p in constant.TMP_DIR.iterdir() if p.suffix.lower() == ".zip")
+    for path in zips:
+        if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                logger.warning(f"import: skipped symlink[{path}]")
+            continue
         start = len(job.songs)
         try:
             import_zip(path, path.name, job)

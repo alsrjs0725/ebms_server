@@ -193,10 +193,10 @@ def test_a3_no_demotion_after_list_change(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
     assert me(client).is_admin
 
-    # ADMIN_EMAILS 목록에서 제외 후 재로그인하면 user로 강등됨
+    # ADMIN_EMAILS는 승격만 하므로 목록에서 빼도 재로그인으로 강등되지 않음(관리자 페이지에서 강등)
     monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
     oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
-    assert me(client).role == "user"
+    assert me(client).is_admin
 
 
 def test_a3_second_account_same_email_other_provider(client, monkeypatch):
@@ -212,10 +212,35 @@ def test_a3_second_account_same_email_other_provider(client, monkeypatch):
     assert user2.id != user1.id
     assert user2.is_admin
 
-    # 목록에서 빠지면 해당 계정으로 로그인 시 강등됨
+    # 목록에서 빠져도 로그인으로 강등되지 않음
     monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
     oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=True)
-    assert me(client).role == "user"
+    assert me(client).is_admin
+
+
+def test_admin_page_promotion_survives_login(client, monkeypatch):
+    """관리자 페이지에서 승격한 사용자는 다시 로그인해도 admin으로 남습니다(#79)."""
+    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
+    user_id = me(client).id
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE user SET role = 'admin' WHERE id = %s", (user_id,))
+        con.commit()
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
+    assert me(client).id == user_id
+    assert me(client).is_admin
+
+
+def test_env_admin_other_identity_keeps_admin(client, monkeypatch):
+    """EBMS_ADMIN_EMAILS 관리자가 이메일이 다른 연결된 수단으로 로그인해도 강등되지 않습니다(#79)."""
+    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    user_id = me(client).id
+    assert me(client).is_admin
+    oauth(client, monkeypatch, "discord", "d1", email="other@example.com", verified=True, link=True)
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "discord", "d1", email="other@example.com", verified=True)
+    assert me(client).id == user_id
+    assert me(client).is_admin
 
 
 def test_a3_link_promotes(client, monkeypatch):
@@ -351,3 +376,14 @@ def test_menu(client, monkeypatch):
     oauth(client, monkeypatch, "google", "a1", email="admin@example.com", name="Ad")
     for path in ("/", "/account", "/admin"):
         assert 'href="/admin"' in client.get(path).text, path
+
+
+def test_insecure_public_url():
+    """https가 아니고 루프백도 아닌 EBMS_PUBLIC_URL은 시작할 때 경고합니다(#28)."""
+    from ebms_server.main import insecure_public_url
+
+    assert insecure_public_url("http://example.com")
+    assert insecure_public_url("http://192.168.0.10:8000")
+    assert not insecure_public_url("https://ebms.example.com")
+    for url in ("http://localhost:8000", "http://127.0.0.1:1234", "http://[::1]:8000"):
+        assert not insecure_public_url(url), url

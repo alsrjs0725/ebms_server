@@ -8,7 +8,7 @@
 | `EBMS_SECRET_KEY` | 쿠키 서명용 임의 문자열. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 | `EBMS_GOOGLE_CLIENT_ID`, `EBMS_GOOGLE_CLIENT_SECRET` | Google OAuth 클라이언트 |
 | `EBMS_DISCORD_CLIENT_ID`, `EBMS_DISCORD_CLIENT_SECRET` | Discord OAuth 앱 |
-| `EBMS_ADMIN_EMAILS` | 이 이메일(OAuth가 확인한 것만)로 로그인하면 관리자로 지정. 쉼표로 구분 |
+| `EBMS_ADMIN_EMAILS` | 이 이메일(OAuth가 확인한 것만)로 로그인하면 관리자로 지정. 쉼표로 구분. 승격만 하므로 목록에서 빼도 강등되지 않음(관리자 페이지에서 강등) |
 
 ## Google
 
@@ -38,7 +38,7 @@
 
 - 처음 보는 OAuth 계정으로 로그인하면 새 계정을 만듭니다. 이메일이 같아도 자동으로 합치지 않으니, 다른 OAuth는 로그인한 상태에서 `/account`의 "연결"로 추가하세요.
 - 이미 다른 계정에 연결된 OAuth 계정은 연결할 수 없습니다(`409`).
-- `/api/account/*`는 세션(웹 쿠키 또는 클라이언트 세션키)이 없거나 만료되면 `401`입니다.
+- `/api/account/*`는 웹 세션(쿠키)으로만 쓸 수 있습니다. 세션이 없거나 만료되면 `401`, 클라이언트 세션키(Bearer)면 `403`입니다. 클라이언트는 자기 세션 로그아웃(`/api/auth/client/logout`)만 합니다.
 
 ## 클라이언트 로그인
 

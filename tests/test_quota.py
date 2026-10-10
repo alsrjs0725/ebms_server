@@ -387,6 +387,87 @@ def test_concurrent_downloads_limit(tmp_path, client, monkeypatch):
         quota.release_download_slot(user_id)
 
 
+def _slots(user_id):
+    return quota._download_tracker._counts.get(user_id, 0)
+
+
+def _serve(response, fail_at):
+    """응답을 ASGI로 보내되 fail_at번째 send에서 연결이 끊긴 것처럼 OSError를 냅니다."""
+    import anyio
+    import pytest
+    from starlette.requests import ClientDisconnect
+
+    sent = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if len(sent) == fail_at:
+            raise OSError("client gone")
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "GET"}
+    with pytest.raises(ClientDisconnect):
+        anyio.run(response, scope, receive, send)
+    return sent
+
+
+def test_download_slot_released_on_early_disconnect(tmp_path, client, monkeypatch):
+    """본문을 시작하기 전(http.response.start)이나 도중에 끊겨도 슬롯은 정확히 한 번 반납됩니다."""
+    from starlette.requests import Request
+
+    from ebms_server import downloads
+    from ebms_server.accounts import User
+
+    key, user_id = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    user = User(user_id, "Alice", None, "user", "active")
+    request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
+
+    # 다른 다운로드 하나가 슬롯을 쥐고 있는 상태. 반납이 두 번 되면 이 슬롯까지 빠집니다.
+    assert quota.acquire_download_slot(user_id)
+    try:
+        def responses():
+            yield downloads.blob_response(request, "song", 1, "1.zip", "x", user_id=user_id)
+            yield downloads.blob_response(request, "chart_chunk", 0, "c.zip", "x", user_id=user_id, meter_user=user_id)
+            yield downloads.pre_song_file(1, "banner.jpg", request, user)
+
+        for fail_at in (0, 1):  # 0: 시작 전, 1: 본문 첫 조각에서
+            for response in responses():
+                assert _slots(user_id) == 2
+                _serve(response, fail_at)
+                assert _slots(user_id) == 1, fail_at
+
+        # 새지 않았으므로 한도까지 다시 잡을 수 있습니다.
+        for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER - 1):
+            assert quota.acquire_download_slot(user_id) is True
+        assert quota.acquire_download_slot(user_id) is False
+    finally:
+        quota._download_tracker._counts.pop(user_id, None)
+
+
+def test_metered_closes_when_limits_lookup_fails(monkeypatch):
+    """한도 조회에서 예외가 나도 close가 불립니다."""
+    import anyio
+    import pytest
+
+    closed = []
+
+    def boom(user_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(quota, "limits_for", boom)
+
+    async def run():
+        async for _ in quota.metered("u", iter([b"x"]), close=lambda: closed.append(1)):
+            pass
+
+    with pytest.raises(RuntimeError):
+        anyio.run(run)
+    assert closed == [1]
+
+
 def test_min_throttled_kbps_validation():
     import pytest
     with pytest.raises(ValueError, match="pre_throttled_kbps must be between 64 and"):

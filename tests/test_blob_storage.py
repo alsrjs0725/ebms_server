@@ -86,14 +86,23 @@ def test_insert_and_download_roundtrip(tmp_path, client):
         assert zf.read(f"{sha(chart_b)}.bme") == chart_b
 
     # 같은 chart를 가진 곡은 기존 song에 연결되고 chunk에 중복 추가되지 않습니다.
+    # 기존 곡 zip에 없는 파일(c.bms)은 더하고, 같은 경로에 내용이 다른 파일은 기존 것을 둡니다.
     chart_c = b"#TITLE C\n"
     song2 = make_song(tmp_path, "song2", {"a.bms": chart_a, "c.bms": chart_c})
-    Database().insert_song(song2)
+    info = Database().insert_song(song2)
+    assert info["song_id"] == 1 and not info["new_song"]
+    assert info["added_files"] == ["c.bms"]
+    assert info["conflicts"] == ["bga/movie.bin", "sound.wav"]
     with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/chart/0").content)) as zf:
         assert sorted(zf.namelist()) == sorted(
             [f"{sha(chart_a)}.bms", f"{sha(chart_b)}.bme", f"{sha(chart_c)}.bms"]
         )
-    assert client.get("/api/play/song/1").content == res.content
+    merged = client.get("/api/play/song/1").content
+    with zipfile.ZipFile(io.BytesIO(merged)) as zf, zipfile.ZipFile(io.BytesIO(res.content)) as old:
+        assert sorted(zf.namelist()) == sorted(old.namelist() + ["c.bms"])
+        assert zf.read("c.bms") == chart_c
+        for name in old.namelist():
+            assert zf.read(name) == old.read(name)
 
 
 def test_chunk_rollover(tmp_path, client, monkeypatch):

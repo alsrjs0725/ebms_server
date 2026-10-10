@@ -167,6 +167,29 @@ def test_revoke_client_session_from_account(client, monkeypatch):
     assert client.get("/api/me", headers={"Authorization": f"Bearer {key}"}).status_code == 401
 
 
+def test_client_session_cannot_modify_account(client, monkeypatch):
+    """클라이언트 세션키(Bearer)로는 로그인 수단 해제·기기 로그아웃을 할 수 없습니다(#29)."""
+    key, user_id = client_login(client, monkeypatch)
+    oauth(client, monkeypatch, "discord", "d1", name="Alice", link=True)
+    identities = accounts.list_identities(user_id)
+    assert len(identities) == 2
+    sessions = accounts.list_sessions(user_id)
+    web_id = next(s.id for s in sessions if s.kind == "web")
+    client_id = next(s.id for s in sessions if s.kind == "client")
+    h = {"Authorization": f"Bearer {key}"}
+
+    assert client.delete(f"/api/account/identities/{identities[0].id}", headers=h).status_code == 403
+    for session_id in (web_id, client_id):
+        assert client.delete(f"/api/account/sessions/{session_id}", headers=h).status_code == 403
+    assert client.delete("/api/account/sessions/1", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert len(accounts.list_identities(user_id)) == 2
+    assert {s.id for s in accounts.list_sessions(user_id)} == {s.id for s in sessions}
+
+    # 웹 세션(쿠키)으로는 됩니다.
+    assert client.delete(f"/api/account/identities/{identities[-1].id}").status_code == 204
+    assert len(accounts.list_identities(user_id)) == 1
+
+
 def test_version_lists_oauths(client, monkeypatch):
     assert client.get("/api/version").json()["auth"] == ["google", "discord"]
     monkeypatch.setattr(constant, "DISCORD_CLIENT_ID", "")

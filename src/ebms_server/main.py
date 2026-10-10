@@ -3,6 +3,7 @@ import logging
 import logging.handlers
 import shutil
 import threading
+import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
@@ -45,6 +46,15 @@ def backfill_pre_chunks() -> None:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
 
 
+def insecure_public_url(url: str) -> bool:
+    """EBMS_PUBLIC_URL이 https가 아니고 localhost(루프백)도 아니면 True.
+    이 경우 세션 쿠키·OAuth 코드·클라이언트 세션키가 암호화 없이 오갑니다."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https":
+        return False
+    return parts.hostname not in ("localhost", "127.0.0.1", "::1")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -55,6 +65,11 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=backfill_pre_chunks, name="backfill_pre_chunks", daemon=True).start()
     if not constant.SECRET_KEY:
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
+    if insecure_public_url(constant.PUBLIC_URL):
+        logging.getLogger(__name__).warning(
+            f"EBMS_PUBLIC_URL({constant.PUBLIC_URL}) is not https. Sessions and login codes are sent in plain text. "
+            "Put the server behind a TLS reverse proxy and set an https:// URL (docs/deployment.md)."
+        )
     if not auth.configured_oauths():
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     # 이전 실행에서 임포트 도중 꺼졌다면 남은 임시 폴더를 지운다

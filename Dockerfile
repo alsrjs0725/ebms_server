@@ -24,6 +24,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/version', timeout=3)" || exit 1
 
-CMD ["fastapi", "run", "--entrypoint", "ebms_server.main:app", \
-     "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--forwarded-allow-ips", "*"]
+# 프록시 헤더(X-Forwarded-*)는 EBMS_FORWARDED_ALLOW_IPS(쉼표 구분, 기본 127.0.0.1)에서 온 요청만 믿습니다.
+# 앞단 TLS 리버스 프록시의 주소(docker 브리지 게이트웨이 등)로 맞추세요(docs/deployment.md).
+ENV EBMS_FORWARDED_ALLOW_IPS=127.0.0.1
+CMD ["sh", "-c", "exec fastapi run --entrypoint ebms_server.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

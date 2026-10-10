@@ -101,8 +101,9 @@ def test_import_zip(client, monkeypatch):
     assert multi["status"] == "done" and multi["error"] is None
     assert multi["songs"] == [
         {"folder": "multi/pack/曲1", "song_id": 2, "new_song": True, "charts": 1, "new_charts": 1},
-        # 같은 차트(a.bms)가 있어 기존 곡 1에 연결됩니다.
-        {"folder": "multi/pack/曲2", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1},
+        # 같은 차트(a.bms)가 있어 기존 곡 1에 연결되고, 곡 1의 zip에 없는 파일은 그 zip에 더합니다.
+        {"folder": "multi/pack/曲2", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1,
+         "added_files": ["c.bms", "c2.bms"]},
     ]
 
     bad = upload(client, "bad.zip", b"not a zip")
@@ -177,3 +178,59 @@ def test_safe_parts():
     assert importer._safe_parts("a\\.\\b.bms") == ["a", "b.bms"]
     for bad in ("/etc/x", "../x", "a/../../x", "C:/x", "C:x"):
         assert importer._safe_parts(bad) is None, bad
+
+
+def test_import_tmp_skips_symlinks(client, monkeypatch, tmp_path):
+    """곡 폴더 안의 심볼릭 링크(파일·폴더)는 따라가지 않고 건너뜁니다(#56)."""
+    admin_login(client, monkeypatch)
+    outside = tmp_path / "outside"
+    (outside / "dir").mkdir(parents=True)
+    secret = b"EBMS_SECRET_KEY=leaked"
+    (outside / "secret.txt").write_bytes(secret)
+    (outside / "dir" / "inner.wav").write_bytes(secret)
+    (outside / "song").mkdir()
+    (outside / "song" / "o.bms").write_bytes(b"#TITLE OUT\n")
+
+    song = constant.TMP_DIR / "group" / "s1"
+    song.mkdir(parents=True)
+    (song / "a.bms").write_bytes(b"#TITLE T\n")
+    (song / "real.wav").write_bytes(b"wav")
+    os.symlink(outside / "secret.txt", song / "leak.ogg")
+    os.symlink(outside / "secret.txt", song / "z.bms")
+    os.symlink(outside / "dir", song / "bga")
+    # 차트가 링크뿐인 폴더는 곡이 아닙니다.
+    only_link = constant.TMP_DIR / "group" / "s2"
+    only_link.mkdir()
+    os.symlink(outside / "song" / "o.bms", only_link / "o.bms")
+    # var/tmp 바로 아래의 폴더 링크도 따라가지 않습니다.
+    os.symlink(outside / "song", constant.TMP_DIR / "linked")
+    os.symlink(outside / "secret.txt", constant.TMP_DIR / "linked.zip")
+
+    job = wait(client, client.post("/api/admin/import/tmp").json())
+    assert job["songs"] == [{"folder": "group/s1", "song_id": 1, "new_song": True, "charts": 1, "new_charts": 1}]
+    with zipfile.ZipFile(io.BytesIO(db_module.Database().get_song_data(1))) as zf:
+        assert sorted(zf.namelist()) == ["a.bms", "real.wav"]
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT data FROM chart_chunk")
+        assert all(secret not in row[0] for row in cur.fetchall())
+        cur.execute("SELECT COUNT(*) FROM chart")
+        assert cur.fetchone()[0] == 1
+    # 링크 대상은 지우지 않습니다.
+    assert (outside / "secret.txt").read_bytes() == secret
+    assert (outside / "song" / "o.bms").exists()
+
+
+def test_create_zip_skips_symlinks(tmp_path):
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"secret")
+    song = tmp_path / "song"
+    (song / "sub").mkdir(parents=True)
+    (song / "a.bms").write_bytes(b"#TITLE\n")
+    (song / "sub" / "x.wav").write_bytes(b"x")
+    os.symlink(outside, song / "leak.ogg")
+    os.symlink(outside, song / "sub" / "leak.wav")
+    os.symlink(tmp_path, song / "up")
+    data = db_module.Database.create_zip(None, song)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert sorted(zf.namelist()) == ["a.bms", "sub/x.wav"]
+    assert [p.name for p in db_module.chart_files(song)] == ["a.bms"]

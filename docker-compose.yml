@@ -46,8 +46,11 @@ services:
       EBMS_DISCORD_CLIENT_ID: ${EBMS_DISCORD_CLIENT_ID:-}
       EBMS_DISCORD_CLIENT_SECRET: ${EBMS_DISCORD_CLIENT_SECRET:-}
       EBMS_ADMIN_EMAILS: ${EBMS_ADMIN_EMAILS:-}
+      # 프록시 헤더를 믿을 앞단 프록시 주소(쉼표 구분). 호스트의 프록시는 docker 브리지 게이트웨이로 보입니다.
+      EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
-      - "${EBMS_PORT:-8000}:8000"
+      # 평문 HTTP이므로 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
+      - "127.0.0.1:${EBMS_PORT:-8000}:8000"
     volumes:
       # 로그·임포트 대기 폴더. EBMS_VAR_DIR로 위치 변경
       - ${EBMS_VAR_DIR:-ebms-var}:/app/var
