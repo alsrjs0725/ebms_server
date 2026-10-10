@@ -924,62 +924,95 @@ class Database:
     def backfill_manifest(self) -> None:
         """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
         원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다. 항목에 kind(pre/play)가 없는 곡도 다시 채웁니다.
-        또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다."""
-        with self._write_lock, connect() as con, con.cursor() as cur:
-            try:
-                # 1) 기존 song.data BLOB을 song_part로 마이그레이션
-                cur.execute("SELECT id, data FROM song WHERE data IS NOT NULL")
-                rows = cur.fetchall()
-                for song_id, song_data in rows:
-                    if song_data is not None:
+        또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다.
+
+        서버 시작 때 실행하므로 곡마다 예외를 잡아 로그를 남기고 건너뜁니다(손상된 zip 하나가 시작을 막지 않게, #45).
+        BACKFILL_BATCH_SONGS곡마다 커밋하고, 건너뛴 곡은 다음 시작 때 다시 시도합니다."""
+        # 1) 기존 song.data BLOB을 song_part로 마이그레이션(곡마다 커밋)
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM song WHERE data IS NOT NULL ORDER BY id")
+            legacy_ids = [row[0] for row in cur.fetchall()]
+        for song_id in legacy_ids:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT data FROM song WHERE id = %s AND data IS NOT NULL", (song_id,))
+                    row = cur.fetchone()
+                    if row is not None:
                         step = constant.BLOB_READ_SIZE
-                        for seq, pos in enumerate(range(0, len(song_data), step)):
-                            part = song_data[pos : pos + step]
+                        for seq, pos in enumerate(range(0, len(row[0]), step)):
                             cur.execute(
                                 "INSERT IGNORE INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
-                                (song_id, seq, part),
+                                (song_id, seq, row[0][pos : pos + step]),
                             )
                         cur.execute("UPDATE song SET data = NULL WHERE id = %s", (song_id,))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    self.logger.exception(f"backfill_manifest: Skipped moving song[{song_id}] data to song_part")
 
-                cur.execute(
-                    "SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s OR files NOT LIKE %s ORDER BY id",
-                    ('%"kind"%', '%"data_offset"%'),
-                )
-                song_ids_no_files = set(row[0] for row in cur.fetchall())
+        # 2) 매니페스트 항목·차트 파일명 채우기
+        with connect() as con, con.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s OR files NOT LIKE %s ORDER BY id",
+                ('%"kind"%', '%"data_offset"%'),
+            )
+            song_ids_no_files = set(row[0] for row in cur.fetchall())
+            cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
+            song_ids_no_filenames = set(row[0] for row in cur.fetchall())
 
-                cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
-                song_ids_no_filenames = set(row[0] for row in cur.fetchall())
-
-                affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
-                if affected_song_ids:
-                    for song_id in affected_song_ids:
-                        song_data = self._get_song_data_with_cur(cur, song_id)
-                        if not song_data:
-                            continue
-                        if song_id in song_ids_no_files:
-                            files = zip_entries(song_data)
-                            cur.execute(
-                                "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
-                                (str(song_id), json.dumps(files), song_id),
+        affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
+        updated = failed = 0
+        step = constant.BACKFILL_BATCH_SONGS
+        for i in range(0, len(affected_song_ids), step):
+            batch = affected_song_ids[i : i + step]
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    done = []
+                    for song_id in batch:
+                        cur.execute("SAVEPOINT song")
+                        try:
+                            self._backfill_song_manifest(
+                                cur, song_id, song_id in song_ids_no_files, song_id in song_ids_no_filenames
                             )
-                        if song_id in song_ids_no_filenames:
-                            with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
-                                for info in zf.infolist():
-                                    if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
-                                        content = zf.read(info)
-                                        sha256 = hashlib.sha256(content).hexdigest()
-                                        cur.execute(
-                                            "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
-                                            (info.filename, song_id, sha256),
-                                        )
-                    for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
+                            cur.execute("RELEASE SAVEPOINT song")
+                            done.append(song_id)
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT song")
+                            failed += 1
+                            self.logger.exception(f"backfill_manifest: Skipped song[{song_id}]")
+                    for chunk_no in sorted({s // constant.SONGS_PER_MANIFEST_CHUNK for s in done}):
                         self._rebuild_manifest_chunk(cur, chunk_no)
-                con.commit()
-            except Exception:
-                con.rollback()
-                raise
-            if affected_song_ids:
-                self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
+                    con.commit()
+                    updated += len(done)
+                except Exception:
+                    con.rollback()
+                    failed += len(batch)
+                    self.logger.exception(f"backfill_manifest: Skipped songs {batch[0]}..{batch[-1]}")
+        if updated:
+            self.logger.info(f"backfill_manifest: Updated manifest of {updated} songs.")
+        if failed:
+            self.logger.warning(f"backfill_manifest: {failed} songs failed. Retrying on next start.")
+
+    def _backfill_song_manifest(self, cur, song_id: int, fill_files: bool, fill_filenames: bool) -> None:
+        """곡 하나의 매니페스트 항목(fill_files)·차트 파일명(fill_filenames)을 song zip에서 채웁니다."""
+        song_data = self._get_song_data_with_cur(cur, song_id)
+        if not song_data:
+            return
+        if fill_files:
+            files = zip_entries(song_data)
+            cur.execute(
+                "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
+                (str(song_id), json.dumps(files), song_id),
+            )
+        if fill_filenames:
+            with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
+                for info in zf.infolist():
+                    if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
+                        sha256 = hashlib.sha256(zf.read(info)).hexdigest()
+                        cur.execute(
+                            "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
+                            (info.filename, song_id, sha256),
+                        )
 
     def backfill_file_kinds(self) -> int:
         """pre/play 판정 규칙(FILE_KINDS_VERSION)이 바뀌었으면 기존 곡의 kind를 다시 판정합니다. kind가 바뀐 곡 수를 반환합니다.
@@ -1020,10 +1053,11 @@ class Database:
                         cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
                         cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
                     con.commit()
+                    changed += len(batch_changed)
                 except Exception:
                     con.rollback()
-                    raise
-            changed += len(batch_changed)
+                    failed += 1
+                    self.logger.exception(f"backfill_file_kinds: Skipped songs from song[{song_ids[i]}]")
 
         if failed:
             self.logger.warning(f"backfill_file_kinds: {failed} songs failed. Retrying on next start.")
