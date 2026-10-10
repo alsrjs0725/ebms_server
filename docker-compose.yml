@@ -50,6 +50,13 @@ services:
       EBMS_DOWNLOAD_THREADS: ${EBMS_DOWNLOAD_THREADS:-16}
       # 프록시 헤더를 믿을 앞단 프록시 주소(쉼표 구분). 호스트의 프록시는 docker 브리지 게이트웨이로 보입니다.
       EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # S3 호환 스토리지 캐시. EBMS_S3_BUCKET이 비면 꺼짐(.env.example 참고)
+      EBMS_S3_ENDPOINT: ${EBMS_S3_ENDPOINT:-}
+      EBMS_S3_BUCKET: ${EBMS_S3_BUCKET:-}
+      EBMS_S3_ACCESS_KEY_ID: ${EBMS_S3_ACCESS_KEY_ID:-}
+      EBMS_S3_SECRET_ACCESS_KEY: ${EBMS_S3_SECRET_ACCESS_KEY:-}
+      EBMS_S3_REGION: ${EBMS_S3_REGION:-auto}
+      EBMS_S3_CACHE_BYTES: ${EBMS_S3_CACHE_BYTES:-0}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로

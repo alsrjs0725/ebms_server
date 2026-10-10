@@ -4,6 +4,7 @@
 - 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안 같은 곡은 재차감 없음), 티켓이 없으면 429.
 """
 import gzip
+import logging
 import mimetypes
 import re
 import struct
@@ -15,15 +16,16 @@ from typing import Annotated
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from . import constant, quota
+from . import constant, quota, s3cache
 from .accounts import User
 from .auth import current_user
 from .db import BlobReader, Database
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
@@ -121,7 +123,14 @@ def blob_response(
     user_id: 동시 다운로드 수를 제한할 사용자 ID.
     before_send: 본문(200/206)을 보내기로 정한 뒤 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
     meter_user: 주면 보낸 바이트를 그 사용자의 사전 다운로드 사용량에 더하고 한도를 넘으면 감속합니다.
+
+    S3 캐시(s3cache)가 켜져 있으면 본문 대신 버킷의 presigned URL로 302 리다이렉트합니다(redirect_response).
     """
+    cache = s3cache.get()
+    if cache is not None:
+        return redirect_response(
+            cache, request, table, row_id, detail, before_send=before_send, meter_user=meter_user
+        )
     if user_id and not quota.acquire_download_slot(user_id):
         raise HTTPException(status_code=429, detail="too many concurrent downloads")
     release = _once(lambda: quota.release_download_slot(user_id) if user_id else None)
@@ -198,6 +207,42 @@ def blob_response(
     except BaseException:
         release()
         raise
+
+
+def redirect_response(
+    cache: s3cache.S3Cache,
+    request: Request,
+    table: str,
+    row_id: int,
+    detail: str,
+    *,
+    before_send: Callable[[], None] | None = None,
+    meter_user: str | None = None,
+) -> Response:
+    """버킷의 presigned URL로 302 리다이렉트합니다. Range·If-Range는 클라이언트가 리다이렉트를 따라가며 버킷에 그대로 보냅니다.
+
+    버킷에 없으면 올리고, 기다리는 시간 안에 못 올리면 503 + Retry-After입니다(티켓은 먼저 쓰고, grant 안의 재요청은 차감 없음).
+    사전 다운로드 사용량은 URL을 줄 때 파일 크기만큼 더하고, 감속은 하지 않습니다.
+    """
+    blob = Database().open_blob(table, row_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail=detail)
+    etag = f'"{blob.sha256}"'
+    headers = {"ETag": etag, "X-Content-SHA256": blob.sha256, "Cache-Control": "no-store"}
+    if _not_modified(request, etag):
+        return Response(status_code=304, headers=headers)
+    if before_send is not None:
+        before_send()
+    try:
+        url = cache.url(table, blob)
+    except Exception:
+        logger.exception(f"s3 upload failed: {table} {row_id}")
+        raise HTTPException(status_code=502, detail="storage upload failed")
+    if url is None:
+        raise HTTPException(status_code=503, detail="preparing download", headers={"Retry-After": "5"})
+    if meter_user is not None:
+        quota.add_pre_usage(meter_user, blob.size)
+    return RedirectResponse(url, status_code=302, headers=headers)
 
 
 def manifest_response(request: Request, chunk_id: int, meter_user: str | None = None) -> Response:

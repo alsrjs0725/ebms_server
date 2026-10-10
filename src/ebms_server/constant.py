@@ -42,6 +42,23 @@ DB_POOL_SIZE = int(os.environ.get("EBMS_DB_POOL_SIZE", "32"))
 # 클라이언트가 보낼 수 있는 최대 패킷 크기. 서버의 max_allowed_packet과 맞춥니다.
 DB_MAX_ALLOWED_PACKET = 1024 * 1024 * 1024
 
+# S3 호환 스토리지(R2·MinIO·B2·AWS 등) 앞단 캐시. EBMS_S3_BUCKET을 비우면 끄고 지금처럼 서버가 직접 보냅니다.
+# 켜면 원본은 MySQL에 그대로 두고, 곡 zip·차트 청크·사전 청크를 버킷에 올린 뒤 presigned URL로 302 리다이렉트합니다.
+S3_ENDPOINT = os.environ.get("EBMS_S3_ENDPOINT", "").rstrip("/")
+S3_BUCKET = os.environ.get("EBMS_S3_BUCKET", "")
+S3_ACCESS_KEY_ID = os.environ.get("EBMS_S3_ACCESS_KEY_ID", "")
+S3_SECRET_ACCESS_KEY = os.environ.get("EBMS_S3_SECRET_ACCESS_KEY", "")
+# R2는 auto
+S3_REGION = os.environ.get("EBMS_S3_REGION", "auto")
+# 버킷에 둘 바이트 상한. 넘으면 곡 zip을 오래 안 쓴 것부터 지웁니다(차트·사전 청크는 지우지 않음). 0이면 지우지 않습니다(전체 저장).
+S3_CACHE_BYTES = int(os.environ.get("EBMS_S3_CACHE_BYTES", "0"))
+# presigned URL 유효시간(초). 이 시간 안에 받은 객체는 지우지 않습니다.
+S3_URL_SECONDS = int(os.environ.get("EBMS_S3_URL_SECONDS", "600"))
+# 버킷에 없을 때 올리기를 기다리는 시간(초). 넘으면 503 + Retry-After로 다시 오게 합니다(클라이언트 읽기 제한 30초보다 짧게).
+S3_UPLOAD_WAIT_SECONDS = float(os.environ.get("EBMS_S3_UPLOAD_WAIT_SECONDS", "20"))
+# 동시에 올리는 수
+S3_UPLOAD_THREADS = int(os.environ.get("EBMS_S3_UPLOAD_THREADS", "2"))
+
 # 로그인/세션. docker compose에서는 .env 값을 environment로 넘깁니다.
 # 외부에서 접속하는 서버 주소. OAuth 리다이렉트 주소(<PUBLIC_URL>/auth/<oauth>/callback)를 만드는 데 씁니다.
 PUBLIC_URL = os.environ.get("EBMS_PUBLIC_URL", "http://localhost:8000").rstrip("/")

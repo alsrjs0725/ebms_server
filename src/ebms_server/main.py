@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, auth, constant, downloads, importer, notices
+from . import admin, auth, constant, downloads, importer, notices, s3cache
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -44,6 +44,13 @@ def backfill_pre_chunks() -> None:
         Database().backfill_pre_chunks()
     except Exception:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+    # S3 캐시가 켜져 있으면 차트·사전 청크를 버킷에 미리 올려 둔다(모든 사용자가 동기화할 때 받음).
+    cache = s3cache.get()
+    if cache is not None:
+        try:
+            cache.prewarm()
+        except Exception:
+            logging.getLogger(__name__).exception("s3 prewarm failed")
 
 
 def insecure_public_url(url: str) -> bool:
@@ -69,6 +76,10 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning(
             f"EBMS_PUBLIC_URL({constant.PUBLIC_URL}) is not https. Sessions and login codes are sent in plain text. "
             "Put the server behind a TLS reverse proxy and set an https:// URL (docs/deployment.md)."
+        )
+    if s3cache.enabled():
+        logging.getLogger(__name__).info(
+            f"S3 cache enabled: bucket={constant.S3_BUCKET} cache_bytes={constant.S3_CACHE_BYTES or 'unlimited'}"
         )
     if not auth.configured_oauths():
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")

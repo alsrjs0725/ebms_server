@@ -211,6 +211,18 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # S3 호환 스토리지 캐시(s3cache)에 올린 객체. kind는 song/chart/pre, last_access는 마지막으로 URL을 준 시각입니다.
+    """
+        CREATE TABLE IF NOT EXISTS s3_object(
+            object_key VARCHAR(255) NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            row_id INT UNSIGNED NOT NULL,
+            size BIGINT UNSIGNED NOT NULL,
+            last_access BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (object_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 클라이언트에 띄울 공지. starts_at·ends_at이 NULL이면 제한 없음입니다.
     """
         CREATE TABLE IF NOT EXISTS notice(
