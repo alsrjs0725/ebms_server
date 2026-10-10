@@ -4,6 +4,7 @@ import gzip
 import json
 import pathlib
 import posixpath
+import re
 import hashlib
 import logging
 import shutil
@@ -167,6 +168,7 @@ SCHEMA = [
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 할당량 전역 기본값. 관리자 페이지에서 수정합니다. 값은 정수 문자열입니다.
+    # 서버 내부 값(file_kinds_version)도 여기 둡니다.
     """
         CREATE TABLE IF NOT EXISTS setting(
             name VARCHAR(64) NOT NULL,
@@ -239,62 +241,96 @@ MISSING_COLUMNS = [
 ]
 
 
-# 사전 파일을 가리키는 차트 헤더와, 파일 확장자가 달라도 같은 파일로 보는 종류(BMS 플레이어의 확장자 대체)
+# 사전 파일을 가리키는 차트 헤더와 그 헤더가 받는 형식. 헤더 값의 확장자가 이 형식일 때만 인정하고,
+# 실제 파일 확장자가 달라도 같은 형식 안이면 같은 파일로 봅니다(BMS 플레이어의 확장자 대체).
 PRE_HEADERS = {
     b"#BANNER": constant.IMAGE_FORMAT,
     b"#STAGEFILE": constant.IMAGE_FORMAT,
     b"#BACKBMP": constant.IMAGE_FORMAT,
     b"#PREVIEW": constant.AUDIO_FORMAT,
 }
+# 키음(#WAVxx)·BGA(#BMPxx) 정의. 여기서 가리키는 파일은 사전 헤더가 함께 가리키지 않는 한 pre가 아닙니다.
+PLAY_HEADER = re.compile(rb"#(?:WAV|BMP)[0-9A-Z]{2}[ \t]", re.IGNORECASE)
 # 차트 헤더 값(파일명)의 인코딩 후보
 CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
+# pre/play 판정 규칙 버전. 규칙을 바꾸면 올리고, 서버 시작 시 이전 규칙으로 판정한 곡을 다시 판정합니다.
+FILE_KINDS_VERSION = 2
+# FILE_KINDS_VERSION을 적용한 버전을 저장하는 setting 이름
+FILE_KINDS_SETTING = "file_kinds_version"
 
 
-def _header_targets(chart: bytes, base: str) -> list[tuple[str, tuple[str, ...]]]:
-    """차트 헤더가 가리키는 파일의 (소문자 경로, 대체 가능한 확장자)를 반환합니다. base는 차트가 있는 폴더입니다."""
-    targets = []
+def _header_paths(value: bytes, base: str) -> list[str]:
+    """차트 헤더 값을 인코딩 후보마다 풀어 base 기준 소문자 경로로 만듭니다."""
+    paths = []
+    for encoding in CHART_ENCODINGS:
+        try:
+            name = value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        paths.append(posixpath.normpath(posixpath.join(base, name.replace("\\", "/"))).lower())
+    return paths
+
+
+def _chart_refs(chart: bytes, base: str) -> tuple[list[tuple[str, tuple[str, ...]]], set[str]]:
+    """차트가 가리키는 파일. (사전 헤더의 (소문자 경로, 대체 가능한 확장자) 목록, 키음·BGA의 소문자 확장자 뺀 경로)를
+    반환합니다. 사전 헤더 값의 확장자가 그 헤더의 형식이 아니면(확장자 없음 포함) 무시합니다. base는 차트가 있는 폴더입니다."""
+    pre_targets = []
+    play_stems = set()
     for line in chart.splitlines():
         line = line.strip()
+        if PLAY_HEADER.match(line):
+            for path in _header_paths(line[6:].strip(), base):
+                play_stems.add(posixpath.splitext(path)[0])
+            continue
         for header, formats in PRE_HEADERS.items():
             if line[:len(header)].upper() != header or line[len(header):len(header) + 1] not in (b" ", b"\t"):
                 continue
-            value = line[len(header):].strip()
-            for encoding in CHART_ENCODINGS:
-                try:
-                    name = value.decode(encoding)
-                except UnicodeDecodeError:
-                    continue
-                path = posixpath.normpath(posixpath.join(base, name.replace("\\", "/"))).lower()
-                targets.append((path, formats))
-    return targets
+            for path in _header_paths(line[len(header):].strip(), base):
+                if posixpath.splitext(path)[1] in formats:
+                    pre_targets.append((path, formats))
+    return pre_targets, play_stems
+
+
+def kinds_from_charts(paths: list[str], charts: dict[str, bytes]) -> dict[str, str]:
+    """곡 zip 항목별 다운로드 구분. paths는 파일 경로, charts는 그중 차트 파일의 {경로: 내용}입니다.
+
+    pre(사전): 차트, 차트 헤더 #BANNER·#STAGEFILE·#BACKBMP(이미지)·#PREVIEW(오디오)가 가리키는 파일,
+    차트와 같은 폴더의 preview*로 시작하는 오디오 파일(키음·BGA로 쓰는 파일 제외).
+    play(플레이): 나머지(키음, BGA 등).
+    """
+    by_stem: dict[str, set[str]] = defaultdict(set)
+    play_stems: set[str] = set()
+    chart_dirs: set[str] = set()
+    for path, content in charts.items():
+        base = posixpath.dirname(path)
+        chart_dirs.add(base.lower())
+        targets, stems = _chart_refs(content, base)
+        for target, formats in targets:
+            by_stem[posixpath.splitext(target)[0]].update(formats)
+        play_stems |= stems
+
+    kinds = {}
+    for path in paths:
+        lower = path.lower()
+        stem, ext = posixpath.splitext(lower)
+        preview = (
+            posixpath.basename(lower).startswith("preview")
+            and ext in constant.AUDIO_FORMAT
+            and posixpath.dirname(lower) in chart_dirs
+            and stem not in play_stems
+        )
+        pre = ext in constant.BMS_FORMAT or ext in by_stem.get(stem, ()) or preview
+        kinds[path] = "pre" if pre else "play"
+    return kinds
 
 
 def file_kinds(zf: zipfile.ZipFile) -> dict[str, str]:
-    """곡 zip 항목별 다운로드 구분. pre(사전): 차트, 차트 헤더 #BANNER·#STAGEFILE·#BACKBMP·#PREVIEW가
-    가리키는 파일, preview*로 시작하는 파일. play(플레이): 나머지(키음, BGA 등)."""
-    infos = [info for info in zf.infolist() if not info.is_dir()]
-    exact: set[str] = set()
-    by_stem: dict[str, set[str]] = defaultdict(set)
-    for info in infos:
-        path = pathlib.PurePosixPath(info.filename)
-        if path.suffix.lower() not in constant.BMS_FORMAT:
-            continue
-        for target, formats in _header_targets(zf.read(info), path.parent.as_posix()):
-            exact.add(target)
-            by_stem[posixpath.splitext(target)[0]].update(formats)
-
-    kinds = {}
-    for info in infos:
-        lower = info.filename.lower()
-        stem, ext = posixpath.splitext(lower)
-        pre = (
-            ext in constant.BMS_FORMAT
-            or posixpath.basename(lower).startswith("preview")
-            or lower in exact
-            or ext in by_stem.get(stem, ())
-        )
-        kinds[info.filename] = "pre" if pre else "play"
-    return kinds
+    """곡 zip 항목별 다운로드 구분(kinds_from_charts 참고)."""
+    paths = [info.filename for info in zf.infolist() if not info.is_dir()]
+    charts = {
+        path: zf.read(path) for path in paths if pathlib.PurePosixPath(path).suffix.lower() in constant.BMS_FORMAT
+    }
+    return kinds_from_charts(paths, charts)
 
 
 def zip_entries(data: bytes) -> list[dict]:
@@ -564,6 +600,7 @@ class Database:
         self.logger = logging.getLogger(__name__)
         self.generate_database()
         self.backfill_manifest()
+        self.backfill_file_kinds()
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT @@max_allowed_packet")
             self.max_allowed_packet = cur.fetchone()[0]
@@ -870,6 +907,81 @@ class Database:
                 raise
             if affected_song_ids:
                 self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
+
+    def backfill_file_kinds(self) -> int:
+        """pre/play 판정 규칙(FILE_KINDS_VERSION)이 바뀌었으면 기존 곡의 kind를 다시 판정합니다. kind가 바뀐 곡 수를 반환합니다.
+
+        곡 zip 전체를 읽지 않고 매니페스트의 항목 목록과 차트 파일만 읽어 판정합니다. kind가 바뀐 곡은 같은 트랜잭션에서
+        매니페스트 청크를 다시 만들고, 사전 청크는 지워 backfill_pre_chunks가 새 규칙으로 다시 만들게 합니다
+        (그동안 클라이언트는 파일별 사전 API로 받고, 이 API도 새 kind를 봅니다).
+        BACKFILL_BATCH_SONGS곡마다 커밋합니다. 판정하지 못한 곡은 로그를 남기고 건너뛰며, 그때는 버전을 올리지 않아
+        다음 시작 때 다시 시도합니다.
+        """
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT value FROM setting WHERE name = %s", (FILE_KINDS_SETTING,))
+            row = cur.fetchone()
+            if row is not None and int(row[0]) >= FILE_KINDS_VERSION:
+                return 0
+            cur.execute("SELECT id FROM song ORDER BY id")
+            song_ids = [r[0] for r in cur.fetchall()]
+
+        changed = failed = 0
+        step = constant.BACKFILL_BATCH_SONGS
+        for i in range(0, len(song_ids), step):
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    batch_changed = []
+                    for song_id in song_ids[i : i + step]:
+                        try:
+                            files = self._recompute_kinds(cur, song_id)
+                        except Exception:
+                            self.logger.exception(f"backfill_file_kinds: Skipped song[{song_id}]")
+                            failed += 1
+                            continue
+                        if files is not None:
+                            cur.execute("UPDATE song SET files = %s WHERE id = %s", (json.dumps(files), song_id))
+                            batch_changed.append(song_id)
+                    for chunk_no in sorted({s // constant.SONGS_PER_MANIFEST_CHUNK for s in batch_changed}):
+                        self._rebuild_manifest_chunk(cur, chunk_no)
+                    for chunk_no in sorted({s // constant.SONGS_PER_PRE_CHUNK for s in batch_changed}):
+                        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
+                        cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            changed += len(batch_changed)
+
+        if failed:
+            self.logger.warning(f"backfill_file_kinds: {failed} songs failed. Retrying on next start.")
+        else:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                cur.execute("UPDATE setting SET value = %s WHERE name = %s", (str(FILE_KINDS_VERSION), FILE_KINDS_SETTING))
+                if cur.rowcount == 0:
+                    cur.execute(
+                        "INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)",
+                        (FILE_KINDS_SETTING, str(FILE_KINDS_VERSION)),
+                    )
+                con.commit()
+        if changed:
+            self.logger.info(f"backfill_file_kinds: Updated pre/play kinds of {changed} songs.")
+        return changed
+
+    def _recompute_kinds(self, cur, song_id: int) -> list[dict] | None:
+        """곡의 매니페스트 항목 kind를 현재 규칙으로 다시 판정합니다. 바뀌었으면 새 항목 목록, 그대로면 None."""
+        cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        files = json.loads(row[0]) if row and row[0] else []
+        if not files:
+            return None
+        charts = {
+            e["path"]: self._read_song_member(cur, song_id, e)
+            for e in files
+            if pathlib.PurePosixPath(e["path"]).suffix.lower() in constant.BMS_FORMAT
+        }
+        kinds = kinds_from_charts([e["path"] for e in files], charts)
+        new = [{**e, "kind": kinds[e["path"]]} for e in files]
+        return new if new != files else None
 
     def migrate_chart_chunk_names(self) -> int:
         """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
