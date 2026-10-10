@@ -184,9 +184,10 @@ def blob_response(
         if meter_user is not None:
             body = quota.metered(meter_user, gen, close=cleanup)
         else:
-            def wrapped_body():
+            async def wrapped_body():
                 try:
-                    yield from gen
+                    while (chunk := await quota.next_download_chunk(gen)) is not None:
+                        yield chunk
                 finally:
                     cleanup()
             body = wrapped_body()
