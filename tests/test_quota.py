@@ -435,6 +435,74 @@ def test_admin_user_overrides(tmp_path, client, monkeypatch):
     assert client.post("/api/admin/users/nope/refill").status_code == 404
 
 
+def test_admin_user_list_batches_queries(tmp_path, client, monkeypatch):
+    """관리 목록은 사용자 수와 상관없이 연결 1개·쿼리 몇 번으로 만듭니다 (#40)"""
+    from ebms_server import accounts, admin
+    from ebms_server.accounts import Profile
+
+    add_songs(tmp_path, 1)
+    users = [accounts.login(Profile("google", f"g{i}", f"u{i}@example.com", True, f"user{i}")) for i in range(12)]
+    accounts.link(users[0].id, Profile("discord", "d0", None, False, "user0"))
+    quota.charge_play(users[1].id, 1)
+    quota.add_pre_usage(users[2].id, 1234)
+    quota.set_overrides(users[3].id, {"max_tickets": 9})
+    expected = {user.id: admin.get_user_detail(user.id) for user in users}
+
+    connects = []
+    queries = []
+    original = db_module.connect
+
+    class CountingCursor:
+        def __init__(self, cur):
+            self.cur = cur
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.cur.close()
+
+        def execute(self, query, args=None):
+            queries.append(query)
+            return self.cur.execute(query, args)
+
+        def __getattr__(self, name):
+            return getattr(self.cur, name)
+
+    class CountingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.con = self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def cursor(self):
+            return CountingCursor(self.con.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+    def counting_connect(**kwargs):
+        connects.append(kwargs)
+        return CountingConnection(original(**kwargs))
+
+    monkeypatch.setattr(db_module, "connect", counting_connect)
+    found = {u["id"]: u for u in admin.search_users()}
+    assert len(connects) == 1
+    assert len(queries) == 5  # 사용자, 설정, OAuth, 티켓, 사전 사용량
+    assert len(found) == 12
+    for user_id, detail in expected.items():
+        assert found[user_id] == detail
+    assert found[users[0].id]["oauths"] == ["google", "discord"]
+    assert found[users[1].id]["tickets"]["available"] == 4
+    assert found[users[2].id]["pre"]["used_bytes"] == 1234
+    assert found[users[3].id]["tickets"]["max"] == 9
+
+
 def test_admin_ban(client, monkeypatch):
     key, user_id = client_login(client, monkeypatch)
     admin_login(client, monkeypatch)
