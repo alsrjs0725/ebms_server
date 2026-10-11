@@ -2,6 +2,9 @@
 
 - 사전: 차트 청크, 매니페스트, 사전 청크(곡들의 배너·스테이지파일·프리뷰 등 묶음), 곡의 사전 파일 하나. 이번 달 사용량에 더하고 한도를 넘으면 감속.
 - 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안 같은 곡은 재차감 없음), 티켓이 없으면 429.
+
+캐싱 리버스 프록시(proxy.py) 뒤에서는 차트 청크·사전 청크·곡 zip의 인증·차감을 /api/proxy/authz가 하고,
+이 경로들은 프록시의 캐시 채우기 요청(사용자 없음)에 본문만 내려줍니다.
 """
 import gzip
 import mimetypes
@@ -18,9 +21,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from . import constant, quota
+from . import constant, proxy, quota
 from .accounts import User
-from .auth import current_user
+from .auth import current_user, optional_api_session
 from .db import BlobReader, Database
 
 router = APIRouter()
@@ -105,6 +108,17 @@ def _not_modified(request: Request, etag: str) -> bool:
     )
 
 
+def download_user(
+    request: Request, session: Annotated[tuple[User, int, str] | None, Depends(optional_api_session)]
+) -> User | None:
+    """캐시되는 다운로드의 사용자. 프록시의 캐시 채우기 요청이면 None(인증·차감은 /api/proxy/authz에서 끝남)."""
+    if proxy.from_proxy(request):
+        return None
+    if session is None:
+        raise HTTPException(status_code=401, detail="login required", headers={"WWW-Authenticate": "Bearer"})
+    return session[0]
+
+
 def blob_response(
     request: Request,
     table: str,
@@ -115,12 +129,14 @@ def blob_response(
     user_id: str | None = None,
     before_send: Callable[[], None] | None = None,
     meter_user: str | None = None,
+    expect_sha256: str | None = None,
 ) -> Response:
     """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다.
 
     user_id: 동시 다운로드 수를 제한할 사용자 ID.
     before_send: 본문(200/206)을 보내기로 정한 뒤 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
     meter_user: 주면 보낸 바이트를 그 사용자의 사전 다운로드 사용량에 더하고 한도를 넘으면 감속합니다.
+    expect_sha256: 주면 내용의 sha256이 다를 때 409를 냅니다(프록시가 옛 키로 새 내용을 캐시하지 않도록).
     """
     if user_id and not quota.acquire_download_slot(user_id):
         raise HTTPException(status_code=429, detail="too many concurrent downloads")
@@ -130,6 +146,9 @@ def blob_response(
         blob = Database().open_blob(table, row_id)
         if blob is None:
             raise HTTPException(status_code=404, detail=detail)
+        if expect_sha256 and expect_sha256 != blob.sha256:
+            blob.close()
+            raise HTTPException(status_code=409, detail="content changed. retry.")
         etag = f'"{blob.sha256}"'
         headers = {
             "Accept-Ranges": "bytes",
@@ -224,17 +243,18 @@ def pre_chart_hash(user: Annotated[User, Depends(current_user)]):
     return Database().get_chart_chunk_hash()
 
 
+def _pre_blob(request: Request, table: str, chunk_id: int, filename: str, user: User | None) -> Response:
+    if user is None:
+        return blob_response(
+            request, table, chunk_id, filename, "File not found",
+            expect_sha256=request.headers.get(proxy.EXPECT_SHA256_HEADER),
+        )
+    return blob_response(request, table, chunk_id, filename, "File not found", user_id=user.id, meter_user=user.id)
+
+
 @router.get("/api/pre/chart/{chunk_id}")
-def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User, Depends(current_user)]):
-    return blob_response(
-        request,
-        "chart_chunk",
-        chunk_id,
-        constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
-        "File not found",
-        user_id=user.id,
-        meter_user=user.id,
-    )
+def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
+    return _pre_blob(request, "chart_chunk", chunk_id, constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
 
 
 @router.get("/api/pre/assethash")
@@ -243,16 +263,8 @@ def pre_asset_hash(user: Annotated[User, Depends(current_user)]):
 
 
 @router.get("/api/pre/asset/{chunk_id}")
-def pre_asset_chunk(chunk_id: int, request: Request, user: Annotated[User, Depends(current_user)]):
-    return blob_response(
-        request,
-        "pre_chunk",
-        chunk_id,
-        constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id),
-        "File not found",
-        user_id=user.id,
-        meter_user=user.id,
-    )
+def pre_asset_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
+    return _pre_blob(request, "pre_chunk", chunk_id, constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
 
 
 @router.get("/api/pre/manifest/hash")
@@ -359,8 +371,13 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
 # ---- 플레이 다운로드 ----
 
 @router.get("/api/play/song/{song_id}")
-def play_song(song_id: int, request: Request, user: Annotated[User, Depends(current_user)]):
+def play_song(song_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
     """곡 zip 전체. Range 이어받기를 지원하고, 본문을 보낼 때 티켓을 씁니다(304·416은 차감 없음)."""
+    if user is None:
+        return blob_response(
+            request, "song", song_id, f"{song_id}.zip", "song not found",
+            expect_sha256=request.headers.get(proxy.EXPECT_SHA256_HEADER),
+        )
 
     def charge() -> None:
         try:
