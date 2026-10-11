@@ -102,6 +102,23 @@ OAuth 앱의 리다이렉트 주소도 새 도메인(`https://ebms.example.com/a
 
    로그인한 클라이언트로 같은 곡을 두 번 받으면 두 번째 응답 헤더에 `X-Cache-Status: HIT`가 붙습니다.
 
+### Nginx Proxy Manager로 설치
+
+3단계의 `setup.sh` 대신 Nginx Proxy Manager(NPM) 컨테이너를 쓸 수 있습니다. 설정 내용은 같고 넣는 위치만 다릅니다(`deploy/proxy/npm/`). 1·2단계(Tailscale, 홈서버 env)와 도메인·Security List는 그대로 합니다.
+
+1. VM에 Docker를 설치하고 `deploy/proxy/npm/docker-compose.yml`을 VM의 폴더(예: `~/npm`)에 둡니다. 기존 NPM을 옮겨 온다면 기존 `data`, `letsencrypt` 폴더를 같은 폴더에 복사합니다.
+2. `deploy/proxy/npm/http_top.conf`를 `~/npm/data/nginx/custom/http_top.conf`로 복사합니다(캐시 크기는 `max_size`). 그다음 `docker compose up -d`로 띄웁니다.
+3. 컨테이너에서 홈서버에 닿는지 확인합니다: `docker compose exec npm curl -s http://100.64.0.10:8000/api/version`
+4. 관리 화면(`ssh -L 8181:127.0.0.1:81 ubuntu@<VM_IP>` 후 `http://localhost:8181`)에서 프록시 호스트를 만들거나 기존 것을 고칩니다.
+   - **Details**: Domain `ebms.example.com`, Scheme `http`, Forward Hostname `100.64.0.10`, Port `8000`(stage는 `8001`). Block Common Exploits는 켜고, Cache Assets는 끕니다.
+   - **SSL**: Let's Encrypt 인증서를 발급하고 Force SSL, HTTP/2를 켭니다.
+   - **Advanced**: `deploy/proxy/npm/advanced.conf` 내용을 붙여넣고 `<EBMS_PROXY_SECRET>` 두 곳을 홈서버 env의 값으로 바꿉니다.
+5. 3단계 4번의 확인 방법 그대로 401과 `X-Cache-Status: HIT`를 확인합니다.
+
+- 관리 화면(81)은 Security List에 열지 마세요. compose가 `127.0.0.1`에만 엽니다.
+- Docker가 연 80·443은 VM의 iptables INPUT 규칙과 상관없이 열립니다. 외부 차단은 Security List가 맡습니다.
+- Advanced에 `location / {`를 넣으면 NPM이 기본 위치를 만들지 않으니 넣지 마세요.
+
 ### 4. 클라이언트
 
 클라이언트에 등록한 서버 주소를 새 도메인(`https://ebms.example.com`)으로 바꿉니다.
