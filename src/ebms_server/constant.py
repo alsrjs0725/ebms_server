@@ -55,6 +55,9 @@ DISCORD_CLIENT_SECRET = os.environ.get("EBMS_DISCORD_CLIENT_SECRET", "")
 ADMIN_EMAILS = {
     e.strip().lower() for e in os.environ.get("EBMS_ADMIN_EMAILS", "").split(",") if e.strip()
 }
+# 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 설정하면 프록시가 /api/proxy/authz로 다운로드 권한을 묻고
+# 캐시를 채울 수 있습니다. 비우면 프록시 연동을 끕니다(docs/proxy.md).
+PROXY_SECRET = os.environ.get("EBMS_PROXY_SECRET", "")
 SESSION_COOKIE = "ebms_session"
 # 웹 세션 유효기간. 쓸 때마다 연장됩니다.
 WEB_SESSION_SECONDS = 30 * 24 * 3600

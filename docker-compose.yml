@@ -50,6 +50,8 @@ services:
       EBMS_DOWNLOAD_THREADS: ${EBMS_DOWNLOAD_THREADS:-16}
       # 프록시 헤더를 믿을 앞단 프록시 주소(쉼표 구분). 호스트의 프록시는 docker 브리지 게이트웨이로 보입니다.
       EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 비우면 프록시 연동을 끕니다(docs/proxy.md).
+      EBMS_PROXY_SECRET: ${EBMS_PROXY_SECRET:-}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로
