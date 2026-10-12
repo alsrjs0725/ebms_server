@@ -62,6 +62,12 @@ services:
       EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
       # 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 비우면 프록시 연동을 끕니다(docs/proxy.md).
       EBMS_PROXY_SECRET: ${EBMS_PROXY_SECRET:-}
+      # 개인정보 보유기간(docs/privacy.md)
+      EBMS_RETENTION_SESSION_DAYS: ${EBMS_RETENTION_SESSION_DAYS:-30}
+      EBMS_RETENTION_GRANT_DAYS: ${EBMS_RETENTION_GRANT_DAYS:-0}
+      EBMS_RETENTION_PRE_USAGE_MONTHS: ${EBMS_RETENTION_PRE_USAGE_MONTHS:-12}
+      EBMS_RETENTION_INACTIVE_USER_DAYS: ${EBMS_RETENTION_INACTIVE_USER_DAYS:-0}
+      EBMS_RETENTION_INTERVAL_HOURS: ${EBMS_RETENTION_INTERVAL_HOURS:-24}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로
