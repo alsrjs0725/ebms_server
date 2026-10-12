@@ -38,7 +38,22 @@
 <button class="btn btn-outline-primary mb-5" type="button" id="scan">var/tmp 가져오기</button>
 
 <h2 class="h5">등록 작업</h2>
-<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다.</p>
+<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다. 지난 기록과 자세한 오류는 <a href="/admin/logs?logger=ebms_server.importer">서버 로그</a>에서 볼 수 있습니다.</p>
+<div class="row g-2 mb-2" id="filter">
+    <div class="col-sm-4 col-md-3">
+        <select class="form-select form-select-sm" id="filter-level" aria-label="결과 수준">
+            <option value="">모든 결과</option>
+            <option value="failed">실패</option>
+            <option value="conflict">충돌(넣지 않은 파일 있음)</option>
+            <option value="new">새 곡</option>
+            <option value="added">기존 곡에 추가</option>
+            <option value="same">변경 없음(이미 있음)</option>
+        </select>
+    </div>
+    <div class="col-sm-8 col-md-6">
+        <input class="form-control form-control-sm" type="search" id="filter-text" placeholder="폴더명, 오류 메시지, 파일명 검색" aria-label="로그 검색">
+    </div>
+</div>
 <div id="jobs"><p class="text-muted small">작업이 없습니다.</p></div>
 {% endblock %}
 
@@ -202,6 +217,28 @@ function songLine(song) {
     return li;
 }
 
+// 곡 결과의 수준: failed, conflict, new, added, same
+function songLevel(song) {
+    if (song.error) return "failed";
+    if (song.conflicts && song.conflicts.length) return "conflict";
+    if (song.new_song) return "new";
+    if (song.new_charts || (song.added_files && song.added_files.length)) return "added";
+    return "same";
+}
+
+const filterLevel = document.getElementById("filter-level");
+const filterText = document.getElementById("filter-text");
+
+function filtering() { return Boolean(filterLevel.value || filterText.value.trim()); }
+
+function matches(song) {
+    if (filterLevel.value && songLevel(song) !== filterLevel.value) return false;
+    const q = filterText.value.trim().toLowerCase();
+    if (!q) return true;
+    const text = [song.folder, song.error, song.song_id, ...(song.conflicts || []), ...(song.added_files || [])].join("\n");
+    return text.toLowerCase().includes(q);
+}
+
 function songList(songs, summary, open) {
     const details = document.createElement("details");
     details.open = open;
@@ -231,9 +268,10 @@ function jobCard(job) {
 
     const failed = job.songs.filter((s) => s.error);
     const ok = job.songs.length - failed.length;
+    const conflicts = job.songs.filter((s) => songLevel(s) === "conflict").length;
     const line = document.createElement("div");
     line.className = "small";
-    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 실패 ${failed.length}`;
+    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 충돌 ${conflicts} · 실패 ${failed.length}`;
     body.append(line);
     if (job.status === "running" && job.total) {
         const p = document.createElement("div");
@@ -251,12 +289,19 @@ function jobCard(job) {
         err.textContent = job.error;
         body.append(err);
     }
-    if (failed.length) body.append(songList(failed, `실패 ${failed.length}곡`, true));
-    if (ok) body.append(songList(job.songs.filter((s) => !s.error), `성공 ${ok}곡`, false));
+    if (filtering()) {
+        const hits = job.songs.filter(matches);
+        if (hits.length) body.append(songList(hits, `필터에 맞는 ${hits.length}곡`, true));
+        else body.append(Object.assign(document.createElement("div"), { className: "small text-muted", textContent: "필터에 맞는 곡이 없습니다." }));
+    } else {
+        if (failed.length) body.append(songList(failed, `실패 ${failed.length}곡`, true));
+        if (ok) body.append(songList(job.songs.filter((s) => !s.error), `성공 ${ok}곡`, false));
+    }
     card.append(body);
     return card;
 }
 
+let lastJobs = [];
 let timer = null;
 async function refreshJobs() {
     clearTimeout(timer);
@@ -269,6 +314,13 @@ async function refreshJobs() {
         timer = setTimeout(refreshJobs, 5000);
         return;
     }
+    lastJobs = jobs;
+    renderJobs();
+    if (jobs.some((j) => j.status === "running")) timer = setTimeout(refreshJobs, 2000);
+}
+
+function renderJobs() {
+    const jobs = lastJobs;
     const box = document.getElementById("jobs");
     // 펼쳐 둔 목록은 새로 그려도 유지합니다.
     const opened = new Set([...box.querySelectorAll("details[open]")].map((d) => d.dataset.key));
@@ -280,8 +332,11 @@ async function refreshJobs() {
         });
     });
     if (!jobs.length) box.innerHTML = '<p class="text-muted small">작업이 없습니다.</p>';
-    if (jobs.some((j) => j.status === "running")) timer = setTimeout(refreshJobs, 2000);
 }
+
+// 필터는 받은 목록을 다시 그리기만 합니다(서버에 다시 묻지 않음).
+filterLevel.addEventListener("change", renderJobs);
+filterText.addEventListener("input", renderJobs);
 refreshJobs();
 </script>
 {% endblock %}
