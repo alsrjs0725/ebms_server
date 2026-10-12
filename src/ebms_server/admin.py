@@ -2,7 +2,7 @@
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
-- 곡 관리: 곡 검색·삭제, 곡 zip의 파일 구조 보기·파일 받기
+- 곡 관리: 곡 검색·삭제(사용 중지)·복원, 곡 zip의 파일 구조 보기·파일 받기
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 - 서버 로그 조회: 수준·로거·검색어 필터
 """
@@ -373,7 +373,8 @@ class SongDelete(BaseModel):
 
 @router.delete("/api/admin/songs/{song_id}")
 def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: SongDelete | None = None):
-    """곡을 지우고 사유와 함께 기록합니다. 번호는 결번으로 남습니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다.
+    """곡을 사용 중지합니다. 곡 파일은 var/unused/{id}/로 옮기고 사유와 함께 기록하며, 번호는 결번으로 남아
+    /restore로 되돌릴 수 있습니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다.
     임포트가 쓰기 잠금을 오래 잡고 있으면 409."""
     reason = (body.reason if body else "").strip()
     if len(reason) > REASON_MAX:
@@ -386,6 +387,27 @@ def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: 
         raise HTTPException(status_code=404, detail="song not found")
     logger.info(f"song {song_id} deleted by {admin.id}: {reason}")
     return {"ok": True}
+
+
+@router.post("/api/admin/songs/{song_id}/restore")
+def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
+    """사용 중지한 곡을 같은 번호로 되돌립니다. 클라이언트는 다음 동기화 때 다시 받습니다."""
+    try:
+        db.Database().restore_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="사용 중지한 곡이 아닙니다.")
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except db.ChartInUseError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"차트가 그 사이 다른 곡({', '.join(f'#{i}' for i in e.song_ids)})으로 등록돼 복원할 수 없습니다.",
+        )
+    except (FileNotFoundError, ValueError) as e:
+        logger.exception(f"restore song {song_id} failed")
+        raise HTTPException(status_code=500, detail=f"옮겨 둔 파일로 복원하지 못했습니다: {e}")
+    logger.info(f"song {song_id} restored by {admin.id}")
+    return get_song_detail(song_id)
 
 
 @router.get("/api/admin/songs/{song_id}/zip")

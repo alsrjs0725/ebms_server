@@ -145,6 +145,7 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     import ebms_server.constant as constant
     monkeypatch.setattr(constant, "TMP_DIR", tmp_path / "var_tmp")
     constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(constant, "UNUSED_DIR", tmp_path / "var_unused")
     original_connect = db_module.connect
     try:
         con = original_connect(database=None)

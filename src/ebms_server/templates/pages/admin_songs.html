@@ -16,7 +16,7 @@
         <button class="nav-link{% if tab == 'songs' %} active{% endif %}" type="button" role="tab" data-tab="songs" data-url="/admin/songs" aria-controls="tab-songs" aria-selected="{{ 'true' if tab == 'songs' else 'false' }}">곡 목록</button>
     </li>
     <li class="nav-item" role="presentation">
-        <button class="nav-link" type="button" role="tab" data-tab="deleted" data-url="/admin/songs" aria-controls="tab-deleted" aria-selected="false">삭제 기록</button>
+        <button class="nav-link" type="button" role="tab" data-tab="deleted" data-url="/admin/songs" aria-controls="tab-deleted" aria-selected="false">사용 중지</button>
     </li>
     <li class="nav-item" role="presentation">
         <button class="nav-link{% if tab == 'import' %} active{% endif %}" type="button" role="tab" data-tab="import" data-url="/admin/import" aria-controls="tab-import" aria-selected="{{ 'true' if tab == 'import' else 'false' }}">곡 임포트</button>
@@ -47,7 +47,7 @@
             </div>
             <div class="d-flex gap-2 flex-shrink-0">
                 <a class="btn btn-sm btn-outline-primary" id="song-zip" href="#">zip 받기</a>
-                <button class="btn btn-sm btn-outline-danger" type="button" id="song-delete">삭제</button>
+                <button class="btn btn-sm btn-outline-danger" type="button" id="song-delete">사용 중지</button>
             </div>
         </div>
         <div class="small" id="song-tree"></div>
@@ -57,17 +57,17 @@
 
 <div id="tab-deleted" role="tabpanel" class="d-none">
 <form id="deleted-search" class="d-flex gap-2 mb-2" role="search">
-    <input class="form-control" type="search" id="deleted-q" placeholder="곡 번호, 폴더명, 삭제 사유" aria-label="삭제 기록 검색">
+    <input class="form-control" type="search" id="deleted-q" placeholder="곡 번호, 폴더명, 사유" aria-label="사용 중지한 곡 검색">
     <button class="btn btn-primary text-nowrap" type="submit">검색</button>
 </form>
-<p class="text-muted small">지운 곡의 번호는 결번으로 남고 다시 쓰지 않습니다. 같은 곡을 다시 임포트하면 새 번호로 등록됩니다.</p>
+<p class="text-muted small">사용 중지한 곡은 서버의 <code>var/unused/곡번호/</code>에 곡 zip과 차트를 옮겨 두고, 번호는 결번으로 남겨 다른 곡에 쓰지 않습니다. <strong>복원</strong>하면 같은 번호로 되돌아가고 클라이언트는 다음 동기화 때 다시 받습니다. 그 사이 같은 차트를 다른 곡으로 임포트했다면 복원할 수 없습니다.</p>
 <div class="table-responsive">
     <table class="table table-sm align-middle small">
-        <thead><tr><th scope="col">번호</th><th scope="col">폴더</th><th scope="col">사유</th><th scope="col">삭제</th></tr></thead>
+        <thead><tr><th scope="col">번호</th><th scope="col">폴더</th><th scope="col">사유</th><th scope="col">중지</th><th scope="col"></th></tr></thead>
         <tbody id="deleted-rows"></tbody>
     </table>
 </div>
-<p class="text-muted small d-none" id="deleted-empty">삭제 기록이 없습니다.</p>
+<p class="text-muted small d-none" id="deleted-empty">사용 중지한 곡이 없습니다.</p>
 <button class="btn btn-sm btn-outline-secondary d-none mb-4" type="button" id="deleted-more">더 보기</button>
 </div>
 
@@ -181,7 +181,7 @@ document.getElementById("song-search").addEventListener("submit", (e) => {
     lastSongId = null;
     loadSongs(false);
 
-// ---- 삭제 기록 ----
+// ---- 사용 중지한 곡 ----
 const deletedRows = document.getElementById("deleted-rows");
 const deletedMore = document.getElementById("deleted-more");
 let deletedQuery = "";
@@ -210,12 +210,34 @@ async function loadDeleted(more) {
             td.textContent = text;
             tr.append(td);
         }
+        const td = document.createElement("td");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-sm btn-outline-primary text-nowrap";
+        btn.textContent = "복원";
+        btn.addEventListener("click", () => restoreSong(row, tr, btn));
+        td.append(btn);
+        tr.append(td);
         deletedRows.append(tr);
     }
     if (rows.length) lastDeletedId = rows[rows.length - 1].song_id;
     deletedMore.classList.toggle("d-none", rows.length < SONG_LIMIT);
     document.getElementById("deleted-empty").classList.toggle("d-none", deletedRows.children.length > 0);
     deletedLoaded = true;
+}
+
+async function restoreSong(row, tr, btn) {
+    if (!confirm(`#${row.song_id} ${row.folder} 곡을 같은 번호로 복원합니다.`)) return;
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/admin/songs/${row.song_id}/restore`, { method: "POST" });
+        if (!res.ok) { alert(await detail(res)); return; }
+        tr.remove();
+        document.getElementById("deleted-empty").classList.toggle("d-none", deletedRows.children.length > 0);
+        // 곡 목록은 다음 검색 때 다시 보입니다.
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 document.getElementById("deleted-search").addEventListener("submit", (e) => {
@@ -225,7 +247,7 @@ document.getElementById("deleted-search").addEventListener("submit", (e) => {
     loadDeleted(false);
 });
 deletedMore.addEventListener("click", () => loadDeleted(true));
-// 탭을 처음 열 때, 그리고 곡을 지운 뒤 다시 열 때 새로 읽습니다.
+// 탭을 처음 열 때, 그리고 곡을 사용 중지한 뒤 다시 열 때 새로 읽습니다.
 document.querySelector('[data-tab="deleted"]').addEventListener("click", () => { if (!deletedLoaded) loadDeleted(false); });
 });
 songMore.addEventListener("click", () => loadSongs(true));
@@ -328,15 +350,15 @@ async function openSong(id) {
 document.getElementById("song-delete").addEventListener("click", async () => {
     const song = currentSong;
     if (!song) return;
-    const reason = prompt(`#${song.id} ${song.folder} 곡을 지우는 사유를 적으세요(삭제 기록에 남습니다).`);
+    const reason = prompt(`#${song.id} ${song.folder} 곡을 사용 중지하는 사유를 적으세요(사용 중지 목록에 남습니다).`);
     if (reason === null) return;
     const typed = prompt(
-        `#${song.id} ${song.folder} 곡을 지웁니다. 되돌릴 수 없고, 번호 ${song.id}는 결번으로 남습니다.\n` +
+        `#${song.id} ${song.folder} 곡을 사용 중지합니다. 곡 파일은 서버의 var/unused로 옮기고, 번호 ${song.id}는 결번으로 남아 나중에 복원할 수 있습니다.\n` +
         `사용자 클라이언트에서는 다음 동기화 때 목록에서 사라집니다.\n\n` +
-        `지우려면 곡 번호 ${song.id}를 입력하세요.`
+        `사용 중지하려면 곡 번호 ${song.id}를 입력하세요.`
     );
     if (typed === null) return;
-    if (typed.trim() !== String(song.id)) { alert("곡 번호가 맞지 않아 지우지 않았습니다."); return; }
+    if (typed.trim() !== String(song.id)) { alert("곡 번호가 맞지 않아 사용 중지하지 않았습니다."); return; }
     const btn = document.getElementById("song-delete");
     btn.disabled = true;
     try {

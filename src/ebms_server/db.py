@@ -212,7 +212,8 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
-    # 지운 곡 기록. 지운 곡 번호는 결번으로 남고 다시 쓰지 않습니다.
+    # 지운(사용 중지한) 곡. 곡 zip과 차트는 UNUSED_DIR/{song_id}/로 옮겨 두고 같은 번호로 복원할 수 있습니다.
+    # 번호는 결번으로 남고 다른 곡에 다시 쓰지 않습니다. chart_list는 복원할 때 다시 붙일 차트 [[sha256, size, 경로], ...].
     """
         CREATE TABLE IF NOT EXISTS deleted_song(
             song_id INT UNSIGNED NOT NULL,
@@ -220,6 +221,7 @@ SCHEMA = [
             size BIGINT UNSIGNED NOT NULL,
             sha256 CHAR(64) NOT NULL,
             charts INT UNSIGNED NOT NULL,
+            chart_list MEDIUMTEXT NOT NULL,
             reason TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             deleted_by CHAR(36),
             deleted_at BIGINT UNSIGNED NOT NULL,
@@ -461,6 +463,14 @@ def _song_zipinfo(name: str) -> zipfile.ZipInfo:
 
 class AmbiguousSongError(ValueError):
     """새 폴더의 차트가 기존 곡 여러 개와 겹쳐 어느 곡에 넣을지 정할 수 없습니다. 등록하지 않고 폴더는 남깁니다."""
+
+
+class ChartInUseError(ValueError):
+    """복원하려는 곡의 차트가 그 사이 다른 곡에 들어가 있습니다."""
+
+    def __init__(self, song_ids: list[int]):
+        super().__init__(f"charts are used by songs {song_ids}")
+        self.song_ids = song_ids
 
 
 class BlobReader:
@@ -1424,17 +1434,59 @@ class Database:
             row = cur.fetchone()
             return row[0] if row else None
 
+    def _lock(self, timeout: float | None) -> None:
+        if not self._write_lock.acquire(timeout=-1 if timeout is None else timeout):
+            raise TimeoutError("song import is holding the write lock")
+
+    @staticmethod
+    def unused_dir(song_id: int) -> pathlib.Path:
+        """사용 중지한 곡을 옮겨 두는 폴더. song.zip과 charts/{sha256}{확장자}가 들어갑니다."""
+        return constant.UNUSED_DIR / str(song_id)
+
+    def _song_charts(self, cur, song_id: int, data: bytes, charts: list[list]) -> dict[str, bytes]:
+        """곡의 차트 내용을 {차트 청크 항목 이름: 내용}으로 모읍니다.
+        곡 zip의 같은 경로에서 먼저 찾고, 곡 zip에 없거나 내용이 다른 차트는 차트 청크에서 꺼냅니다."""
+        found: dict[str, bytes] = {}
+        wanted: dict[str, str] = {}
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = set(zf.namelist())
+            for chart_id, size, filename in charts:
+                arcname = chart_arcname(chart_id, pathlib.PurePosixPath(filename or f"{chart_id}.bms"))
+                content = zf.read(filename) if filename in names else None
+                if content is not None and len(content) == size and hashlib.sha256(content).hexdigest() == chart_id:
+                    found[arcname] = content
+                else:
+                    wanted[chart_id] = arcname
+        if wanted:
+            # 차트 청크 항목 이름은 sha256 + 확장자. 최근 청크부터 찾습니다.
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id DESC")
+            for (chunk_no,) in cur.fetchall():
+                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
+                with zipfile.ZipFile(io.BytesIO(cur.fetchone()[0])) as zf:
+                    for name in zf.namelist():
+                        chart_id = name.split(".", 1)[0]
+                        if chart_id in wanted:
+                            found[wanted.pop(chart_id)] = zf.read(name)
+                if not wanted:
+                    break
+        if wanted:
+            self.logger.warning(f"delete_song: Song[{song_id}] charts not found anywhere: {sorted(wanted)}")
+        return found
+
     def delete_song(
         self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
     ) -> bool:
-        """곡을 지우고 그 곡이 든 매니페스트·사전 청크를 다시 만듭니다. 없는 곡이면 False.
-        지운 곡은 deleted_song에 사유와 함께 남기고, 그 번호는 다시 쓰지 않습니다.
+        """곡을 사용 중지합니다. 없는 곡이면 False.
 
-        차트 청크에서는 뺄 수 없으므로 차트 행은 song_id만 비워 남기고, 같은 차트를 다시 임포트하면 새 곡에 붙습니다.
+        곡 zip과 차트(곡 zip에 없는 차트는 차트 청크에서 꺼냄)를 UNUSED_DIR/{song_id}/로 옮기고 DB의 곡 데이터를 지운 뒤,
+        그 곡이 든 매니페스트·사전 청크를 다시 만듭니다. deleted_song에 사유와 차트 목록을 남기고,
+        번호는 결번으로 두어 restore_song으로 같은 번호로 되돌릴 수 있습니다.
+        차트 청크에서는 뺄 수 없으므로 차트 행은 song_id만 비워 남깁니다.
         임포트 배치가 쓰기 잠금을 잡고 있으면 timeout(초)까지 기다리고, 넘으면 TimeoutError.
         """
-        if not self._write_lock.acquire(timeout=-1 if timeout is None else timeout):
-            raise TimeoutError("song import is holding the write lock")
+        self._lock(timeout)
+        target = self.unused_dir(song_id)
+        written = False
         try:
             with connect() as con, con.cursor() as cur:
                 try:
@@ -1442,14 +1494,35 @@ class Database:
                     row = cur.fetchone()
                     if row is None:
                         return False
-                    cur.execute("SELECT COUNT(*) FROM chart WHERE song_id = %s", (song_id,))
-                    charts = cur.fetchone()[0]
+                    folder, size, sha256 = row
+                    data = self._get_song_data_with_cur(cur, song_id)
+                    if data is None or hashlib.sha256(data).hexdigest() != sha256:
+                        raise ValueError(f"song {song_id}: zip data is missing or does not match its sha256")
+                    cur.execute("SELECT id, size, filename FROM chart WHERE song_id = %s ORDER BY id", (song_id,))
+                    charts = [list(r) for r in cur.fetchall()]
+                    chart_data = self._song_charts(cur, song_id, data, charts)
+
+                    # DB에서 지우기 전에 파일을 끝까지 써 둡니다. 다 쓴 뒤 폴더 이름을 바꿔 반쯤 쓴 폴더가 남지 않게 합니다.
+                    tmp = constant.UNUSED_DIR / f".{song_id}.tmp"
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    (tmp / "charts").mkdir(parents=True)
+                    for name, content in [("song.zip", data), *((f"charts/{n}", c) for n, c in chart_data.items())]:
+                        with open(tmp / name, "wb") as f:
+                            f.write(content)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    shutil.rmtree(target, ignore_errors=True)
+                    os.replace(tmp, target)
+                    written = True
+
                     cur.execute(
                         """
-                        INSERT INTO deleted_song (song_id, folder, size, sha256, charts, reason, deleted_by, deleted_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO deleted_song
+                            (song_id, folder, size, sha256, charts, chart_list, reason, deleted_by, deleted_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (song_id, row[0], row[1], row[2], charts, reason, deleted_by, int(time.time())),
+                        (song_id, folder, size, sha256, len(charts), json.dumps(charts, ensure_ascii=False), reason,
+                         deleted_by, int(time.time())),
                     )
                     cur.execute("UPDATE chart SET song_id = NULL WHERE song_id = %s", (song_id,))
                     cur.execute("DELETE FROM download_grant WHERE song_id = %s", (song_id,))
@@ -1460,11 +1533,80 @@ class Database:
                     con.commit()
                 except Exception:
                     con.rollback()
+                    if written:
+                        shutil.rmtree(target, ignore_errors=True)
                     raise
         finally:
             self._write_lock.release()
-        self.logger.info(f"delete_song: Deleted song[{song_id}]")
+        self.logger.info(f"delete_song: Moved song[{song_id}] to {target}")
         return True
+
+    def restore_song(self, song_id: int, timeout: float | None = None) -> None:
+        """사용 중지한 곡을 같은 번호로 되돌립니다. 차트 행이 없어진 차트는 옮겨 둔 차트 파일로 차트 청크에 다시 넣습니다.
+
+        사용 중지한 곡이 아니면 LookupError, 옮겨 둔 파일이 없거나 내용이 다르면 FileNotFoundError·ValueError,
+        그 사이 같은 차트가 다른 곡으로 임포트됐으면 ChartInUseError. 잠금을 못 잡으면 TimeoutError.
+        """
+        self._lock(timeout)
+        source = self.unused_dir(song_id)
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT folder, size, sha256, chart_list FROM deleted_song WHERE song_id = %s FOR UPDATE",
+                        (song_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise LookupError(f"song {song_id} is not unused")
+                    folder, size, sha256, chart_list = row
+                    data = (source / "song.zip").read_bytes()
+                    if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
+                        raise ValueError(f"{source}/song.zip does not match song {song_id}")
+                    charts = json.loads(chart_list)
+                    taken = set()
+                    readd = []
+                    for chart_id, chart_size, filename in charts:
+                        cur.execute("SELECT song_id FROM chart WHERE id = %s AND size = %s", (chart_id, chart_size))
+                        found = cur.fetchone()
+                        if found is None:
+                            arcname = chart_arcname(chart_id, pathlib.PurePosixPath(filename or f"{chart_id}.bms"))
+                            content = (source / "charts" / arcname).read_bytes()
+                            if hashlib.sha256(content).hexdigest() != chart_id:
+                                raise ValueError(f"{source}/charts/{arcname} does not match its sha256")
+                            readd.append((chart_id, chart_size, filename, arcname, content))
+                        elif found[0] is not None:
+                            taken.add(found[0])
+                    if taken:
+                        raise ChartInUseError(sorted(taken))
+
+                    cur.execute(
+                        "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
+                        (song_id, size, sha256, folder, json.dumps(zip_entries(data))),
+                    )
+                    self._insert_song_parts(cur, song_id, data)
+                    for chart_id, chart_size, _ in charts:
+                        cur.execute(
+                            "UPDATE chart SET song_id = %s WHERE id = %s AND size = %s", (song_id, chart_id, chart_size)
+                        )
+                    for chart_id, chart_size, filename, _, _ in readd:
+                        cur.execute(
+                            "INSERT INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
+                            (chart_id, song_id, chart_size, filename),
+                        )
+                    if readd:
+                        self._append_charts_to_chunk(cur, [(arcname, content) for *_, arcname, content in readd])
+                    cur.execute("DELETE FROM deleted_song WHERE song_id = %s", (song_id,))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        shutil.rmtree(source, ignore_errors=True)
+        self.logger.info(f"restore_song: Restored song[{song_id}]")
 
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""

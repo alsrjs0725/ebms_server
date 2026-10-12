@@ -16,6 +16,8 @@ TMP_DIR = BASE_DIR / "var" / "tmp"
 # 관리자 페이지에서 올린 zip을 풀어두는 임시 폴더. 등록이 끝나면 지웁니다.
 IMPORT_DIR = BASE_DIR / "var" / "import"
 LOG_DIR = BASE_DIR / "var" / "log"
+# 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
+UNUSED_DIR = BASE_DIR / "var" / "unused"
 BYTE_PER_CHUNK = 64 * 1024 * 1024
 # 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
 IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
