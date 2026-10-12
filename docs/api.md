@@ -126,4 +126,4 @@ zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`
 곡 폴더 전체(키음, BGA 등 포함) zip을 내려줍니다. song id는 매니페스트에서 얻습니다. 티켓 규칙은 [다운로드 문서의 "플레이 티켓"](download.md)을 보세요.
 
 - 응답 `200`/`206` (`application/zip`): 곡 zip (Deflate 압축, 폴더 구조 유지)
-- 오류: `404` `song not found`, `422` `song_id`가 정수가 아님, `429` `no download ticket`
+- 오류: `404` `song not found`, `410` `song deleted` 또는 `song deleted: <삭제 사유>`(관리자가 지운 곡, 번호는 결번), `422` `song_id`가 정수가 아님, `429` `no download ticket`

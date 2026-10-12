@@ -1466,6 +1466,13 @@ class Database:
         self.logger.info(f"delete_song: Deleted song[{song_id}]")
         return True
 
+    def deleted_reason(self, song_id: int) -> str | None:
+        """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT reason FROM deleted_song WHERE song_id = %s", (song_id,))
+            row = cur.fetchone()
+        return None if row is None else row[0]
+
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
         """song / chart_chunk / pre_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
 

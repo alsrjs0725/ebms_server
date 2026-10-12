@@ -72,6 +72,9 @@ server {
         if ($ebms_status = 404) {
             return 404 '{"detail":"$ebms_detail"}';
         }
+        if ($ebms_status = 410) {
+            return 410 '{"detail":"$ebms_detail"}';
+        }
         if ($ebms_status = 429) {
             add_header Retry-After $ebms_retry_after always;
             return 429 '{"detail":"$ebms_detail"}';

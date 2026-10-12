@@ -107,3 +107,26 @@ def test_fill_request_serves_without_user(tmp_path, client, monkeypatch):
     monkeypatch.setattr(constant, "PROXY_SECRET", "")
     assert client.get("/api/play/song/1", headers=fill).status_code == 401
     assert client.get("/api/play/song/1", headers=bearer(key)).status_code == 200
+
+
+def test_deleted_song_is_gone(tmp_path, client, monkeypatch):
+    """지운 곡(결번)은 404 대신 410과 삭제 사유. 프록시가 JSON에 그대로 넣도록 detail은 ASCII로 이스케이프합니다."""
+    monkeypatch.setattr(constant, "PROXY_SECRET", SECRET)
+    key, user_id = client_login(client, monkeypatch)
+    add_songs(tmp_path, 2)
+    Database().delete_song(1, '저작권 "요청"')
+    Database().delete_song(2)
+    h = bearer(key)
+
+    r = authz(client, "/api/play/song/1", h)
+    assert r.headers["x-ebms-status"] == "410"
+    assert r.headers["x-ebms-detail"] == 'song deleted: \\uc800\\uc791\\uad8c \\"\\uc694\\uccad\\"'
+    assert authz(client, "/api/play/song/2", h).headers["x-ebms-detail"] == "song deleted"
+
+    r = client.get("/api/play/song/1", headers=h)
+    assert (r.status_code, r.json()["detail"]) == (410, 'song deleted: 저작권 "요청"')
+    assert client.get("/api/pre/song/2/file", params={"path": "a.bms"}, headers=h).status_code == 410
+    assert client.get("/api/play/song/99", headers=h).status_code == 404
+    # 티켓은 쓰지 않습니다.
+    state = quota.ticket_state(user_id)
+    assert state.available == state.max_tickets

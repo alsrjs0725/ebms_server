@@ -145,6 +145,9 @@ def blob_response(
     try:
         blob = Database().open_blob(table, row_id)
         if blob is None:
+            if table == "song":
+                status, detail = proxy.missing_song(row_id)
+                raise HTTPException(status_code=status, detail=detail)
             raise HTTPException(status_code=404, detail=detail)
         if expect_sha256 and expect_sha256 != blob.sha256:
             blob.close()
@@ -324,7 +327,8 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
     try:
         files = Database().get_song_files(song_id)
         if files is None:
-            raise HTTPException(status_code=404, detail="song not found")
+            status, detail = proxy.missing_song(song_id)
+            raise HTTPException(status_code=status, detail=detail)
         entry = next((f for f in files if f["path"] == path), None)
         if entry is None:
             raise HTTPException(status_code=404, detail="file not found")
@@ -340,7 +344,8 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
 
         blob = Database().open_blob("song", song_id)
         if blob is None:
-            raise HTTPException(status_code=404, detail="song not found")
+            status, detail = proxy.missing_song(song_id)
+            raise HTTPException(status_code=status, detail=detail)
         try:
             start, decompressor = _zip_member(blob, entry)
         except ValueError:
