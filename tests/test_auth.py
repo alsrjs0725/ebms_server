@@ -248,18 +248,29 @@ def test_env_admin_other_identity_keeps_admin(client, monkeypatch):
     assert me(client).is_admin
 
 
+REMOVED_COLUMNS = [
+    ("user", "email"), ("user_identity", "email"), ("user_identity", "name"),
+    ("session", "device_name"), ("auth_code", "device_name"),
+]
+
+
+def has_column(table: str, column: str) -> bool:
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+            """,
+            (table, column),
+        )
+        return cur.fetchone()[0] > 0
+
+
 def test_no_email_or_device_name_stored(client, monkeypatch):
     """이메일과 기기 이름(User-Agent)은 저장하지 않습니다(#102)."""
     client.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"
     oauth(client, monkeypatch, "google", "g1", name="Alice")
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute(
-            """
-            SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('email', 'device_name')
-            """
-        )
-        assert cur.fetchall() == ()
+    assert not any(has_column(*c) for c in REMOVED_COLUMNS)
     assert "Chrome" not in client.get("/account").text
     assert "email" not in client.get("/api/me").json()
     assert {p.scope for p in auth.OAUTHS.values()} == {"openid", "identify"}
@@ -324,18 +335,9 @@ def test_old_columns_dropped_on_start(client, monkeypatch):
         cur.execute("ALTER TABLE auth_code ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
         con.commit()
     Database().generate_database()
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute(
-            """
-            SELECT COUNT(*) FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('email', 'device_name')
-               OR (TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_identity' AND COLUMN_NAME = 'name')
-            """
-        )
-        assert cur.fetchone()[0] == 0
-        # OAuth에서 가져온 표시 이름도 비움(다음 로그인 때 닉네임을 정함)
-        cur.execute("SELECT display_name FROM user WHERE id = 'u1'")
-        assert cur.fetchone()[0] == ""
+    assert not any(has_column(*c) for c in REMOVED_COLUMNS)
+    # OAuth에서 가져온 표시 이름도 비움(다음 로그인 때 닉네임을 정함)
+    assert accounts.get_user("u1").display_name == ""
     # 이미 정리한 DB에서 다시 시작하면 닉네임을 건드리지 않음
     accounts.set_nickname("u1", "Nick")
     Database().generate_database()

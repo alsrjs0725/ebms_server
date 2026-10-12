@@ -320,3 +320,39 @@ def consume_auth_code(code: str) -> tuple[str, str] | None:
         con.commit()
     return tuple(row) if row else None
 
+
+
+# user를 가리키는 테이블. FK ON DELETE CASCADE로도 지워지지만, 외래 키를 강제하지 않는 환경에서도
+# 남지 않도록 user보다 먼저 직접 지웁니다.
+USER_TABLES = ("user_identity", "session", "auth_code", "user_ticket", "download_grant", "pre_usage")
+
+
+def delete_user(user_id: str) -> str:
+    """계정과 계정에 딸린 데이터를 지웁니다. 반환값: "ok", "not_found", "last_admin"(마지막 관리자라 거부)
+
+    지운 곡 기록(deleted_song.deleted_by)은 곡 복원에 필요하므로 남기고 누가 지웠는지만 비웁니다.
+    """
+    with db.connect() as con, con.cursor() as cur:
+        try:
+            cur.execute("SELECT role FROM user WHERE id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone()
+            if row is None:
+                result = "not_found"
+            else:
+                if row[0] == "admin":
+                    # 두 관리자가 동시에 탈퇴해 관리자가 0명이 되지 않도록 관리자 행을 잠근 뒤 셉니다.
+                    cur.execute("SELECT id FROM user WHERE role = 'admin' AND status = 'active' FOR UPDATE")
+                    others = [r[0] for r in cur.fetchall() if r[0] != user_id]
+                    if not others:
+                        con.commit()
+                        return "last_admin"
+                cur.execute("UPDATE deleted_song SET deleted_by = NULL WHERE deleted_by = %s", (user_id,))
+                for table in USER_TABLES:
+                    cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
+                cur.execute("DELETE FROM user WHERE id = %s", (user_id,))
+                result = "ok"
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+    return result

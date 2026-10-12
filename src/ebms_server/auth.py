@@ -549,6 +549,19 @@ def delete_session(session_id: int, user: Annotated[User, Depends(web_user)]):
     return Response(status_code=204)
 
 
+@router.delete("/api/account", status_code=204)
+def delete_account(user: Annotated[User, Depends(web_user)]):
+    """회원 탈퇴. 계정과 로그인 수단·세션(클라이언트 포함)·사용량을 지우고 쿠키를 지웁니다."""
+    result = accounts.delete_user(user.id)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="account not found")
+    if result == "last_admin":
+        raise HTTPException(status_code=409, detail="마지막 관리자는 탈퇴할 수 없습니다. 다른 관리자를 먼저 지정하세요.")
+    response = Response(status_code=204)
+    response.delete_cookie(constant.SESSION_COOKIE, path="/")
+    return response
+
+
 # ---- 클라이언트 로그인 ----
 
 # base64url(sha256(code_verifier)), 패딩 없음
