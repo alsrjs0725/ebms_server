@@ -1,16 +1,58 @@
 {% extends "auth_base.html" %}
 
-{% block title %}곡 임포트 - EBMS{% endblock %}
+{% block title %}곡 관리 - EBMS{% endblock %}
 
 {% block content %}
 <nav aria-label="breadcrumb">
     <ol class="breadcrumb">
         <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
-        <li class="breadcrumb-item active" aria-current="page">곡 임포트</li>
+        <li class="breadcrumb-item active" aria-current="page">곡 관리</li>
     </ol>
 </nav>
-<h1 class="h3 mb-4">곡 임포트</h1>
+<h1 class="h3 mb-3">곡 관리</h1>
 
+<ul class="nav nav-tabs mb-4" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link{% if tab == 'songs' %} active{% endif %}" type="button" role="tab" data-tab="songs" data-url="/admin/songs" aria-controls="tab-songs" aria-selected="{{ 'true' if tab == 'songs' else 'false' }}">곡 목록</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link{% if tab == 'import' %} active{% endif %}" type="button" role="tab" data-tab="import" data-url="/admin/import" aria-controls="tab-import" aria-selected="{{ 'true' if tab == 'import' else 'false' }}">곡 임포트</button>
+    </li>
+</ul>
+
+<div id="tab-songs" role="tabpanel"{% if tab != 'songs' %} class="d-none"{% endif %}>
+<form id="song-search" class="d-flex gap-2 mb-2" role="search">
+    <input class="form-control" type="search" id="song-q" placeholder="곡 번호, 폴더명, 차트 파일명" aria-label="곡 검색">
+    <button class="btn btn-primary text-nowrap" type="submit">검색</button>
+</form>
+<p class="text-muted small">최근 등록한 곡부터 {{ limit }}곡씩 보여줍니다. 곡을 누르면 파일 구조를 보고 파일을 받거나 곡을 지울 수 있습니다.</p>
+<div class="table-responsive">
+    <table class="table table-sm table-hover align-middle small">
+        <thead><tr><th scope="col">번호</th><th scope="col">폴더</th><th scope="col" class="text-end">차트</th><th scope="col" class="text-end">크기</th></tr></thead>
+        <tbody id="song-rows"></tbody>
+    </table>
+</div>
+<p class="text-muted small d-none" id="song-empty">찾는 곡이 없습니다.</p>
+<button class="btn btn-sm btn-outline-secondary d-none mb-4" type="button" id="song-more">더 보기</button>
+
+<div class="card d-none" id="song-detail">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+            <div>
+                <h2 class="h5 mb-1" id="song-title"></h2>
+                <div class="text-muted small" id="song-meta"></div>
+            </div>
+            <div class="d-flex gap-2 flex-shrink-0">
+                <a class="btn btn-sm btn-outline-primary" id="song-zip" href="#">zip 받기</a>
+                <button class="btn btn-sm btn-outline-danger" type="button" id="song-delete">삭제</button>
+            </div>
+        </div>
+        <div class="small" id="song-tree"></div>
+    </div>
+</div>
+</div>
+
+<div id="tab-import" role="tabpanel"{% if tab != 'import' %} class="d-none"{% endif %}>
 <h2 class="h5">zip 업로드</h2>
 <p class="text-muted small">
     차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 등록합니다. zip 하나에 곡 여러 개가 있어도 되고,
@@ -55,10 +97,195 @@
     </div>
 </div>
 <div id="jobs"><p class="text-muted small">작업이 없습니다.</p></div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+// ---- 탭 ----
+document.querySelectorAll("[data-tab]").forEach((btn) => btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-tab]").forEach((b) => {
+        const on = b === btn;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-selected", on);
+        document.getElementById(`tab-${b.dataset.tab}`).classList.toggle("d-none", !on);
+    });
+    history.replaceState(null, "", btn.dataset.url);
+}));
+
+// ---- 곡 목록 ----
+const SONG_LIMIT = {{ limit }};
+const songRows = document.getElementById("song-rows");
+const songMore = document.getElementById("song-more");
+const songDetail = document.getElementById("song-detail");
+let songQuery = "";
+let lastSongId = null;
+let currentSong = null;
+
+function size(n) {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)}KB`;
+    if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)}MB`;
+    return `${(n / 1024 ** 3).toFixed(2)}GB`;
+}
+
+async function loadSongs(more) {
+    const params = new URLSearchParams({ q: songQuery });
+    if (more && lastSongId !== null) params.set("before", lastSongId);
+    const res = await fetch(`/api/admin/songs?${params}`);
+    if (!res.ok) { alert(await detail(res)); return; }
+    const songs = await res.json();
+    if (!more) songRows.replaceChildren();
+    for (const song of songs) {
+        const tr = document.createElement("tr");
+        tr.style.cursor = "pointer";
+        tr.dataset.id = song.id;
+        tr.tabIndex = 0;
+        for (const [text, cls] of [[song.id, ""], [song.folder || "(이름 없음)", "text-break"], [song.charts, "text-end"], [size(song.size), "text-end text-nowrap"]]) {
+            const td = document.createElement("td");
+            td.className = cls;
+            td.textContent = text;
+            tr.append(td);
+        }
+        tr.addEventListener("click", () => openSong(song.id));
+        tr.addEventListener("keydown", (e) => { if (e.key === "Enter") openSong(song.id); });
+        songRows.append(tr);
+    }
+    if (songs.length) lastSongId = songs[songs.length - 1].id;
+    songMore.classList.toggle("d-none", songs.length < SONG_LIMIT);
+    document.getElementById("song-empty").classList.toggle("d-none", songRows.children.length > 0);
+}
+
+document.getElementById("song-search").addEventListener("submit", (e) => {
+    e.preventDefault();
+    songQuery = document.getElementById("song-q").value.trim();
+    lastSongId = null;
+    loadSongs(false);
+});
+songMore.addEventListener("click", () => loadSongs(true));
+
+function fileTree(files) {
+    // "a/b/c.wav" 경로를 폴더별로 묶습니다.
+    const root = { dirs: new Map(), files: [] };
+    for (const file of files) {
+        const parts = file.path.split("/");
+        let node = root;
+        for (const part of parts.slice(0, -1)) {
+            if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+            node = node.dirs.get(part);
+        }
+        node.files.push({ ...file, name: parts[parts.length - 1] });
+    }
+    return root;
+}
+
+function nodeSize(node) {
+    let total = node.files.reduce((sum, f) => sum + f.size, 0);
+    let count = node.files.length;
+    for (const dir of node.dirs.values()) {
+        const [s, c] = nodeSize(dir);
+        total += s;
+        count += c;
+    }
+    return [total, count];
+}
+
+function renderNode(node, songId) {
+    const ul = document.createElement("ul");
+    ul.className = "list-unstyled ms-3 mb-0";
+    const byName = (a, b) => a.localeCompare(b);
+    for (const name of [...node.dirs.keys()].sort(byName)) {
+        const dir = node.dirs.get(name);
+        const [total, count] = nodeSize(dir);
+        const li = document.createElement("li");
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = `📁 ${name}/ `;
+        const meta = document.createElement("span");
+        meta.className = "text-muted";
+        meta.textContent = `(${count}개, ${size(total)})`;
+        summary.append(meta);
+        details.append(summary, renderNode(dir, songId));
+        li.append(details);
+        ul.append(li);
+    }
+    for (const file of node.files.sort((a, b) => byName(a.name, b.name))) {
+        const li = document.createElement("li");
+        li.className = "d-flex gap-2 align-items-baseline";
+        const a = document.createElement("a");
+        a.href = `/api/admin/songs/${songId}/file?path=${encodeURIComponent(file.path)}`;
+        a.className = "text-break";
+        a.textContent = file.name;
+        a.title = `${file.path} 받기`;
+        const meta = document.createElement("span");
+        meta.className = "text-muted text-nowrap";
+        meta.textContent = size(file.size);
+        li.append(a, meta);
+        if (file.chart) {
+            const badge = document.createElement("span");
+            badge.className = "badge text-bg-primary";
+            badge.textContent = "차트";
+            li.append(badge);
+        }
+        if (file.kind) {
+            const badge = document.createElement("span");
+            badge.className = "badge " + (file.kind === "pre" ? "text-bg-info" : "text-bg-light border");
+            badge.textContent = file.kind === "pre" ? "사전" : "플레이";
+            badge.title = file.kind === "pre" ? "사전 다운로드 파일(배너·프리뷰 등)" : "플레이할 때 받는 파일";
+            li.append(badge);
+        }
+        ul.append(li);
+    }
+    return ul;
+}
+
+async function openSong(id) {
+    const res = await fetch(`/api/admin/songs/${id}`);
+    if (!res.ok) { alert(await detail(res)); return; }
+    const song = await res.json();
+    currentSong = song;
+    songRows.querySelectorAll("tr").forEach((tr) => tr.classList.toggle("table-active", Number(tr.dataset.id) === id));
+    document.getElementById("song-title").textContent = `#${song.id} ${song.folder || "(이름 없음)"}`;
+    document.getElementById("song-meta").textContent =
+        `zip ${size(song.size)} · 파일 ${song.files.length}개 · 차트 ${song.charts.length}개 · sha256 ${song.sha256.slice(0, 16)}…`;
+    document.getElementById("song-zip").href = `/api/admin/songs/${song.id}/zip`;
+    const tree = renderNode(fileTree(song.files), song.id);
+    tree.classList.remove("ms-3");
+    // 최상위 폴더 하나만 있으면 펼쳐 둡니다.
+    const top = tree.querySelectorAll(":scope > li > details");
+    if (top.length === 1) top[0].open = true;
+    document.getElementById("song-tree").replaceChildren(tree);
+    songDetail.classList.remove("d-none");
+    songDetail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+document.getElementById("song-delete").addEventListener("click", async () => {
+    const song = currentSong;
+    if (!song) return;
+    const typed = prompt(
+        `#${song.id} ${song.folder} 곡을 지웁니다. 되돌릴 수 없습니다.\n` +
+        `사용자 클라이언트에서는 다음 동기화 때 목록에서 사라집니다.\n\n` +
+        `지우려면 곡 번호 ${song.id}를 입력하세요.`
+    );
+    if (typed === null) return;
+    if (typed.trim() !== String(song.id)) { alert("곡 번호가 맞지 않아 지우지 않았습니다."); return; }
+    const btn = document.getElementById("song-delete");
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/admin/songs/${song.id}`, { method: "DELETE" });
+        if (!res.ok) { alert(await detail(res)); return; }
+        songRows.querySelector(`tr[data-id="${song.id}"]`)?.remove();
+        document.getElementById("song-empty").classList.toggle("d-none", songRows.children.length > 0);
+        songDetail.classList.add("d-none");
+        currentSong = null;
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+loadSongs(false);
+
+// ---- 곡 임포트 ----
 const MB = 1024 * 1024;
 const MIN_CHUNK = MB / 4;
 let chunkSize = 32 * MB;  // 프록시가 413을 주면 줄입니다.

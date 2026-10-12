@@ -1263,8 +1263,10 @@ class Database:
         self.logger.info(f"insert_song: Merged {len(added)} files into song[{song_id}, {len(data)} bytes]")
         return len(data), added, conflicts
 
-    def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> list:
+    def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> tuple[list, int]:
+        """(차트 청크에 넣을 새 차트, 지운 곡에서 남은 차트를 이 곡에 다시 붙인 수)를 반환합니다."""
         new_charts = []
+        reattached = 0
         for (chart_file_path, size, sha256) in bms_files:
             filename = chart_file_path.relative_to(root).as_posix()
             cur.execute(
@@ -1274,11 +1276,19 @@ class Database:
             if cur.rowcount == 1:
                 new_charts.append((chart_arcname(sha256, chart_file_path), chart_file_path.read_bytes()))
             elif song_id is not None:
+                # 지운 곡의 차트는 차트 청크에 그대로 있으므로 청크에 다시 넣지 않고 곡만 붙입니다.
+                cur.execute(
+                    "UPDATE chart SET song_id = %s, filename = %s WHERE id = %s AND size = %s AND song_id IS NULL",
+                    (song_id, filename, str(sha256), size),
+                )
+                if cur.rowcount == 1:
+                    reattached += 1
+                    continue
                 cur.execute(
                     "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
                     (filename, str(sha256), size),
                 )
-        return new_charts
+        return new_charts, reattached
 
     def create_zip(self, source_dir: os.PathLike) -> bytes:
         """
@@ -1385,6 +1395,35 @@ class Database:
             cur.execute("SELECT data FROM manifest_chunk WHERE id = %s", (chunk_no,))
             row = cur.fetchone()
             return row[0] if row else None
+
+    def delete_song(self, song_id: int, timeout: float | None = None) -> bool:
+        """곡을 지우고 그 곡이 든 매니페스트·사전 청크를 다시 만듭니다. 없는 곡이면 False.
+
+        차트 청크에서는 뺄 수 없으므로 차트 행은 song_id만 비워 남기고, 같은 차트를 다시 임포트하면 새 곡에 붙습니다.
+        임포트 배치가 쓰기 잠금을 잡고 있으면 timeout(초)까지 기다리고, 넘으면 TimeoutError.
+        """
+        if not self._write_lock.acquire(timeout=-1 if timeout is None else timeout):
+            raise TimeoutError("song import is holding the write lock")
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT id FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    if cur.fetchone() is None:
+                        return False
+                    cur.execute("UPDATE chart SET song_id = NULL WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM download_grant WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM song WHERE id = %s", (song_id,))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        self.logger.info(f"delete_song: Deleted song[{song_id}]")
+        return True
 
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
         """song / chart_chunk / pre_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
@@ -1524,7 +1563,7 @@ class SongBatch:
                 song_bytes, added, conflicts = merged
                 # 내용이 달라 곡 zip에 넣지 못한 차트는 등록하지 않습니다(zip의 같은 경로 파일과 어긋나므로).
                 bms_files = [f for f in bms_files if f[0].relative_to(root).as_posix() not in conflicts]
-            new_charts = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
+            new_charts, reattached = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
             cur.execute("RELEASE SAVEPOINT song")
         except Exception:
             cur.execute("ROLLBACK TO SAVEPOINT song")
@@ -1534,7 +1573,7 @@ class SongBatch:
         self._chart_bytes += sum(len(content) for _, content in new_charts)
         self._song_bytes += song_bytes
         self._songs += 1
-        if new_song or new_charts or added:
+        if new_song or new_charts or reattached or added:
             self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
         if new_song or added:
             self._pre_chunks.add(song_id // constant.SONGS_PER_PRE_CHUNK)
