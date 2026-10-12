@@ -1,0 +1,48 @@
+{% extends "auth_base.html" %}
+
+{% block title %}서버 로그 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">서버 로그</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">서버 로그</h1>
+
+<form id="filter" class="row g-2 mb-2">
+    <div class="col-sm-3 col-md-2">
+        <select class="form-select form-select-sm" name="level" aria-label="최소 수준">
+            <option value="">모든 수준</option>
+            {% for level in levels %}<option value="{{ level }}">{{ level }} 이상</option>{% endfor %}
+        </select>
+    </div>
+    <div class="col-sm-5 col-md-4">
+        <select class="form-select form-select-sm" name="logger" aria-label="로거">
+            <option value="">모든 로거</option>
+            <option value="ebms_server.importer">곡 임포트 (ebms_server.importer)</option>
+            {% for name in loggers if name != "ebms_server.importer" %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="col-sm-4 col-md-4">
+        <input class="form-control form-control-sm" type="search" name="q" placeholder="메시지, 시각(2026-10-12 17:) 검색" aria-label="로그 검색">
+    </div>
+    <div class="col-md-2 d-flex gap-2">
+        <button class="btn btn-sm btn-outline-secondary" type="button" id="refresh">새로 고침</button>
+    </div>
+</form>
+<p class="text-muted small" id="info">최신 로그부터 보여줍니다. 로거를 고르면 그 하위 로거도 함께 보입니다.</p>
+
+<div class="table-responsive">
+    <table class="table table-sm small align-top">
+        <thead><tr><th class="w-11em">시각</th><th class="w-6em">수준</th><th class="w-12em">로거</th><th>메시지</th></tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+</div>
+<button class="btn btn-outline-primary btn-sm d-none" type="button" id="more">더 보기</button>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_logs.js') }}"></script>
+{% endblock %}

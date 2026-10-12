@@ -2,18 +2,23 @@
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
+- 곡 관리: 곡 검색·삭제(사용 중지)·복원, 곡 zip의 파일 구조 보기·파일 받기
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
+- 서버 로그 조회: 수준·로거·검색어 필터
 """
+import json
 import logging
+import mimetypes
 import time
+import urllib.parse
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import accounts, auth, constant, db, importer, quota
+from . import auth, constant, db, downloads, importer, logs, quota
 from .accounts import User
 from .templating import templates
 
@@ -23,6 +28,10 @@ logger = logging.getLogger(__name__)
 ROLES = ("user", "admin")
 STATUSES = ("active", "banned")
 SEARCH_LIMIT = 50
+# 곡을 지울 때 임포트 배치가 쓰기 잠금을 놓기를 기다리는 시간(초)
+DELETE_LOCK_TIMEOUT = 10
+# 삭제 사유 최대 글자 수
+REASON_MAX = 1000
 
 
 def web_admin(session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)]) -> User:
@@ -37,9 +46,12 @@ def _like(text: str) -> str:
     return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
+USER_COLUMNS = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
+
+
 def search_users(q: str = "") -> list[dict]:
     """이름·이메일·계정 ID·연결된 OAuth 이름/이메일로 찾습니다(대소문자 무시). 최근 로그인 순, 최대 SEARCH_LIMIT명."""
-    columns = "id, display_name, email, role, status, created_at, last_login_at, " + ", ".join(quota.USER_LIMITS)
+    columns = ", ".join(USER_COLUMNS)
     with db.connect() as con, con.cursor() as cur:
         if q.strip():
             # 컬럼이 _bin 콜레이션이라 대소문자를 맞춰 비교합니다.
@@ -55,38 +67,139 @@ def search_users(q: str = "") -> list[dict]:
             )
         else:
             cur.execute(f"SELECT {columns} FROM user ORDER BY last_login_at DESC, created_at DESC LIMIT {SEARCH_LIMIT}")
-        rows = cur.fetchall()
-    names = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
-    return [_with_usage(dict(zip(names, row))) for row in rows]
+        users = [dict(zip(USER_COLUMNS, row)) for row in cur.fetchall()]
+        return _with_usage(cur, users)
 
 
-def _with_usage(user: dict) -> dict:
-    limits = quota.limits_for(user["id"])
-    return {
-        "id": user["id"],
-        "display_name": user["display_name"],
-        "email": user["email"],
-        "role": user["role"],
-        "status": user["status"],
-        "created_at": user["created_at"],
-        "last_login_at": user["last_login_at"],
-        "oauths": [i.oauth for i in accounts.list_identities(user["id"])],
-        # 사용자별 값(None이면 전역 기본값)
-        "overrides": {name: user[name] for name in quota.USER_LIMITS},
-        "tickets": quota.ticket_json(quota.ticket_state(user["id"], limits)),
-        "pre": quota.pre_state(user["id"], limits),
-    }
+def _with_usage(cur, users: list[dict]) -> list[dict]:
+    """사용자 목록에 OAuth·티켓·사전 사용량을 붙입니다. 사용자 수와 상관없이 같은 연결로 쿼리 4번만 씁니다(#40)."""
+    if not users:
+        return []
+    ids = [user["id"] for user in users]
+    marks = ", ".join(["%s"] * len(ids))
+    settings = quota.get_settings(cur)
+    oauths: dict[str, list[str]] = {user_id: [] for user_id in ids}
+    cur.execute(f"SELECT user_id, oauth FROM user_identity WHERE user_id IN ({marks}) ORDER BY id", ids)
+    for user_id, oauth in cur.fetchall():
+        oauths[user_id].append(oauth)
+    cur.execute(f"SELECT user_id, tickets, updated_at FROM user_ticket WHERE user_id IN ({marks})", ids)
+    tickets = {user_id: (stored, updated_at) for user_id, stored, updated_at in cur.fetchall()}
+    month = quota.current_month()
+    cur.execute(f"SELECT user_id, bytes FROM pre_usage WHERE month = %s AND user_id IN ({marks})", (month, *ids))
+    used = {user_id: int(nbytes) for user_id, nbytes in cur.fetchall()}
+
+    now = time.time()
+    result = []
+    for user in users:
+        overrides = {name: user[name] for name in quota.USER_LIMITS}
+        limits = quota.merge_limits(settings, overrides)
+        result.append({
+            "id": user["id"],
+            "display_name": user["display_name"],
+            "email": user["email"],
+            "role": user["role"],
+            "status": user["status"],
+            "created_at": user["created_at"],
+            "last_login_at": user["last_login_at"],
+            "oauths": oauths[user["id"]],
+            # 사용자별 값(None이면 전역 기본값)
+            "overrides": overrides,
+            "tickets": quota.ticket_json(quota.ticket_state_from(tickets.get(user["id"]), limits, now)),
+            "pre": quota.pre_state_from(used.get(user["id"], 0), limits, month),
+        })
+    return result
+
+
+def search_songs(q: str = "", before: int | None = None) -> list[dict]:
+    """곡 번호·폴더명·차트 파일명으로 찾습니다(대소문자 무시). 최근 등록 순, 최대 SEARCH_LIMIT곡.
+    before를 주면 그보다 작은 번호만(다음 쪽)."""
+    where = []
+    params: list = []
+    q = q.strip()
+    if q:
+        like = _like(q.lower())
+        cond = "LOWER(s.folder) LIKE %s OR s.id IN (SELECT song_id FROM chart WHERE LOWER(filename) LIKE %s)"
+        params += [like, like]
+        if q.isdigit():
+            cond = "s.id = %s OR " + cond
+            params.insert(0, int(q))
+        where.append(f"({cond})")
+    if before is not None:
+        where.append("s.id < %s")
+        params.append(before)
+    sql = (
+        "SELECT s.id, s.folder, s.size, (SELECT COUNT(*) FROM chart c WHERE c.song_id = s.id) FROM song s"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + f" ORDER BY s.id DESC LIMIT {SEARCH_LIMIT}"
+    )
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [
+            {"id": song_id, "folder": folder, "size": size, "charts": charts}
+            for song_id, folder, size, charts in cur.fetchall()
+        ]
+
+
+DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at")
+
+
+def search_deleted_songs(q: str = "", before: int | None = None) -> list[dict]:
+    """지운 곡 기록을 곡 번호·폴더명·사유로 찾습니다. 번호 내림차순, 최대 SEARCH_LIMIT개.
+    before를 주면 그보다 작은 번호만(다음 쪽)."""
+    where = []
+    params: list = []
+    q = q.strip()
+    if q:
+        like = _like(q.lower())
+        cond = "LOWER(d.folder) LIKE %s OR LOWER(d.reason) LIKE %s"
+        params += [like, like]
+        if q.isdigit():
+            cond = "d.song_id = %s OR " + cond
+            params.insert(0, int(q))
+        where.append(f"({cond})")
+    if before is not None:
+        where.append("d.song_id < %s")
+        params.append(before)
+    columns = ", ".join(f"d.{name}" for name in DELETED_COLUMNS)
+    sql = (
+        f"SELECT {columns}, u.display_name FROM deleted_song d LEFT JOIN user u ON u.id = d.deleted_by"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + f" ORDER BY d.song_id DESC LIMIT {SEARCH_LIMIT}"
+    )
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [
+            {**dict(zip(DELETED_COLUMNS, row)), "deleted_by_name": row[-1]}
+            for row in cur.fetchall()
+        ]
+
+
+def get_song_detail(song_id: int) -> dict:
+    """곡 정보와 곡 zip의 파일 목록. 파일마다 차트면 chart(sha256)가 붙습니다."""
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT id, folder, size, sha256, files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="song not found")
+        cur.execute("SELECT id, filename, size FROM chart WHERE song_id = %s ORDER BY filename", (song_id,))
+        charts = [{"sha256": sha256, "path": path, "size": size} for sha256, path, size in cur.fetchall()]
+    by_path = {chart["path"]: chart["sha256"] for chart in charts}
+    files = []
+    for entry in json.loads(row[4]) if row[4] else []:
+        item = {"path": entry["path"], "size": entry["size"], "comp_size": entry["comp_size"], "kind": entry.get("kind")}
+        if entry["path"] in by_path:
+            item["chart"] = by_path[entry["path"]]
+        files.append(item)
+    return {"id": row[0], "folder": row[1], "size": row[2], "sha256": row[3], "charts": charts, "files": files}
 
 
 def get_user_detail(user_id: str) -> dict:
-    columns = "id, display_name, email, role, status, created_at, last_login_at, " + ", ".join(quota.USER_LIMITS)
     with db.connect() as con, con.cursor() as cur:
-        cur.execute(f"SELECT {columns} FROM user WHERE id = %s", (user_id,))
+        cur.execute(f"SELECT {', '.join(USER_COLUMNS)} FROM user WHERE id = %s", (user_id,))
         row = cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    names = ("id", "display_name", "email", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
-    return _with_usage(dict(zip(names, row)))
+        if row is None:
+            raise HTTPException(status_code=404, detail="user not found")
+        return _with_usage(cur, [dict(zip(USER_COLUMNS, row))])[0]
 
 
 # ---- 페이지 ----
@@ -116,8 +229,31 @@ def admin_page(
     )
 
 
+@router.get("/admin/songs", response_class=HTMLResponse)
 @router.get("/admin/import", response_class=HTMLResponse)
-def import_page(
+def songs_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
+):
+    """곡 관리(검색·삭제·파일 보기)와 곡 임포트 탭. /admin/import는 임포트 탭을 엽니다."""
+    if session is None:
+        return auth._login_redirect(request)
+    if not session[0].is_admin:
+        return _forbidden(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/admin_songs.html",
+        context={
+            "user": session[0],
+            "formats": constant.BMS_FORMAT,
+            "tab": "import" if request.url.path == "/admin/import" else "songs",
+            "limit": SEARCH_LIMIT,
+        },
+    )
+
+
+@router.get("/admin/logs", response_class=HTMLResponse)
+def logs_page(
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
 ):
@@ -127,8 +263,8 @@ def import_page(
         return _forbidden(request)
     return templates.TemplateResponse(
         request=request,
-        name="pages/admin_import.html",
-        context={"user": session[0], "formats": constant.BMS_FORMAT},
+        name="pages/admin_logs.html",
+        context={"user": session[0], "levels": logs.LEVELS, "loggers": logs.loggers()},
     )
 
 
@@ -216,6 +352,105 @@ def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
     return get_user_detail(user_id)
 
 
+@router.get("/api/admin/songs")
+def list_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
+    return search_songs(q, before)
+
+
+@router.get("/api/admin/songs/deleted")
+def list_deleted_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
+    return search_deleted_songs(q, before)
+
+
+@router.get("/api/admin/songs/{song_id}")
+def get_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
+    return get_song_detail(song_id)
+
+
+class SongDelete(BaseModel):
+    reason: str = ""
+
+
+@router.delete("/api/admin/songs/{song_id}")
+def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: SongDelete | None = None):
+    """곡을 사용 중지합니다. 곡 파일은 var/unused/{id}/로 옮기고 사유와 함께 기록하며, 번호는 결번으로 남아
+    /restore로 되돌릴 수 있습니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다.
+    임포트가 쓰기 잠금을 오래 잡고 있으면 409."""
+    reason = (body.reason if body else "").strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    try:
+        deleted = db.Database().delete_song(song_id, reason, admin.id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    if not deleted:
+        raise HTTPException(status_code=404, detail="song not found")
+    logger.info(f"song {song_id} deleted by {admin.id}: {reason}")
+    return {"ok": True}
+
+
+@router.post("/api/admin/songs/{song_id}/restore")
+def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
+    """사용 중지한 곡을 같은 번호로 되돌립니다. 클라이언트는 다음 동기화 때 다시 받습니다."""
+    try:
+        db.Database().restore_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="사용 중지한 곡이 아닙니다.")
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except db.ChartInUseError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"차트가 그 사이 다른 곡({', '.join(f'#{i}' for i in e.song_ids)})으로 등록돼 복원할 수 없습니다.",
+        )
+    except (FileNotFoundError, ValueError) as e:
+        logger.exception(f"restore song {song_id} failed")
+        raise HTTPException(status_code=500, detail=f"옮겨 둔 파일로 복원하지 못했습니다: {e}")
+    logger.info(f"song {song_id} restored by {admin.id}")
+    return get_song_detail(song_id)
+
+
+@router.get("/api/admin/songs/{song_id}/zip")
+def download_song_zip(song_id: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
+    """곡 zip 전체. 티켓·사용량은 쓰지 않습니다."""
+    return downloads.blob_response(request, "song", song_id, f"song_{song_id}.zip", "song not found")
+
+
+@router.get("/api/admin/songs/{song_id}/file")
+def download_song_file(song_id: int, path: str, admin: Annotated[User, Depends(web_admin)]):
+    """곡 zip의 파일 하나를 압축을 풀어 내려줍니다. 티켓·사용량은 쓰지 않습니다."""
+    files = db.Database().get_song_files(song_id)
+    if files is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    entry = next((f for f in files if f["path"] == path), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    blob = db.Database().open_blob("song", song_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    try:
+        start, decompressor = downloads._zip_member(blob, entry)
+    except ValueError:
+        blob.close()
+        raise HTTPException(status_code=500, detail="broken song file")
+    body = downloads._iter_member(blob, start, entry["comp_size"], decompressor)
+    name = urllib.parse.quote(path.rsplit("/", 1)[-1])
+
+    @downloads._once
+    def cleanup():
+        try:
+            body.close()
+        finally:
+            blob.close()
+
+    return downloads.ReleasingStreamingResponse(
+        body,
+        on_close=cleanup,
+        media_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
+        headers={"Content-Length": str(entry["size"]), "Content-Disposition": f"attachment; filename*=UTF-8''{name}"},
+    )
+
+
 class UploadStart(BaseModel):
     filename: str
     size: int
@@ -272,3 +507,19 @@ def get_job(job_id: str, admin: Annotated[User, Depends(web_admin)]):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job.json()
+
+
+@router.get("/api/admin/logs")
+def search_logs(
+    admin: Annotated[User, Depends(web_admin)],
+    level: str = "",
+    logger: str = "",
+    q: str = "",
+    cursor: str = "",
+    limit: int = 200,
+):
+    """서버 로그를 최신부터 거릅니다. level은 최소 수준, logger는 이름 또는 상위 이름."""
+    try:
+        return logs.search(level=level, logger=logger, q=q, cursor=cursor, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

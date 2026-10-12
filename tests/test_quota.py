@@ -1,8 +1,13 @@
 """사전/플레이 다운로드, 티켓, 월 사용량·감속, 관리자 설정 테스트."""
 import datetime
 import io
+import json
 import os
+import threading
 import zipfile
+
+import anyio
+import anyio.to_thread
 
 from ebms_server import constant, db as db_module, quota
 from ebms_server.db import Database, file_kinds
@@ -76,6 +81,108 @@ def test_file_kinds(tmp_path):
     data = Database.create_zip(None, song)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         assert file_kinds(zf) == EXPECTED_KINDS
+
+
+def test_file_kinds_strict_rules(tmp_path):
+    """헤더 값의 확장자가 헤더 형식이 아니거나 없으면 무시하고, preview*는 차트 폴더의 오디오만,
+    키음·BGA로 쓰는 파일은 사전 헤더가 가리키지 않는 한 play (#36)"""
+    song = tmp_path / "s"
+    (song / "sub").mkdir(parents=True)
+    (song / "a.bms").write_bytes(
+        b"#BANNER sound.wav\r\n"         # 이미지 헤더에 오디오 → 무시
+        b"#STAGEFILE bga\\movie.mp4\r\n"  # 이미지 헤더에 동영상 → 무시
+        b"#PREVIEW bgm\r\n"              # 확장자 없음 → 무시
+        b"#BACKBMP back.png\r\n"
+        b"#WAV01 sound.wav\r\n"
+        b"#WAV02 preview_full.ogg\r\n"    # preview*지만 키음
+        b"#wav03 preview_hook.wav\r\n"    # 키음이지만 #PREVIEW도 가리킴
+        b"#PREVIEW preview_hook.wav\r\n"
+        b"#BMP01 bga\\movie.mp4\r\n"
+    )
+    for name in (
+        "sound.wav", "sound.png", "bgm.ogg", "bgm.wav", "back.jpg", "back.wav",
+        "preview_full.ogg", "preview_full.wav", "preview_hook.wav", "preview.ogg",
+        "previewbga.mp4", "preview.png", "sub/preview.ogg",
+    ):
+        (song / name).write_bytes(os.urandom(100))
+    (song / "bga").mkdir()
+    (song / "bga" / "movie.mp4").write_bytes(os.urandom(100))
+    data = Database.create_zip(None, song)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert file_kinds(zf) == {
+            "a.bms": "pre",
+            "sound.wav": "play",
+            "sound.png": "play",
+            "bgm.ogg": "play",
+            "bgm.wav": "play",
+            "back.jpg": "pre",
+            "back.wav": "play",
+            "preview_full.ogg": "play",
+            "preview_full.wav": "play",
+            "preview_hook.wav": "pre",
+            "preview.ogg": "pre",
+            "previewbga.mp4": "play",
+            "preview.png": "play",
+            "sub/preview.ogg": "play",
+            "bga/movie.mp4": "play",
+        }
+
+
+def test_backfill_file_kinds_recomputes_old_rules(tmp_path, client, monkeypatch):
+    """이전 규칙으로 판정한 곡은 시작할 때 다시 판정하고, 사전 청크도 새 규칙으로 다시 만듭니다 (#36)"""
+    key, _ = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    db = Database()
+    db.backfill_pre_chunks()
+    # 이전 규칙: 키음·BGA도 pre로 판정돼 있던 상태
+    with db_module.connect() as con, con.cursor() as cur:
+        files = db.get_song_files(1)
+        cur.execute(
+            "UPDATE song SET files = %s WHERE id = 1",
+            (json.dumps([{**e, "kind": "pre"} for e in files]),),
+        )
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        con.commit()
+    with db_module.connect() as con, con.cursor() as cur:
+        db._rebuild_pre_chunk(cur, 0)
+        con.commit()
+    h = bearer(key)
+    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 200
+
+    assert db.backfill_file_kinds() == 1
+    assert {p: f["kind"] for p, f in manifest_files(client, key).items()} == EXPECTED_KINDS
+    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 403
+    # 사전 청크는 지워졌다가 뒤에서 새 규칙으로 다시 만들어짐
+    assert db.get_pre_chunk_hash() == {}
+    assert db.backfill_pre_chunks() == 1
+    asset = client.get("/api/pre/asset/0", headers=h)
+    with zipfile.ZipFile(io.BytesIO(asset.content)) as zf:
+        assert sorted(zf.namelist()) == ["1/banner.jpg", "1/preview_auto.ogg", "1/sub/PV.wav", "1/ステージ.bmp"]
+    # 버전을 기록했으므로 다음 시작 때는 다시 하지 않음
+    assert db.backfill_file_kinds() == 0
+
+
+def test_backfill_file_kinds_skips_broken_song(tmp_path, client, monkeypatch):
+    """판정하지 못한 곡은 건너뛰고 다른 곡은 고치며, 버전은 올리지 않아 다음에 다시 시도합니다 (#36)"""
+    add_songs(tmp_path, 2)
+    db = Database()
+    with db_module.connect() as con, con.cursor() as cur:
+        for song_id in (1, 2):
+            files = db.get_song_files(song_id)
+            if song_id == 1:
+                files = [{**e, "crc32": "00000000"} if e["path"] == "a.bms" else e for e in files]
+            cur.execute(
+                "UPDATE song SET files = %s WHERE id = %s",
+                (json.dumps([{**e, "kind": "pre"} for e in files]), song_id),
+            )
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        con.commit()
+    assert db.backfill_file_kinds() == 1
+    assert {e["path"]: e["kind"] for e in db.get_song_files(2)} == EXPECTED_KINDS
+    assert {e["kind"] for e in db.get_song_files(1)} == {"pre"}
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT value FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        assert cur.fetchone() is None
 
 
 def test_manifest_kind_and_backfill(tmp_path, client, monkeypatch):
@@ -328,6 +435,74 @@ def test_admin_user_overrides(tmp_path, client, monkeypatch):
     assert client.post("/api/admin/users/nope/refill").status_code == 404
 
 
+def test_admin_user_list_batches_queries(tmp_path, client, monkeypatch):
+    """관리 목록은 사용자 수와 상관없이 연결 1개·쿼리 몇 번으로 만듭니다 (#40)"""
+    from ebms_server import accounts, admin
+    from ebms_server.accounts import Profile
+
+    add_songs(tmp_path, 1)
+    users = [accounts.login(Profile("google", f"g{i}", f"u{i}@example.com", True, f"user{i}")) for i in range(12)]
+    accounts.link(users[0].id, Profile("discord", "d0", None, False, "user0"))
+    quota.charge_play(users[1].id, 1)
+    quota.add_pre_usage(users[2].id, 1234)
+    quota.set_overrides(users[3].id, {"max_tickets": 9})
+    expected = {user.id: admin.get_user_detail(user.id) for user in users}
+
+    connects = []
+    queries = []
+    original = db_module.connect
+
+    class CountingCursor:
+        def __init__(self, cur):
+            self.cur = cur
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.cur.close()
+
+        def execute(self, query, args=None):
+            queries.append(query)
+            return self.cur.execute(query, args)
+
+        def __getattr__(self, name):
+            return getattr(self.cur, name)
+
+    class CountingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.con = self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def cursor(self):
+            return CountingCursor(self.con.cursor())
+
+        def __getattr__(self, name):
+            return getattr(self.con, name)
+
+    def counting_connect(**kwargs):
+        connects.append(kwargs)
+        return CountingConnection(original(**kwargs))
+
+    monkeypatch.setattr(db_module, "connect", counting_connect)
+    found = {u["id"]: u for u in admin.search_users()}
+    assert len(connects) == 1
+    assert len(queries) == 5  # 사용자, 설정, OAuth, 티켓, 사전 사용량
+    assert len(found) == 12
+    for user_id, detail in expected.items():
+        assert found[user_id] == detail
+    assert found[users[0].id]["oauths"] == ["google", "discord"]
+    assert found[users[1].id]["tickets"]["available"] == 4
+    assert found[users[2].id]["pre"]["used_bytes"] == 1234
+    assert found[users[3].id]["tickets"]["max"] == 9
+
+
 def test_admin_ban(client, monkeypatch):
     key, user_id = client_login(client, monkeypatch)
     admin_login(client, monkeypatch)
@@ -474,3 +649,50 @@ def test_min_throttled_kbps_validation():
         quota.validate("pre_throttled_kbps", 10)
 
     assert quota.validate("pre_throttled_kbps", 64) == 64
+
+
+# ---- 다운로드 스레드 (#41) ----
+
+def test_metered_reads_in_download_limiter_and_writes_usage_off_loop_when_cancelled(monkeypatch):
+    """본문 조각은 다운로드 전용 스레드 한도에서 읽고, 취소돼도 사용량은 이벤트 루프 밖 스레드에서 기록합니다."""
+    limits = quota.Limits(5, 60, 1800, 0, 500)  # 한도 0 → 감속(500Kbps)
+    monkeypatch.setattr(quota, "limits_for", lambda user_id: limits)
+    monkeypatch.setattr(quota, "pre_used", lambda user_id: 0)
+    writes = []
+    monkeypatch.setattr(
+        quota, "add_pre_usage", lambda user_id, nbytes: writes.append((user_id, nbytes, threading.get_ident()))
+    )
+    closed = []
+
+    async def main():
+        loop_thread = threading.get_ident()
+        limiter = quota.download_limiter()
+        default = anyio.to_thread.current_default_thread_limiter()
+        tokens = []
+
+        def chunks():
+            tokens.append((limiter.borrowed_tokens, default.borrowed_tokens, threading.get_ident()))
+            yield b"x" * (2 * quota.THROTTLE_PIECE)
+
+        got = []
+
+        async def consume():
+            async for piece in quota.metered("u-cancel", chunks(), close=lambda: closed.append(True)):
+                got.append(piece)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(consume)
+            with anyio.fail_after(5):
+                while not got:
+                    await anyio.sleep(0.01)
+            # 두 번째 조각은 감속 대기(약 0.26초) 중. 여기서 취소합니다(연결 끊김).
+            await anyio.sleep(0.05)
+            tg.cancel_scope.cancel()
+        return loop_thread, tokens, got
+
+    loop_thread, tokens, got = anyio.run(main)
+    assert tokens == [(1, 0, tokens[0][2])] and tokens[0][2] != loop_thread
+    assert len(got) == 1
+    assert closed == [True]
+    assert [(u, n) for u, n, _ in writes] == [("u-cancel", quota.THROTTLE_PIECE)]
+    assert writes[0][2] != loop_thread

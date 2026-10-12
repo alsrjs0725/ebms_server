@@ -4,6 +4,7 @@ import gzip
 import json
 import pathlib
 import posixpath
+import re
 import hashlib
 import logging
 import shutil
@@ -11,6 +12,7 @@ import stat
 import struct
 import zipfile
 import threading
+import time
 import zlib
 from collections import defaultdict
 from collections.abc import Iterator
@@ -167,6 +169,7 @@ SCHEMA = [
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 할당량 전역 기본값. 관리자 페이지에서 수정합니다. 값은 정수 문자열입니다.
+    # 서버 내부 값(file_kinds_version)도 여기 둡니다.
     """
         CREATE TABLE IF NOT EXISTS setting(
             name VARCHAR(64) NOT NULL,
@@ -209,6 +212,23 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 지운(사용 중지한) 곡. 곡 zip과 차트는 UNUSED_DIR/{song_id}/로 옮겨 두고 같은 번호로 복원할 수 있습니다.
+    # 번호는 결번으로 남고 다른 곡에 다시 쓰지 않습니다. chart_list는 복원할 때 다시 붙일 차트 [[sha256, size, 경로], ...].
+    """
+        CREATE TABLE IF NOT EXISTS deleted_song(
+            song_id INT UNSIGNED NOT NULL,
+            folder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            size BIGINT UNSIGNED NOT NULL,
+            sha256 CHAR(64) NOT NULL,
+            charts INT UNSIGNED NOT NULL,
+            chart_list MEDIUMTEXT NOT NULL,
+            reason TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            deleted_by CHAR(36),
+            deleted_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (song_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 클라이언트에 띄울 공지. starts_at·ends_at이 NULL이면 제한 없음입니다.
     """
         CREATE TABLE IF NOT EXISTS notice(
@@ -239,62 +259,96 @@ MISSING_COLUMNS = [
 ]
 
 
-# 사전 파일을 가리키는 차트 헤더와, 파일 확장자가 달라도 같은 파일로 보는 종류(BMS 플레이어의 확장자 대체)
+# 사전 파일을 가리키는 차트 헤더와 그 헤더가 받는 형식. 헤더 값의 확장자가 이 형식일 때만 인정하고,
+# 실제 파일 확장자가 달라도 같은 형식 안이면 같은 파일로 봅니다(BMS 플레이어의 확장자 대체).
 PRE_HEADERS = {
     b"#BANNER": constant.IMAGE_FORMAT,
     b"#STAGEFILE": constant.IMAGE_FORMAT,
     b"#BACKBMP": constant.IMAGE_FORMAT,
     b"#PREVIEW": constant.AUDIO_FORMAT,
 }
+# 키음(#WAVxx)·BGA(#BMPxx) 정의. 여기서 가리키는 파일은 사전 헤더가 함께 가리키지 않는 한 pre가 아닙니다.
+PLAY_HEADER = re.compile(rb"#(?:WAV|BMP)[0-9A-Z]{2}[ \t]", re.IGNORECASE)
 # 차트 헤더 값(파일명)의 인코딩 후보
 CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
+# pre/play 판정 규칙 버전. 규칙을 바꾸면 올리고, 서버 시작 시 이전 규칙으로 판정한 곡을 다시 판정합니다.
+FILE_KINDS_VERSION = 2
+# FILE_KINDS_VERSION을 적용한 버전을 저장하는 setting 이름
+FILE_KINDS_SETTING = "file_kinds_version"
 
 
-def _header_targets(chart: bytes, base: str) -> list[tuple[str, tuple[str, ...]]]:
-    """차트 헤더가 가리키는 파일의 (소문자 경로, 대체 가능한 확장자)를 반환합니다. base는 차트가 있는 폴더입니다."""
-    targets = []
+def _header_paths(value: bytes, base: str) -> list[str]:
+    """차트 헤더 값을 인코딩 후보마다 풀어 base 기준 소문자 경로로 만듭니다."""
+    paths = []
+    for encoding in CHART_ENCODINGS:
+        try:
+            name = value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        paths.append(posixpath.normpath(posixpath.join(base, name.replace("\\", "/"))).lower())
+    return paths
+
+
+def _chart_refs(chart: bytes, base: str) -> tuple[list[tuple[str, tuple[str, ...]]], set[str]]:
+    """차트가 가리키는 파일. (사전 헤더의 (소문자 경로, 대체 가능한 확장자) 목록, 키음·BGA의 소문자 확장자 뺀 경로)를
+    반환합니다. 사전 헤더 값의 확장자가 그 헤더의 형식이 아니면(확장자 없음 포함) 무시합니다. base는 차트가 있는 폴더입니다."""
+    pre_targets = []
+    play_stems = set()
     for line in chart.splitlines():
         line = line.strip()
+        if PLAY_HEADER.match(line):
+            for path in _header_paths(line[6:].strip(), base):
+                play_stems.add(posixpath.splitext(path)[0])
+            continue
         for header, formats in PRE_HEADERS.items():
             if line[:len(header)].upper() != header or line[len(header):len(header) + 1] not in (b" ", b"\t"):
                 continue
-            value = line[len(header):].strip()
-            for encoding in CHART_ENCODINGS:
-                try:
-                    name = value.decode(encoding)
-                except UnicodeDecodeError:
-                    continue
-                path = posixpath.normpath(posixpath.join(base, name.replace("\\", "/"))).lower()
-                targets.append((path, formats))
-    return targets
+            for path in _header_paths(line[len(header):].strip(), base):
+                if posixpath.splitext(path)[1] in formats:
+                    pre_targets.append((path, formats))
+    return pre_targets, play_stems
+
+
+def kinds_from_charts(paths: list[str], charts: dict[str, bytes]) -> dict[str, str]:
+    """곡 zip 항목별 다운로드 구분. paths는 파일 경로, charts는 그중 차트 파일의 {경로: 내용}입니다.
+
+    pre(사전): 차트, 차트 헤더 #BANNER·#STAGEFILE·#BACKBMP(이미지)·#PREVIEW(오디오)가 가리키는 파일,
+    차트와 같은 폴더의 preview*로 시작하는 오디오 파일(키음·BGA로 쓰는 파일 제외).
+    play(플레이): 나머지(키음, BGA 등).
+    """
+    by_stem: dict[str, set[str]] = defaultdict(set)
+    play_stems: set[str] = set()
+    chart_dirs: set[str] = set()
+    for path, content in charts.items():
+        base = posixpath.dirname(path)
+        chart_dirs.add(base.lower())
+        targets, stems = _chart_refs(content, base)
+        for target, formats in targets:
+            by_stem[posixpath.splitext(target)[0]].update(formats)
+        play_stems |= stems
+
+    kinds = {}
+    for path in paths:
+        lower = path.lower()
+        stem, ext = posixpath.splitext(lower)
+        preview = (
+            posixpath.basename(lower).startswith("preview")
+            and ext in constant.AUDIO_FORMAT
+            and posixpath.dirname(lower) in chart_dirs
+            and stem not in play_stems
+        )
+        pre = ext in constant.BMS_FORMAT or ext in by_stem.get(stem, ()) or preview
+        kinds[path] = "pre" if pre else "play"
+    return kinds
 
 
 def file_kinds(zf: zipfile.ZipFile) -> dict[str, str]:
-    """곡 zip 항목별 다운로드 구분. pre(사전): 차트, 차트 헤더 #BANNER·#STAGEFILE·#BACKBMP·#PREVIEW가
-    가리키는 파일, preview*로 시작하는 파일. play(플레이): 나머지(키음, BGA 등)."""
-    infos = [info for info in zf.infolist() if not info.is_dir()]
-    exact: set[str] = set()
-    by_stem: dict[str, set[str]] = defaultdict(set)
-    for info in infos:
-        path = pathlib.PurePosixPath(info.filename)
-        if path.suffix.lower() not in constant.BMS_FORMAT:
-            continue
-        for target, formats in _header_targets(zf.read(info), path.parent.as_posix()):
-            exact.add(target)
-            by_stem[posixpath.splitext(target)[0]].update(formats)
-
-    kinds = {}
-    for info in infos:
-        lower = info.filename.lower()
-        stem, ext = posixpath.splitext(lower)
-        pre = (
-            ext in constant.BMS_FORMAT
-            or posixpath.basename(lower).startswith("preview")
-            or lower in exact
-            or ext in by_stem.get(stem, ())
-        )
-        kinds[info.filename] = "pre" if pre else "play"
-    return kinds
+    """곡 zip 항목별 다운로드 구분(kinds_from_charts 참고)."""
+    paths = [info.filename for info in zf.infolist() if not info.is_dir()]
+    charts = {
+        path: zf.read(path) for path in paths if pathlib.PurePosixPath(path).suffix.lower() in constant.BMS_FORMAT
+    }
+    return kinds_from_charts(paths, charts)
 
 
 def zip_entries(data: bytes) -> list[dict]:
@@ -411,6 +465,14 @@ class AmbiguousSongError(ValueError):
     """새 폴더의 차트가 기존 곡 여러 개와 겹쳐 어느 곡에 넣을지 정할 수 없습니다. 등록하지 않고 폴더는 남깁니다."""
 
 
+class ChartInUseError(ValueError):
+    """복원하려는 곡의 차트가 그 사이 다른 곡에 들어가 있습니다."""
+
+    def __init__(self, song_ids: list[int]):
+        super().__init__(f"charts are used by songs {song_ids}")
+        self.song_ids = song_ids
+
+
 class BlobReader:
     """BLOB을 나눠 읽습니다. 전송 중에 연결을 유지하지 않고 매 chunk 읽기마다 단기 연결을 씁니다."""
 
@@ -506,11 +568,75 @@ class BlobReader:
         pass
 
 
-def connect(**kwargs) -> pymysql.connections.Connection:
-    """constant.py에 정의된 MySQL 서버에 연결합니다.
+class ConnectionPool:
+    """스레드 안전한 간단한 연결 풀. 접속 정보별로 다 쓴 연결을 최대 size개까지 남겨 두고 다시 씁니다.
 
-    주의: PyMySQL Connection의 context manager는 __exit__ 시 con.close()를 부르지 않으므로
-    자동으로 connection을 닫으려면 ConnectionWrapper를 반환합니다.
+    연결마다 TLS·인증에 수십 ms가 들어 쿼리마다 새로 맺으면 요청 하나에 수백 ms가 걸리므로 재사용합니다(#40).
+    - 꺼낼 때 ping으로 끊긴 연결(서버 재시작, wait_timeout)을 걸러 내고 새로 맺습니다.
+    - 돌려받을 때 rollback해 커밋하지 않은 작업·트랜잭션 스냅숏을 버립니다(연결을 닫을 때와 같은 결과).
+      rollback이 실패하거나 남겨 둔 연결이 size개면 닫습니다.
+    - 동시에 쓰는 연결 수는 막지 않습니다(스레드 한도가 상한). size는 놀고 있는 연결 수의 상한입니다.
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+        self._idle: dict[tuple, list[pymysql.connections.Connection]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def connect(self, params: dict) -> "ConnectionWrapper":
+        key = tuple(sorted(params.items()))
+        while True:
+            with self._lock:
+                idle = self._idle.get(key)
+                con = idle.pop() if idle else None
+            if con is None:
+                return ConnectionWrapper(pymysql.connect(**params), self, key)
+            try:
+                con.ping(reconnect=False)
+            except Exception:
+                self._discard(con)
+                continue
+            return ConnectionWrapper(con, self, key)
+
+    def release(self, key: tuple, con: pymysql.connections.Connection) -> None:
+        if not con.open:
+            return
+        try:
+            con.rollback()
+        except Exception:
+            self._discard(con)
+            return
+        with self._lock:
+            idle = self._idle[key]
+            if len(idle) < self.size:
+                idle.append(con)
+                return
+        self._discard(con)
+
+    def clear(self) -> None:
+        """남겨 둔 연결을 모두 닫습니다."""
+        with self._lock:
+            cons = [con for idle in self._idle.values() for con in idle]
+            self._idle.clear()
+        for con in cons:
+            self._discard(con)
+
+    @staticmethod
+    def _discard(con: pymysql.connections.Connection) -> None:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+_pool = ConnectionPool(constant.DB_POOL_SIZE)
+
+
+def connect(**kwargs) -> "ConnectionWrapper":
+    """constant.py에 정의된 MySQL 서버에 연결합니다. 연결 풀(ConnectionPool)에서 꺼내고 다 쓰면 돌려줍니다.
+
+    with connect() as con 은 pymysql.Connection을 주고, with를 빠져나가거나 close()를 부르면
+    커밋하지 않은 작업을 rollback한 뒤 풀에 돌려줍니다.
     """
     params = dict(
         host=constant.DB_HOST,
@@ -522,25 +648,34 @@ def connect(**kwargs) -> pymysql.connections.Connection:
         max_allowed_packet=constant.DB_MAX_ALLOWED_PACKET,
     )
     params.update(kwargs)
-    con = pymysql.connect(**params)
-    return ConnectionWrapper(con)
+    return _pool.connect(params)
 
 
 class ConnectionWrapper:
-    """pymysql.Connection의 래퍼. with 문을 빠져나갈 때 연결을 확실히 닫습니다."""
+    """pymysql.Connection의 래퍼. with 문을 빠져나가거나 close()를 부르면 연결을 풀에 돌려줍니다(한 번만)."""
 
-    def __init__(self, con: pymysql.connections.Connection):
+    def __init__(self, con: pymysql.connections.Connection, pool: ConnectionPool | None = None, key: tuple = ()):
         self._con = con
+        self._pool = pool
+        self._key = key
+        self._released = False
 
     def __enter__(self):
-        return self._con.__enter__()
+        return self._con
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            return self._con.__exit__(exc_type, exc_val, exc_tb)
-        finally:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._pool is None:
             if self._con.open:
                 self._con.close()
+        else:
+            self._pool.release(self._key, self._con)
 
     def __getattr__(self, name):
         return getattr(self._con, name)
@@ -564,6 +699,7 @@ class Database:
         self.logger = logging.getLogger(__name__)
         self.generate_database()
         self.backfill_manifest()
+        self.backfill_file_kinds()
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT @@max_allowed_packet")
             self.max_allowed_packet = cur.fetchone()[0]
@@ -814,62 +950,171 @@ class Database:
     def backfill_manifest(self) -> None:
         """매니페스트 정보가 없는 곡(이전 버전에서 넣은 곡)의 항목 목록을 song zip에서 채웁니다.
         원래 폴더명은 알 수 없으므로 song id를 폴더명으로 씁니다. 항목에 kind(pre/play)가 없는 곡도 다시 채웁니다.
-        또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다."""
-        with self._write_lock, connect() as con, con.cursor() as cur:
-            try:
-                # 1) 기존 song.data BLOB을 song_part로 마이그레이션
-                cur.execute("SELECT id, data FROM song WHERE data IS NOT NULL")
-                rows = cur.fetchall()
-                for song_id, song_data in rows:
-                    if song_data is not None:
+        또한 chart 테이블에 filename이 채워지지 않은 항목의 파일명을 song zip에서 추출해 채웁니다.
+
+        서버 시작 때 실행하므로 곡마다 예외를 잡아 로그를 남기고 건너뜁니다(손상된 zip 하나가 시작을 막지 않게, #45).
+        BACKFILL_BATCH_SONGS곡마다 커밋하고, 건너뛴 곡은 다음 시작 때 다시 시도합니다."""
+        # 1) 기존 song.data BLOB을 song_part로 마이그레이션(곡마다 커밋)
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM song WHERE data IS NOT NULL ORDER BY id")
+            legacy_ids = [row[0] for row in cur.fetchall()]
+        for song_id in legacy_ids:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT data FROM song WHERE id = %s AND data IS NOT NULL", (song_id,))
+                    row = cur.fetchone()
+                    if row is not None:
                         step = constant.BLOB_READ_SIZE
-                        for seq, pos in enumerate(range(0, len(song_data), step)):
-                            part = song_data[pos : pos + step]
+                        for seq, pos in enumerate(range(0, len(row[0]), step)):
                             cur.execute(
                                 "INSERT IGNORE INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
-                                (song_id, seq, part),
+                                (song_id, seq, row[0][pos : pos + step]),
                             )
                         cur.execute("UPDATE song SET data = NULL WHERE id = %s", (song_id,))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    self.logger.exception(f"backfill_manifest: Skipped moving song[{song_id}] data to song_part")
 
-                cur.execute(
-                    "SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s OR files NOT LIKE %s ORDER BY id",
-                    ('%"kind"%', '%"data_offset"%'),
-                )
-                song_ids_no_files = set(row[0] for row in cur.fetchall())
+        # 2) 매니페스트 항목·차트 파일명 채우기
+        with connect() as con, con.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM song WHERE files IS NULL OR files NOT LIKE %s OR files NOT LIKE %s ORDER BY id",
+                ('%"kind"%', '%"data_offset"%'),
+            )
+            song_ids_no_files = set(row[0] for row in cur.fetchall())
+            cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
+            song_ids_no_filenames = set(row[0] for row in cur.fetchall())
 
-                cur.execute("SELECT DISTINCT song_id FROM chart WHERE filename = '' AND song_id IS NOT NULL")
-                song_ids_no_filenames = set(row[0] for row in cur.fetchall())
-
-                affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
-                if affected_song_ids:
-                    for song_id in affected_song_ids:
-                        song_data = self._get_song_data_with_cur(cur, song_id)
-                        if not song_data:
-                            continue
-                        if song_id in song_ids_no_files:
-                            files = zip_entries(song_data)
-                            cur.execute(
-                                "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
-                                (str(song_id), json.dumps(files), song_id),
+        affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
+        updated = failed = 0
+        step = constant.BACKFILL_BATCH_SONGS
+        for i in range(0, len(affected_song_ids), step):
+            batch = affected_song_ids[i : i + step]
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    done = []
+                    for song_id in batch:
+                        cur.execute("SAVEPOINT song")
+                        try:
+                            self._backfill_song_manifest(
+                                cur, song_id, song_id in song_ids_no_files, song_id in song_ids_no_filenames
                             )
-                        if song_id in song_ids_no_filenames:
-                            with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
-                                for info in zf.infolist():
-                                    if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
-                                        content = zf.read(info)
-                                        sha256 = hashlib.sha256(content).hexdigest()
-                                        cur.execute(
-                                            "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
-                                            (info.filename, song_id, sha256),
-                                        )
-                    for chunk_no in sorted({i // constant.SONGS_PER_MANIFEST_CHUNK for i in affected_song_ids}):
+                            cur.execute("RELEASE SAVEPOINT song")
+                            done.append(song_id)
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT song")
+                            failed += 1
+                            self.logger.exception(f"backfill_manifest: Skipped song[{song_id}]")
+                    for chunk_no in sorted({s // constant.SONGS_PER_MANIFEST_CHUNK for s in done}):
                         self._rebuild_manifest_chunk(cur, chunk_no)
+                    con.commit()
+                    updated += len(done)
+                except Exception:
+                    con.rollback()
+                    failed += len(batch)
+                    self.logger.exception(f"backfill_manifest: Skipped songs {batch[0]}..{batch[-1]}")
+        if updated:
+            self.logger.info(f"backfill_manifest: Updated manifest of {updated} songs.")
+        if failed:
+            self.logger.warning(f"backfill_manifest: {failed} songs failed. Retrying on next start.")
+
+    def _backfill_song_manifest(self, cur, song_id: int, fill_files: bool, fill_filenames: bool) -> None:
+        """곡 하나의 매니페스트 항목(fill_files)·차트 파일명(fill_filenames)을 song zip에서 채웁니다."""
+        song_data = self._get_song_data_with_cur(cur, song_id)
+        if not song_data:
+            return
+        if fill_files:
+            files = zip_entries(song_data)
+            cur.execute(
+                "UPDATE song SET folder = IF(folder = '', %s, folder), files = %s WHERE id = %s",
+                (str(song_id), json.dumps(files), song_id),
+            )
+        if fill_filenames:
+            with zipfile.ZipFile(io.BytesIO(song_data)) as zf:
+                for info in zf.infolist():
+                    if not info.is_dir() and pathlib.PurePosixPath(info.filename).suffix.lower() in constant.BMS_FORMAT:
+                        sha256 = hashlib.sha256(zf.read(info)).hexdigest()
+                        cur.execute(
+                            "UPDATE chart SET filename = %s WHERE song_id = %s AND id = %s AND filename = ''",
+                            (info.filename, song_id, sha256),
+                        )
+
+    def backfill_file_kinds(self) -> int:
+        """pre/play 판정 규칙(FILE_KINDS_VERSION)이 바뀌었으면 기존 곡의 kind를 다시 판정합니다. kind가 바뀐 곡 수를 반환합니다.
+
+        곡 zip 전체를 읽지 않고 매니페스트의 항목 목록과 차트 파일만 읽어 판정합니다. kind가 바뀐 곡은 같은 트랜잭션에서
+        매니페스트 청크를 다시 만들고, 사전 청크는 지워 backfill_pre_chunks가 새 규칙으로 다시 만들게 합니다
+        (그동안 클라이언트는 파일별 사전 API로 받고, 이 API도 새 kind를 봅니다).
+        BACKFILL_BATCH_SONGS곡마다 커밋합니다. 판정하지 못한 곡은 로그를 남기고 건너뛰며, 그때는 버전을 올리지 않아
+        다음 시작 때 다시 시도합니다.
+        """
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT value FROM setting WHERE name = %s", (FILE_KINDS_SETTING,))
+            row = cur.fetchone()
+            if row is not None and int(row[0]) >= FILE_KINDS_VERSION:
+                return 0
+            cur.execute("SELECT id FROM song ORDER BY id")
+            song_ids = [r[0] for r in cur.fetchall()]
+
+        changed = failed = 0
+        step = constant.BACKFILL_BATCH_SONGS
+        for i in range(0, len(song_ids), step):
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    batch_changed = []
+                    for song_id in song_ids[i : i + step]:
+                        try:
+                            files = self._recompute_kinds(cur, song_id)
+                        except Exception:
+                            self.logger.exception(f"backfill_file_kinds: Skipped song[{song_id}]")
+                            failed += 1
+                            continue
+                        if files is not None:
+                            cur.execute("UPDATE song SET files = %s WHERE id = %s", (json.dumps(files), song_id))
+                            batch_changed.append(song_id)
+                    for chunk_no in sorted({s // constant.SONGS_PER_MANIFEST_CHUNK for s in batch_changed}):
+                        self._rebuild_manifest_chunk(cur, chunk_no)
+                    for chunk_no in sorted({s // constant.SONGS_PER_PRE_CHUNK for s in batch_changed}):
+                        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
+                        cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
+                    con.commit()
+                    changed += len(batch_changed)
+                except Exception:
+                    con.rollback()
+                    failed += 1
+                    self.logger.exception(f"backfill_file_kinds: Skipped songs from song[{song_ids[i]}]")
+
+        if failed:
+            self.logger.warning(f"backfill_file_kinds: {failed} songs failed. Retrying on next start.")
+        else:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                cur.execute("UPDATE setting SET value = %s WHERE name = %s", (str(FILE_KINDS_VERSION), FILE_KINDS_SETTING))
+                if cur.rowcount == 0:
+                    cur.execute(
+                        "INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)",
+                        (FILE_KINDS_SETTING, str(FILE_KINDS_VERSION)),
+                    )
                 con.commit()
-            except Exception:
-                con.rollback()
-                raise
-            if affected_song_ids:
-                self.logger.info(f"backfill_manifest: Updated manifest of {len(affected_song_ids)} songs.")
+        if changed:
+            self.logger.info(f"backfill_file_kinds: Updated pre/play kinds of {changed} songs.")
+        return changed
+
+    def _recompute_kinds(self, cur, song_id: int) -> list[dict] | None:
+        """곡의 매니페스트 항목 kind를 현재 규칙으로 다시 판정합니다. 바뀌었으면 새 항목 목록, 그대로면 None."""
+        cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        files = json.loads(row[0]) if row and row[0] else []
+        if not files:
+            return None
+        charts = {
+            e["path"]: self._read_song_member(cur, song_id, e)
+            for e in files
+            if pathlib.PurePosixPath(e["path"]).suffix.lower() in constant.BMS_FORMAT
+        }
+        kinds = kinds_from_charts([e["path"] for e in files], charts)
+        new = [{**e, "kind": kinds[e["path"]]} for e in files]
+        return new if new != files else None
 
     def migrate_chart_chunk_names(self) -> int:
         """chart chunk 안의 항목 이름을 원래 파일명에서 {sha256}{ext}로 바꿉니다. 바뀐 chunk 수를 반환합니다.
@@ -966,8 +1211,9 @@ class Database:
             return None, 0
 
         cur.execute(
-            "INSERT INTO song (size, sha256, folder, files) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
             (
+                self._next_song_id(cur),
                 len(data),
                 hashlib.sha256(data).hexdigest(),
                 root.resolve().name,
@@ -978,6 +1224,17 @@ class Database:
         self._insert_song_parts(cur, song_id, data)
         self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
         return song_id, len(data)
+
+    def _next_song_id(self, cur) -> int | None:
+        """새 곡 번호. 보통은 None(AUTO_INCREMENT)이고, 지운 곡 번호가 가장 크면 그 뒤 번호를 정해 결번을 다시 쓰지 않게 합니다
+        (AUTO_INCREMENT가 되돌아가는 경우: 오래된 MySQL 재시작, 백업 복원 등)."""
+        cur.execute("SELECT MAX(song_id) FROM deleted_song")
+        deleted = cur.fetchone()[0]
+        if deleted is None:
+            return None
+        cur.execute("SELECT MAX(id) FROM song")
+        current = cur.fetchone()[0]
+        return deleted + 1 if current is None or current < deleted else None
 
     def _insert_song_parts(self, cur, song_id: int, data: bytes) -> None:
         step = constant.BLOB_READ_SIZE
@@ -1044,8 +1301,10 @@ class Database:
         self.logger.info(f"insert_song: Merged {len(added)} files into song[{song_id}, {len(data)} bytes]")
         return len(data), added, conflicts
 
-    def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> list:
+    def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> tuple[list, int]:
+        """(차트 청크에 넣을 새 차트, 지운 곡에서 남은 차트를 이 곡에 다시 붙인 수)를 반환합니다."""
         new_charts = []
+        reattached = 0
         for (chart_file_path, size, sha256) in bms_files:
             filename = chart_file_path.relative_to(root).as_posix()
             cur.execute(
@@ -1055,24 +1314,19 @@ class Database:
             if cur.rowcount == 1:
                 new_charts.append((chart_arcname(sha256, chart_file_path), chart_file_path.read_bytes()))
             elif song_id is not None:
+                # 지운 곡의 차트는 차트 청크에 그대로 있으므로 청크에 다시 넣지 않고 곡만 붙입니다.
+                cur.execute(
+                    "UPDATE chart SET song_id = %s, filename = %s WHERE id = %s AND size = %s AND song_id IS NULL",
+                    (song_id, filename, str(sha256), size),
+                )
+                if cur.rowcount == 1:
+                    reattached += 1
+                    continue
                 cur.execute(
                     "UPDATE chart SET filename = %s WHERE id = %s AND size = %s AND filename = ''",
                     (filename, str(sha256), size),
                 )
-        return new_charts
-
-    def insert_songs(self, directory:os.PathLike, reculsive=False, remove=False) -> None:
-        root_dir = pathlib.Path(directory)
-        for file_name in os.listdir(root_dir):
-            cur_dir = root_dir / file_name
-            if (cur_dir).is_dir() and reculsive:
-                self.insert_songs(cur_dir, True, remove)
-                continue
-            if cur_dir.suffix.lower() in constant.BMS_FORMAT:
-                self.insert_song(root_dir)
-                if remove:
-                    shutil.rmtree(root_dir)
-                break
+        return new_charts, reattached
 
     def create_zip(self, source_dir: os.PathLike) -> bytes:
         """
@@ -1179,6 +1433,187 @@ class Database:
             cur.execute("SELECT data FROM manifest_chunk WHERE id = %s", (chunk_no,))
             row = cur.fetchone()
             return row[0] if row else None
+
+    def _lock(self, timeout: float | None) -> None:
+        if not self._write_lock.acquire(timeout=-1 if timeout is None else timeout):
+            raise TimeoutError("song import is holding the write lock")
+
+    @staticmethod
+    def unused_dir(song_id: int) -> pathlib.Path:
+        """사용 중지한 곡을 옮겨 두는 폴더. song.zip과 charts/{sha256}{확장자}가 들어갑니다."""
+        return constant.UNUSED_DIR / str(song_id)
+
+    def _song_charts(self, cur, song_id: int, data: bytes, charts: list[list]) -> dict[str, bytes]:
+        """곡의 차트 내용을 {차트 청크 항목 이름: 내용}으로 모읍니다.
+        곡 zip의 같은 경로에서 먼저 찾고, 곡 zip에 없거나 내용이 다른 차트는 차트 청크에서 꺼냅니다."""
+        found: dict[str, bytes] = {}
+        wanted: dict[str, str] = {}
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = set(zf.namelist())
+            for chart_id, size, filename in charts:
+                arcname = chart_arcname(chart_id, pathlib.PurePosixPath(filename or f"{chart_id}.bms"))
+                content = zf.read(filename) if filename in names else None
+                if content is not None and len(content) == size and hashlib.sha256(content).hexdigest() == chart_id:
+                    found[arcname] = content
+                else:
+                    wanted[chart_id] = arcname
+        if wanted:
+            # 차트 청크 항목 이름은 sha256 + 확장자. 최근 청크부터 찾습니다.
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id DESC")
+            for (chunk_no,) in cur.fetchall():
+                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
+                with zipfile.ZipFile(io.BytesIO(cur.fetchone()[0])) as zf:
+                    for name in zf.namelist():
+                        chart_id = name.split(".", 1)[0]
+                        if chart_id in wanted:
+                            found[wanted.pop(chart_id)] = zf.read(name)
+                if not wanted:
+                    break
+        if wanted:
+            self.logger.warning(f"delete_song: Song[{song_id}] charts not found anywhere: {sorted(wanted)}")
+        return found
+
+    def delete_song(
+        self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
+    ) -> bool:
+        """곡을 사용 중지합니다. 없는 곡이면 False.
+
+        곡 zip과 차트(곡 zip에 없는 차트는 차트 청크에서 꺼냄)를 UNUSED_DIR/{song_id}/로 옮기고 DB의 곡 데이터를 지운 뒤,
+        그 곡이 든 매니페스트·사전 청크를 다시 만듭니다. deleted_song에 사유와 차트 목록을 남기고,
+        번호는 결번으로 두어 restore_song으로 같은 번호로 되돌릴 수 있습니다.
+        차트 청크에서는 뺄 수 없으므로 차트 행은 song_id만 비워 남깁니다.
+        임포트 배치가 쓰기 잠금을 잡고 있으면 timeout(초)까지 기다리고, 넘으면 TimeoutError.
+        """
+        self._lock(timeout)
+        target = self.unused_dir(song_id)
+        written = False
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT folder, size, sha256 FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return False
+                    folder, size, sha256 = row
+                    data = self._get_song_data_with_cur(cur, song_id)
+                    if data is None or hashlib.sha256(data).hexdigest() != sha256:
+                        raise ValueError(f"song {song_id}: zip data is missing or does not match its sha256")
+                    cur.execute("SELECT id, size, filename FROM chart WHERE song_id = %s ORDER BY id", (song_id,))
+                    charts = [list(r) for r in cur.fetchall()]
+                    chart_data = self._song_charts(cur, song_id, data, charts)
+
+                    # DB에서 지우기 전에 파일을 끝까지 써 둡니다. 다 쓴 뒤 폴더 이름을 바꿔 반쯤 쓴 폴더가 남지 않게 합니다.
+                    tmp = constant.UNUSED_DIR / f".{song_id}.tmp"
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    (tmp / "charts").mkdir(parents=True)
+                    for name, content in [("song.zip", data), *((f"charts/{n}", c) for n, c in chart_data.items())]:
+                        with open(tmp / name, "wb") as f:
+                            f.write(content)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    shutil.rmtree(target, ignore_errors=True)
+                    os.replace(tmp, target)
+                    written = True
+
+                    cur.execute(
+                        """
+                        INSERT INTO deleted_song
+                            (song_id, folder, size, sha256, charts, chart_list, reason, deleted_by, deleted_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (song_id, folder, size, sha256, len(charts), json.dumps(charts, ensure_ascii=False), reason,
+                         deleted_by, int(time.time())),
+                    )
+                    cur.execute("UPDATE chart SET song_id = NULL WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM download_grant WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
+                    cur.execute("DELETE FROM song WHERE id = %s", (song_id,))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    if written:
+                        shutil.rmtree(target, ignore_errors=True)
+                    raise
+        finally:
+            self._write_lock.release()
+        self.logger.info(f"delete_song: Moved song[{song_id}] to {target}")
+        return True
+
+    def restore_song(self, song_id: int, timeout: float | None = None) -> None:
+        """사용 중지한 곡을 같은 번호로 되돌립니다. 차트 행이 없어진 차트는 옮겨 둔 차트 파일로 차트 청크에 다시 넣습니다.
+
+        사용 중지한 곡이 아니면 LookupError, 옮겨 둔 파일이 없거나 내용이 다르면 FileNotFoundError·ValueError,
+        그 사이 같은 차트가 다른 곡으로 임포트됐으면 ChartInUseError. 잠금을 못 잡으면 TimeoutError.
+        """
+        self._lock(timeout)
+        source = self.unused_dir(song_id)
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT folder, size, sha256, chart_list FROM deleted_song WHERE song_id = %s FOR UPDATE",
+                        (song_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise LookupError(f"song {song_id} is not unused")
+                    folder, size, sha256, chart_list = row
+                    data = (source / "song.zip").read_bytes()
+                    if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
+                        raise ValueError(f"{source}/song.zip does not match song {song_id}")
+                    charts = json.loads(chart_list)
+                    taken = set()
+                    readd = []
+                    for chart_id, chart_size, filename in charts:
+                        cur.execute("SELECT song_id FROM chart WHERE id = %s AND size = %s", (chart_id, chart_size))
+                        found = cur.fetchone()
+                        if found is None:
+                            arcname = chart_arcname(chart_id, pathlib.PurePosixPath(filename or f"{chart_id}.bms"))
+                            content = (source / "charts" / arcname).read_bytes()
+                            if hashlib.sha256(content).hexdigest() != chart_id:
+                                raise ValueError(f"{source}/charts/{arcname} does not match its sha256")
+                            readd.append((chart_id, chart_size, filename, arcname, content))
+                        elif found[0] is not None:
+                            taken.add(found[0])
+                    if taken:
+                        raise ChartInUseError(sorted(taken))
+
+                    cur.execute(
+                        "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
+                        (song_id, size, sha256, folder, json.dumps(zip_entries(data))),
+                    )
+                    self._insert_song_parts(cur, song_id, data)
+                    for chart_id, chart_size, _ in charts:
+                        cur.execute(
+                            "UPDATE chart SET song_id = %s WHERE id = %s AND size = %s", (song_id, chart_id, chart_size)
+                        )
+                    for chart_id, chart_size, filename, _, _ in readd:
+                        cur.execute(
+                            "INSERT INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
+                            (chart_id, song_id, chart_size, filename),
+                        )
+                    if readd:
+                        self._append_charts_to_chunk(cur, [(arcname, content) for *_, arcname, content in readd])
+                    cur.execute("DELETE FROM deleted_song WHERE song_id = %s", (song_id,))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        shutil.rmtree(source, ignore_errors=True)
+        self.logger.info(f"restore_song: Restored song[{song_id}]")
+
+    def deleted_reason(self, song_id: int) -> str | None:
+        """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT reason FROM deleted_song WHERE song_id = %s", (song_id,))
+            row = cur.fetchone()
+        return None if row is None else row[0]
 
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
         """song / chart_chunk / pre_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
@@ -1318,7 +1753,7 @@ class SongBatch:
                 song_bytes, added, conflicts = merged
                 # 내용이 달라 곡 zip에 넣지 못한 차트는 등록하지 않습니다(zip의 같은 경로 파일과 어긋나므로).
                 bms_files = [f for f in bms_files if f[0].relative_to(root).as_posix() not in conflicts]
-            new_charts = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
+            new_charts, reattached = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
             cur.execute("RELEASE SAVEPOINT song")
         except Exception:
             cur.execute("ROLLBACK TO SAVEPOINT song")
@@ -1328,7 +1763,7 @@ class SongBatch:
         self._chart_bytes += sum(len(content) for _, content in new_charts)
         self._song_bytes += song_bytes
         self._songs += 1
-        if new_song or new_charts or added:
+        if new_song or new_charts or reattached or added:
             self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
         if new_song or added:
             self._pre_chunks.add(song_id // constant.SONGS_PER_PRE_CHUNK)

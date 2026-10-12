@@ -1,6 +1,8 @@
 """MySQL BLOB 저장 왕복 테스트. EBMS_DB_* 환경변수의 서버에 ebms_test DB를 만들어 사용합니다."""
+import gzip
 import hashlib
 import io
+import json
 import os
 import zipfile
 
@@ -325,6 +327,32 @@ def test_song_part_chunking_and_migration(tmp_path, client, database):
     res_play = client.get("/api/play/song/1")
     assert res_play.status_code == 200
     assert res_play.content == raw_zip
+
+
+def test_backfill_manifest_skips_broken_song(tmp_path, database, monkeypatch, caplog):
+    """손상된 곡 zip 하나가 있어도 시작(backfill)이 실패하지 않고 나머지 곡은 채웁니다 (#45)"""
+    monkeypatch.setattr(constant, "BACKFILL_BATCH_SONGS", 2)
+    for i in range(3):
+        database.insert_song(make_song(tmp_path, f"s{i}", {"a.bms": f"#TITLE {i}\n".encode()}))
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE song SET files = NULL")
+        cur.execute("UPDATE chart SET filename = ''")
+        cur.execute("UPDATE song_part SET data = %s WHERE song_id = 2", (b"broken" * 10,))
+        con.commit()
+
+    Database._instance = None
+    Database._initialized = False
+    with caplog.at_level("ERROR"):
+        Database()
+    assert "Skipped song[2]" in caplog.text
+
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT id, files IS NULL FROM song ORDER BY id")
+        assert [tuple(row) for row in cur.fetchall()] == [(1, 0), (2, 1), (3, 0)]
+        cur.execute("SELECT song_id, filename FROM chart ORDER BY song_id")
+        assert [tuple(row) for row in cur.fetchall()] == [(1, "a.bms"), (2, ""), (3, "a.bms")]
+    manifest = json.loads(gzip.decompress(Database().get_manifest_chunk(0)))
+    assert [len(song["files"]) > 0 for song in manifest] == [True, False, True]
 
 
 def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):

@@ -9,12 +9,16 @@
 """
 import asyncio
 import datetime
+import logging
 import math
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 
+import anyio
+import anyio.to_thread
+from anyio.lowlevel import RunVar
 from fastapi.concurrency import run_in_threadpool
 
 from . import constant, db
@@ -91,13 +95,16 @@ def validate(name: str, value) -> int:
 
 # ---- 전역 설정 ----
 
-def get_settings() -> dict[str, int]:
+def get_settings(cur=None) -> dict[str, int]:
+    """전역 설정. cur를 주면 그 연결로 읽습니다."""
+    if cur is None:
+        with db.connect() as con, con.cursor() as cur:
+            return get_settings(cur)
     settings = dict(constant.DEFAULT_SETTINGS)
-    with db.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT name, value FROM setting")
-        for name, value in cur.fetchall():
-            if name in settings:
-                settings[name] = int(value)
+    cur.execute("SELECT name, value FROM setting")
+    for name, value in cur.fetchall():
+        if name in settings:
+            settings[name] = int(value)
     return settings
 
 
@@ -134,14 +141,17 @@ def get_overrides(cur, user_id: str) -> dict[str, int | None]:
     return dict(zip(USER_LIMITS, row)) if row else {name: None for name in USER_LIMITS}
 
 
-def limits_for(user_id: str) -> Limits:
-    settings = get_settings()
-    with db.connect() as con, con.cursor() as cur:
-        overrides = get_overrides(cur, user_id)
+def merge_limits(settings: dict[str, int], overrides: dict[str, int | None]) -> Limits:
+    """전역 설정에 사용자별 값(None이 아닌 것)을 덮어씁니다."""
     return Limits(**{
         name: overrides[name] if overrides.get(name) is not None else settings[name]
         for name in constant.DEFAULT_SETTINGS
     })
+
+
+def limits_for(user_id: str) -> Limits:
+    with db.connect() as con, con.cursor() as cur:
+        return merge_limits(get_settings(cur), get_overrides(cur, user_id))
 
 
 def set_overrides(user_id: str, values: dict) -> None:
@@ -202,6 +212,11 @@ def ticket_state(user_id: str, limits: Limits | None = None) -> TicketState:
     with db.connect() as con, con.cursor() as cur:
         cur.execute("SELECT tickets, updated_at FROM user_ticket WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
+    return ticket_state_from(row, limits, now)
+
+
+def ticket_state_from(row: tuple | None, limits: Limits, now: float) -> TicketState:
+    """user_ticket의 (tickets, updated_at) 행(없으면 None)으로 티켓 상태를 계산합니다."""
     return _state(_current_tickets(row, limits, now), limits, now)
 
 
@@ -343,10 +358,32 @@ class Throttle:
             return start - now
 
 
+# 이벤트 루프마다 하나씩 둡니다(테스트처럼 루프가 여러 번 만들어져도 섞이지 않게).
+_download_limiter: RunVar[anyio.CapacityLimiter] = RunVar("download_limiter")
+
+
+def download_limiter() -> anyio.CapacityLimiter:
+    """다운로드 본문 읽기 전용 스레드 한도(constant.DOWNLOAD_THREADS)."""
+    try:
+        return _download_limiter.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(constant.DOWNLOAD_THREADS)
+        _download_limiter.set(limiter)
+        return limiter
+
+
+async def next_download_chunk(chunks: Iterator[bytes]) -> bytes | None:
+    """동기 iterator(DB 읽기)에서 다음 조각을 다운로드 전용 스레드 한도 안에서 꺼냅니다. 끝이면 None.
+
+    큰 곡을 동시에 많이 받아 스레드가 느린 BLOB 읽기에 묶여도 기본 스레드 한도를 쓰는 API·로그인은 기다리지 않습니다(#41).
+    """
+    return await anyio.to_thread.run_sync(next, chunks, None, limiter=download_limiter())
+
+
 async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIterator[bytes]:
     """사전 다운로드 응답 본문. 보낸 바이트를 이번 달 사용량에 더하고, 한도를 넘으면 감속합니다.
 
-    chunks는 동기 iterator(DB 읽기)라 스레드에서 꺼내고, 감속 대기는 스레드를 붙잡지 않습니다.
+    chunks는 동기 iterator(DB 읽기)라 다운로드 전용 스레드 한도 안에서 꺼내고, 감속 대기는 스레드를 붙잡지 않습니다.
     """
     pending = 0
     try:
@@ -356,7 +393,7 @@ async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIte
         rate = limits.pre_throttled_kbps * 1000 / 8
         bucket = Throttle.for_user(user_id)
         while True:
-            chunk = await run_in_threadpool(next, chunks, None)
+            chunk = await next_download_chunk(chunks)
             if chunk is None:
                 break
             throttled = used >= limits.pre_monthly_bytes
@@ -373,17 +410,27 @@ async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIte
                 await run_in_threadpool(add_pre_usage, user_id, pending)
                 pending = 0
     finally:
-        if close is not None:
-            close()
-        if pending:
-            # 연결이 끊겨 취소된 경우에도 반영되도록 await 없이 바로 씁니다(짧은 쿼리 2개).
-            add_pre_usage(user_id, pending)
+        try:
+            if close is not None:
+                close()
+        finally:
+            if pending:
+                # 연결이 끊겨 취소된 경우에도 반영되도록 취소를 막고, 이벤트 루프를 멈추지 않도록 스레드에서 씁니다.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await run_in_threadpool(add_pre_usage, user_id, pending)
+                    except Exception:
+                        logging.getLogger(__name__).exception(f"add_pre_usage failed: lost {pending} bytes of {user_id}")
 
 
 def pre_state(user_id: str, limits: Limits | None = None) -> dict:
     limits = limits or limits_for(user_id)
     month = current_month()
-    used = pre_used(user_id, month)
+    return pre_state_from(pre_used(user_id, month), limits, month)
+
+
+def pre_state_from(used: int, limits: Limits, month: str) -> dict:
+    """이번 달 사용량으로 사전 다운로드 상태를 만듭니다."""
     return {
         "month": month,
         "used_bytes": used,

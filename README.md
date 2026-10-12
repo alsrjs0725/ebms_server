@@ -30,5 +30,6 @@ docker compose up -d
 | [docs/deployment.md](docs/deployment.md) | 배포·운영: 포트, 데이터 볼륨, 곡 등록, 데이터 마이그레이션 |
 | [docs/auth.md](docs/auth.md) | 로그인 설정(Google, Discord), 웹 로그인, 클라이언트 로그인(PKCE) |
 | [docs/download.md](docs/download.md) | 다운로드 정책: 사전/플레이 구분, 플레이 티켓, 월 사용량 |
+| [docs/proxy.md](docs/proxy.md) | 캐싱 리버스 프록시(오라클 VM 등): 권한 확인·캐시·접속 제한, 설치 순서 |
 | [docs/admin.md](docs/admin.md) | 관리자 페이지와 관리자 API |
 | [docs/api.md](docs/api.md) | HTTP API 레퍼런스: 엔드포인트, 공통 헤더, 응답 형식 |

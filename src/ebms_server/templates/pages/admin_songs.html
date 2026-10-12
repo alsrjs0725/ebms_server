@@ -1,0 +1,124 @@
+{% extends "auth_base.html" %}
+
+{% block title %}곡 관리 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">곡 관리</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-3">곡 관리</h1>
+
+<ul class="nav nav-tabs mb-4" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link{% if tab == 'songs' %} active{% endif %}" type="button" role="tab" data-tab="songs" data-url="/admin/songs" aria-controls="tab-songs" aria-selected="{{ 'true' if tab == 'songs' else 'false' }}">곡 목록</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link" type="button" role="tab" data-tab="deleted" data-url="/admin/songs" aria-controls="tab-deleted" aria-selected="false">사용 중지</button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link{% if tab == 'import' %} active{% endif %}" type="button" role="tab" data-tab="import" data-url="/admin/import" aria-controls="tab-import" aria-selected="{{ 'true' if tab == 'import' else 'false' }}">곡 임포트</button>
+    </li>
+</ul>
+
+<div id="tab-songs" role="tabpanel" data-limit="{{ limit }}"{% if tab != 'songs' %} class="d-none"{% endif %}>
+<form id="song-search" class="d-flex gap-2 mb-2" role="search">
+    <input class="form-control" type="search" id="song-q" placeholder="곡 번호, 폴더명, 차트 파일명" aria-label="곡 검색">
+    <button class="btn btn-primary text-nowrap" type="submit">검색</button>
+</form>
+<p class="text-muted small">최근 등록한 곡부터 {{ limit }}곡씩 보여줍니다. 곡을 누르면 파일 구조를 보고 파일을 받거나 곡을 지울 수 있습니다.</p>
+<div class="table-responsive">
+    <table class="table table-sm table-hover align-middle small">
+        <thead><tr><th scope="col">번호</th><th scope="col">폴더</th><th scope="col" class="text-end">차트</th><th scope="col" class="text-end">크기</th></tr></thead>
+        <tbody id="song-rows"></tbody>
+    </table>
+</div>
+<p class="text-muted small d-none" id="song-empty">찾는 곡이 없습니다.</p>
+<button class="btn btn-sm btn-outline-secondary d-none mb-4" type="button" id="song-more">더 보기</button>
+
+<div class="card d-none" id="song-detail">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+            <div>
+                <h2 class="h5 mb-1" id="song-title"></h2>
+                <div class="text-muted small" id="song-meta"></div>
+            </div>
+            <div class="d-flex gap-2 flex-shrink-0">
+                <a class="btn btn-sm btn-outline-primary" id="song-zip" href="#">zip 받기</a>
+                <button class="btn btn-sm btn-outline-danger" type="button" id="song-delete">사용 중지</button>
+            </div>
+        </div>
+        <div class="small" id="song-tree"></div>
+    </div>
+</div>
+</div>
+
+<div id="tab-deleted" role="tabpanel" class="d-none">
+<form id="deleted-search" class="d-flex gap-2 mb-2" role="search">
+    <input class="form-control" type="search" id="deleted-q" placeholder="곡 번호, 폴더명, 사유" aria-label="사용 중지한 곡 검색">
+    <button class="btn btn-primary text-nowrap" type="submit">검색</button>
+</form>
+<p class="text-muted small">사용 중지한 곡은 서버의 <code>var/unused/곡번호/</code>에 곡 zip과 차트를 옮겨 두고, 번호는 결번으로 남겨 다른 곡에 쓰지 않습니다. <strong>복원</strong>하면 같은 번호로 되돌아가고 클라이언트는 다음 동기화 때 다시 받습니다. 그 사이 같은 차트를 다른 곡으로 임포트했다면 복원할 수 없습니다.</p>
+<div class="table-responsive">
+    <table class="table table-sm align-middle small">
+        <thead><tr><th scope="col">번호</th><th scope="col">폴더</th><th scope="col">사유</th><th scope="col">중지</th><th scope="col"></th></tr></thead>
+        <tbody id="deleted-rows"></tbody>
+    </table>
+</div>
+<p class="text-muted small d-none" id="deleted-empty">사용 중지한 곡이 없습니다.</p>
+<button class="btn btn-sm btn-outline-secondary d-none mb-4" type="button" id="deleted-more">더 보기</button>
+</div>
+
+<div id="tab-import" role="tabpanel"{% if tab != 'import' %} class="d-none"{% endif %}>
+<h2 class="h5">zip 업로드</h2>
+<p class="text-muted small">
+    차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 등록합니다. zip 하나에 곡 여러 개가 있어도 되고,
+    zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다. 같은 차트가 이미 있으면 기존 곡에 연결됩니다.
+    큰 파일도 조각으로 나눠 올리고, 등록은 서버에서 이어서 진행되므로 다 올린 뒤에는 페이지를 닫아도 됩니다.
+</p>
+<form id="upload" class="mb-5">
+    <div class="mb-3">
+        <label class="form-label" for="files">zip 파일(여러 개 선택 가능)</label>
+        <input class="form-control" type="file" id="files" name="files" accept=".zip,application/zip" multiple required>
+    </div>
+    <div class="mb-3 d-none" id="upload-state">
+        <div class="small mb-1" id="upload-label"></div>
+        <div class="progress" role="progressbar" aria-label="업로드 진행률">
+            <div class="progress-bar w-0"></div>
+        </div>
+    </div>
+    <button class="btn btn-primary" type="submit">업로드하고 등록</button>
+    <button class="btn btn-outline-secondary d-none" type="button" id="cancel">업로드 취소</button>
+</form>
+
+<h2 class="h5">var/tmp 가져오기</h2>
+<p class="text-muted small">서버의 <code>var/tmp/</code>에 있는 곡 폴더와 zip을 지금 등록합니다(서버 시작 시와 같음). 등록한 폴더와 zip은 지웁니다.
+    수 GB 이상이면 웹 업로드보다 zip을 내부망으로 서버의 <code>var/tmp/</code>에 복사(SMB, scp 등)한 뒤 누르는 편이 훨씬 빠릅니다. 복사 중에 누르지 않도록, 다른 이름으로 복사한 뒤 <code>.zip</code>으로 바꾸세요.</p>
+<button class="btn btn-outline-primary mb-5" type="button" id="scan">var/tmp 가져오기</button>
+
+<h2 class="h5">등록 작업</h2>
+<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다. 지난 기록과 자세한 오류는 <a href="/admin/logs?logger=ebms_server.importer">서버 로그</a>에서 볼 수 있습니다.</p>
+<div class="row g-2 mb-2" id="filter">
+    <div class="col-sm-4 col-md-3">
+        <select class="form-select form-select-sm" id="filter-level" aria-label="결과 수준">
+            <option value="">모든 결과</option>
+            <option value="failed">실패</option>
+            <option value="conflict">충돌(넣지 않은 파일 있음)</option>
+            <option value="new">새 곡</option>
+            <option value="added">기존 곡에 추가</option>
+            <option value="same">변경 없음(이미 있음)</option>
+        </select>
+    </div>
+    <div class="col-sm-8 col-md-6">
+        <input class="form-control form-control-sm" type="search" id="filter-text" placeholder="폴더명, 오류 메시지, 파일명 검색" aria-label="로그 검색">
+    </div>
+</div>
+<div id="jobs"><p class="text-muted small">작업이 없습니다.</p></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_songs.js') }}"></script>
+{% endblock %}

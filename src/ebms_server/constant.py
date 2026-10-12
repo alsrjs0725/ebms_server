@@ -16,10 +16,14 @@ TMP_DIR = BASE_DIR / "var" / "tmp"
 # 관리자 페이지에서 올린 zip을 풀어두는 임시 폴더. 등록이 끝나면 지웁니다.
 IMPORT_DIR = BASE_DIR / "var" / "import"
 LOG_DIR = BASE_DIR / "var" / "log"
+# 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
+UNUSED_DIR = BASE_DIR / "var" / "unused"
 BYTE_PER_CHUNK = 64 * 1024 * 1024
 # 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
 IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
 IMPORT_BATCH_SONGS = 500
+# 서버 시작 시 기존 곡을 다시 처리(매니페스트·pre/play 판정 채우기)할 때 커밋하는 곡 수
+BACKFILL_BATCH_SONGS = 100
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 SONGS_PER_MANIFEST_CHUNK = 1000
@@ -28,10 +32,15 @@ SONGS_PER_PRE_CHUNK = 32
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
 API_VERSION = 3
+# 다운로드 본문(BLOB 조각) 읽기에 쓰는 스레드 수 한도. API·로그인이 쓰는 기본 스레드 한도(40)와 따로 셉니다.
+# 큰 곡을 동시에 많이 받아도 다른 요청이 스레드를 기다리지 않게 합니다. 늘리면 MySQL 동시 연결도 그만큼 늘어납니다.
+DOWNLOAD_THREADS = int(os.environ.get("EBMS_DOWNLOAD_THREADS", "16"))
 # BLOB 다운로드 시 한 번에 읽어오는 크기
 BLOB_READ_SIZE = 1024 * 1024
 # INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트
 PACKET_OVERHEAD = 1024 * 1024
+# 연결 풀에 남겨 둘 유휴 MySQL 연결 수 상한
+DB_POOL_SIZE = int(os.environ.get("EBMS_DB_POOL_SIZE", "32"))
 # 클라이언트가 보낼 수 있는 최대 패킷 크기. 서버의 max_allowed_packet과 맞춥니다.
 DB_MAX_ALLOWED_PACKET = 1024 * 1024 * 1024
 
@@ -48,6 +57,9 @@ DISCORD_CLIENT_SECRET = os.environ.get("EBMS_DISCORD_CLIENT_SECRET", "")
 ADMIN_EMAILS = {
     e.strip().lower() for e in os.environ.get("EBMS_ADMIN_EMAILS", "").split(",") if e.strip()
 }
+# 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 설정하면 프록시가 /api/proxy/authz로 다운로드 권한을 묻고
+# 캐시를 채울 수 있습니다. 비우면 프록시 연동을 끕니다(docs/proxy.md).
+PROXY_SECRET = os.environ.get("EBMS_PROXY_SECRET", "")
 SESSION_COOKIE = "ebms_session"
 # 웹 세션 유효기간. 쓸 때마다 연장됩니다.
 WEB_SESSION_SECONDS = 30 * 24 * 3600

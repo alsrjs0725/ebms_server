@@ -7,7 +7,7 @@ from ebms_server import main
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 
-PAGES = ("/", "/login", "/account", "/admin", "/admin/import", "/admin/notices", "/auth/client/authorize")
+PAGES = ("/", "/login", "/account", "/admin", "/admin/import", "/admin/songs", "/admin/logs", "/admin/notices", "/auth/client/authorize")
 
 
 def assert_security_headers(response):

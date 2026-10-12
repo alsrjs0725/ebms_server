@@ -1,0 +1,15 @@
+# Nginx Proxy Manager(NPM)로 EBMS 캐싱 프록시를 띄울 때의 예시(docs/proxy.md#nginx-proxy-manager로-설치).
+# 기존 NPM을 옮겨 온다면 그 data, letsencrypt 폴더를 이 파일 옆에 그대로 복사합니다.
+services:
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # 관리 화면은 인터넷에 열지 않습니다. ssh -L 8181:127.0.0.1:81 ubuntu@<VM_IP> 후 http://localhost:8181
+      - "127.0.0.1:81:81"
+    volumes:
+      # nginx/custom/http_top.conf(캐시·접속 제한)와 캐시(ebms-cache)도 여기에 들어갑니다.
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
