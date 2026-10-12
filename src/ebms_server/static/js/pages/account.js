@@ -15,3 +15,22 @@ document.querySelectorAll("[data-delete]").forEach((btn) => {
         location.reload();
     });
 });
+
+const deleteAgree = document.getElementById("deleteAccountAgree");
+const deleteConfirm = document.getElementById("deleteAccountConfirm");
+if (deleteAgree && deleteConfirm) {
+    deleteAgree.addEventListener("change", () => {
+        deleteConfirm.disabled = !deleteAgree.checked;
+    });
+    deleteConfirm.addEventListener("click", async () => {
+        deleteConfirm.disabled = true;
+        const res = await fetch("/api/account", { method: "DELETE" });
+        if (res.ok) {
+            location.href = "/login";
+            return;
+        }
+        const body = await res.json().catch(() => ({}));
+        alert(body.detail || `실패했습니다 (${res.status})`);
+        deleteConfirm.disabled = !deleteAgree.checked;
+    });
+}

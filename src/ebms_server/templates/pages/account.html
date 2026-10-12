@@ -55,6 +55,33 @@
     </li>
     {% endfor %}
 </ul>
+
+<h2 class="h5 mt-5">계정 삭제</h2>
+<p class="text-muted">계정과 로그인 수단, 로그인된 모든 기기(클라이언트 포함), 티켓·다운로드 사용 기록을 바로 지웁니다. 되돌릴 수 없습니다.</p>
+{% if user.is_admin %}<p class="text-muted small">관리자가 혼자뿐이면 삭제할 수 없습니다. 다른 관리자를 먼저 지정하세요.</p>{% endif %}
+<button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteAccountModal">계정 삭제</button>
+
+<div class="modal fade" id="deleteAccountModal" tabindex="-1" aria-labelledby="deleteAccountTitle" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title h5" id="deleteAccountTitle">계정을 삭제할까요?</h3>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="닫기"></button>
+            </div>
+            <div class="modal-body">
+                <p><strong>{{ user.display_name or user.id }}</strong> 계정과 연결된 데이터가 모두 지워지고 모든 기기에서 로그아웃됩니다. 같은 OAuth 계정으로 다시 로그인하면 새 계정으로 가입됩니다.</p>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="deleteAccountAgree">
+                    <label class="form-check-label" for="deleteAccountAgree">되돌릴 수 없다는 것을 확인했습니다.</label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">취소</button>
+                <button type="button" class="btn btn-danger" id="deleteAccountConfirm" disabled>계정 삭제</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
