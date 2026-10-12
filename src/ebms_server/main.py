@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, auth, constant, downloads, importer, notices, proxy
+from . import admin, auth, constant, downloads, importer, notices, proxy, retention
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -114,7 +114,11 @@ async def lifespan(app: FastAPI):
     # var/tmp 임포트는 큰 zip이 있으면 오래 걸리므로 백그라운드로 돌려 시작(헬스체크)을 막지 않는다.
     # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 import_tmp가 만들어 둔다
     importer.start_tmp_job()
+    # 보유기간이 지난 개인정보(세션·다운로드 기록·월 사용량 등)를 주기적으로 지운다(docs/privacy.md)
+    retention_stop = retention.start()
     yield
+    if retention_stop is not None:
+        retention_stop.set()
 
 
 app = FastAPI(lifespan=lifespan)

@@ -70,6 +70,19 @@ CLIENT_SESSION_SECONDS = 90 * 24 * 3600
 # 클라이언트 로그인용 1회용 코드 유효기간
 AUTH_CODE_SECONDS = 60
 
+# 개인정보 보유기간(docs/privacy.md). 지난 행은 정리 작업이 RETENTION_INTERVAL_HOURS마다 지웁니다.
+# 0이면 그 항목은 지우지 않습니다(RETENTION_GRANT_DAYS만 예외로 -1).
+# 만료·해지된 세션(기기 이름·사용 시각)을 남겨 두는 일수
+RETENTION_SESSION_DAYS = int(os.environ.get("EBMS_RETENTION_SESSION_DAYS", "30"))
+# 곡별 다운로드 기록(download_grant)을 차감 면제 기간(expires_at)이 지난 뒤 남겨 두는 일수. 0이면 지나자마자, -1이면 지우지 않습니다.
+RETENTION_GRANT_DAYS = int(os.environ.get("EBMS_RETENTION_GRANT_DAYS", "0"))
+# 월별 사전 다운로드 사용량(pre_usage)을 이번 달 포함 몇 달 남길지
+RETENTION_PRE_USAGE_MONTHS = int(os.environ.get("EBMS_RETENTION_PRE_USAGE_MONTHS", "12"))
+# 마지막 로그인·세션 사용 뒤 이 일수가 지난 계정을 연결된 데이터와 함께 지웁니다(관리자 제외). 기본 0(지우지 않음).
+RETENTION_INACTIVE_USER_DAYS = int(os.environ.get("EBMS_RETENTION_INACTIVE_USER_DAYS", "0"))
+# 정리 작업 주기(시간). 서버가 시작할 때 한 번 돌고 이후 이 간격으로 돕니다. 0이면 정리 작업을 끕니다.
+RETENTION_INTERVAL_HOURS = float(os.environ.get("EBMS_RETENTION_INTERVAL_HOURS", "24"))
+
 # 할당량 전역 기본값. 처음 시작할 때 setting 테이블에 넣고, 이후에는 관리자 페이지에서 바꿉니다.
 DEFAULT_SETTINGS = {
     # 플레이 다운로드: 최대 티켓 수, 티켓 1개가 차는 시간(초), 차감 후 같은 곡을 다시 받아도 차감하지 않는 시간(초)
