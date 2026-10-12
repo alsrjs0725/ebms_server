@@ -8,7 +8,7 @@ from test_quota import admin_login
 def test_notice_admin_only(client, monkeypatch):
     assert client.get("/api/admin/notices").status_code == 401
     assert client.post("/api/admin/notices", json={"title": "x"}).status_code == 401
-    oauth(client, monkeypatch, "google", "u1", email="user@example.com")
+    oauth(client, monkeypatch, "google", "u1")
     assert client.post("/api/admin/notices", json={"title": "x"}).status_code == 403
     assert client.get("/admin/notices").status_code == 403
 

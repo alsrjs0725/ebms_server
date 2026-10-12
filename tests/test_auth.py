@@ -28,7 +28,7 @@ def client(monkeypatch):
     for name in ("GOOGLE", "DISCORD"):
         monkeypatch.setattr(constant, f"{name}_CLIENT_ID", f"{name.lower()}-id")
         monkeypatch.setattr(constant, f"{name}_CLIENT_SECRET", f"{name.lower()}-secret")
-    monkeypatch.setattr(constant, "ADMIN_EMAILS", {"admin@example.com"})
+    monkeypatch.setattr(constant, "ADMIN_USER_IDS", set())
     Database._instance = None
     Database._initialized = False
     Database()
@@ -38,8 +38,11 @@ def client(monkeypatch):
     Database._initialized = False
 
 
-def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="tester", link=False, next=None):
-    """start → (가짜 oauth) → callback 을 거친 callback 응답을 반환합니다."""
+def oauth(client, monkeypatch, oauth, puid, *, name="tester", link=False, next=None, admin=False):
+    """start → (가짜 oauth) → callback 을 거친 callback 응답을 반환합니다.
+
+    admin이면 로그인한 계정 ID를 EBMS_ADMIN_USER_IDS에 넣습니다(다음 요청부터 관리자).
+    """
     params = {}
     if link:
         params["link"] = "1"
@@ -54,7 +57,7 @@ def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="
 
     def fake_fetch_profile(p, code, verifier):
         seen["verifier"] = verifier
-        return Profile(oauth, puid, email, verified, name)
+        return Profile(oauth, puid, name)
 
     monkeypatch.setattr(auth, "fetch_profile", fake_fetch_profile)
     r = client.get(
@@ -66,6 +69,8 @@ def oauth(client, monkeypatch, oauth, puid, *, email=None, verified=True, name="
         # PKCE: 쿠키에 둔 verifier가 보낸 challenge와 맞아야 함
         challenge = auth._b64(__import__("hashlib").sha256(seen["verifier"].encode()).digest())
         assert query["code_challenge"] == [challenge]
+    if admin:
+        monkeypatch.setattr(constant, "ADMIN_USER_IDS", constant.ADMIN_USER_IDS | {me(client).id})
     return r
 
 
@@ -79,12 +84,11 @@ def test_login_creates_user_and_session(client, monkeypatch):
     assert r.status_code == 303
     assert r.headers["location"] == "/login?next=%2Faccount"
 
-    r = oauth(client, monkeypatch, "google", "g1", email="a@example.com", name="Alice")
+    r = oauth(client, monkeypatch, "google", "g1", name="Alice")
     assert r.status_code == 303
     assert r.headers["location"] == "/account"
     user = me(client)
     assert user.display_name == "Alice"
-    assert user.email == "a@example.com"
     assert len(user.id) == 36
 
     r = client.get("/account")
@@ -93,17 +97,17 @@ def test_login_creates_user_and_session(client, monkeypatch):
 
     # 같은 OAuth 계정으로 다시 로그인하면 같은 user, 이전 웹 세션은 폐기
     old_token = client.cookies.get(constant.SESSION_COOKIE)
-    oauth(client, monkeypatch, "google", "g1", email="a@example.com")
+    oauth(client, monkeypatch, "google", "g1")
     assert me(client).id == user.id
     assert accounts.authenticate(old_token, "web") is None
     assert len(accounts.list_sessions(user.id)) == 1
 
 
 def test_other_provider_without_link_is_new_user(client, monkeypatch):
-    oauth(client, monkeypatch, "google", "g1", email="same@example.com")
+    oauth(client, monkeypatch, "google", "g1")
     first = me(client).id
-    # 이메일이 같아도 자동으로 합치지 않음
-    oauth(client, monkeypatch, "discord", "d1", email="same@example.com")
+    # 다른 OAuth 계정은 자동으로 합치지 않음
+    oauth(client, monkeypatch, "discord", "d1")
     assert me(client).id != first
 
 
@@ -156,16 +160,16 @@ def test_unlink(client, monkeypatch):
 def test_sessions_list_and_revoke(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1")
     user_id = me(client).id
-    other = accounts.create_session(user_id, "web", "other device")
+    current_id = accounts.list_sessions(user_id)[0].id
+    other = accounts.create_session(user_id, "web")
     sessions = accounts.list_sessions(user_id)
     assert len(sessions) == 2
-    other_id = next(s.id for s in sessions if s.device_name == "other device")
+    other_id = next(s.id for s in sessions if s.id != current_id)
 
     assert client.delete(f"/api/account/sessions/{other_id}").status_code == 204
     assert accounts.authenticate(other, "web") is None
     assert client.delete(f"/api/account/sessions/{other_id}").status_code == 404
 
-    current_id = accounts.list_sessions(user_id)[0].id
     assert client.delete(f"/api/account/sessions/{current_id}").status_code == 204
     assert client.get("/account", follow_redirects=False).status_code == 303
 
@@ -182,77 +186,98 @@ def test_logout(client, monkeypatch):
     assert accounts.authenticate(token, "web") is None
 
 
-def test_admin_email(client, monkeypatch):
-    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=False)
+def test_admin_user_ids(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1")
+    user_id = me(client).id
     assert me(client).role == "user"
-    oauth(client, monkeypatch, "google", "g1", email="Admin@example.com", verified=True)
+    # env에 계정 ID를 넣으면 다시 로그인하지 않아도 다음 요청부터 관리자
+    monkeypatch.setattr(constant, "ADMIN_USER_IDS", {user_id})
     assert me(client).is_admin
+    assert accounts.get_user(user_id).is_admin
+    # 다른 계정은 그대로
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "google", "g2")
+    assert me(client).role == "user"
+
+
+def test_admin_user_ids_promote_on_login(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1")
+    user_id = me(client).id
+    client.post("/auth/logout")
+    monkeypatch.setattr(constant, "ADMIN_USER_IDS", {user_id})
+    oauth(client, monkeypatch, "google", "g1")
+    assert accounts.get_user(user_id).is_admin
 
 
 def test_a3_no_demotion_after_list_change(client, monkeypatch):
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    oauth(client, monkeypatch, "google", "g1", admin=True)
     assert me(client).is_admin
 
-    # ADMIN_EMAILS는 승격만 하므로 목록에서 빼도 재로그인으로 강등되지 않음(관리자 페이지에서 강등)
-    monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
-    assert me(client).is_admin
-
-
-def test_a3_second_account_same_email_other_provider(client, monkeypatch):
-    # 첫 번째 제공자로 로그인
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
-    user1 = me(client)
-    assert user1.is_admin
-
-    # 연결 없이 다른 제공자로 로그인하면 별도 계정이 생성됨
-    client.post("/auth/logout")
-    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=True)
-    user2 = me(client)
-    assert user2.id != user1.id
-    assert user2.is_admin
-
-    # 목록에서 빠져도 로그인으로 강등되지 않음
-    monkeypatch.setattr(constant, "ADMIN_EMAILS", set())
-    oauth(client, monkeypatch, "discord", "d1", email="admin@example.com", verified=True)
+    # ADMIN_USER_IDS는 승격만 하므로 목록에서 빼도 재로그인으로 강등되지 않음(관리자 페이지에서 강등)
+    monkeypatch.setattr(constant, "ADMIN_USER_IDS", set())
+    oauth(client, monkeypatch, "google", "g1")
     assert me(client).is_admin
 
 
 def test_admin_page_promotion_survives_login(client, monkeypatch):
     """관리자 페이지에서 승격한 사용자는 다시 로그인해도 admin으로 남습니다(#79)."""
-    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
+    oauth(client, monkeypatch, "discord", "d1")
     user_id = me(client).id
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("UPDATE user SET role = 'admin' WHERE id = %s", (user_id,))
         con.commit()
     client.post("/auth/logout")
-    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
+    oauth(client, monkeypatch, "discord", "d1")
     assert me(client).id == user_id
     assert me(client).is_admin
 
 
 def test_env_admin_other_identity_keeps_admin(client, monkeypatch):
-    """EBMS_ADMIN_EMAILS 관리자가 이메일이 다른 연결된 수단으로 로그인해도 강등되지 않습니다(#79)."""
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True)
+    """EBMS_ADMIN_USER_IDS 관리자가 연결된 다른 수단으로 로그인해도 관리자입니다(#79)."""
+    oauth(client, monkeypatch, "google", "g1", admin=True)
     user_id = me(client).id
     assert me(client).is_admin
-    oauth(client, monkeypatch, "discord", "d1", email="other@example.com", verified=True, link=True)
+    oauth(client, monkeypatch, "discord", "d1", link=True)
     client.post("/auth/logout")
-    oauth(client, monkeypatch, "discord", "d1", email="other@example.com", verified=True)
+    oauth(client, monkeypatch, "discord", "d1")
     assert me(client).id == user_id
     assert me(client).is_admin
 
 
-def test_a3_link_promotes(client, monkeypatch):
-    # 일반 사용자 계정 생성
-    oauth(client, monkeypatch, "discord", "d1", email="user@example.com", verified=True)
-    user_id = me(client).id
-    assert me(client).role == "user"
+def test_no_email_or_device_name_stored(client, monkeypatch):
+    """이메일과 기기 이름(User-Agent)은 저장하지 않습니다(#102)."""
+    client.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"
+    oauth(client, monkeypatch, "google", "g1", name="Alice")
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(
+            """
+            SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('email', 'device_name')
+            """
+        )
+        assert cur.fetchall() == ()
+    assert "Chrome" not in client.get("/account").text
+    assert "email" not in client.get("/api/me").json()
+    assert {p.scope for p in auth.OAUTHS.values()} == {"openid profile", "identify"}
 
-    # 관리자 이메일 OAuth를 연결해도 자동 승격되지 않음
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com", verified=True, link=True)
-    assert me(client).role == "user"
-    assert me(client).id == user_id
+
+def test_old_columns_dropped_on_start(client, monkeypatch):
+    """예전 DB에 남은 이메일·기기 이름 컬럼은 서버 시작 시 값과 함께 지웁니다(#102)."""
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("ALTER TABLE user ADD COLUMN email VARCHAR(255)")
+        cur.execute("ALTER TABLE user_identity ADD COLUMN email VARCHAR(255)")
+        cur.execute("ALTER TABLE session ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE auth_code ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
+        con.commit()
+    Database().generate_database()
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('email', 'device_name')
+            """
+        )
+        assert cur.fetchone()[0] == 0
 
 
 def test_banned_user_cannot_login(client, monkeypatch):
@@ -316,7 +341,7 @@ def test_safe_next():
 
 def test_login_page_continue_link_rejects_control_chars(client, monkeypatch):
     """로그인된 상태의 로그인 페이지 "계속하기" 링크에 탭이 섞인 next가 들어가지 않음 (#58)"""
-    oauth(client, monkeypatch, "google", "g1", email="a@example.com")
+    oauth(client, monkeypatch, "google", "g1")
     r = client.get("/login", params={"next": "/\t/evil.com"})
     assert r.status_code == 200
     assert '<a href="/account">계속하기</a>' in r.text
@@ -383,7 +408,7 @@ def test_menu(client, monkeypatch):
     r = client.get("/")
     assert "로그인 / 가입" in r.text and 'href="/account"' not in r.text
 
-    oauth(client, monkeypatch, "google", "u1", email="u@example.com", name="Bob")
+    oauth(client, monkeypatch, "google", "u1", name="Bob")
     for path in ("/", "/account", "/login"):
         text = client.get(path).text
         assert 'href="/account">설정' in text and "로그아웃" in text and 'href="/admin"' not in text, path
@@ -392,7 +417,7 @@ def test_menu(client, monkeypatch):
     assert "권한 없음" in text and 'href="/account">설정' in text
 
     client.post("/auth/logout")
-    oauth(client, monkeypatch, "google", "a1", email="admin@example.com", name="Ad")
+    oauth(client, monkeypatch, "google", "a1", name="Ad", admin=True)
     for path in ("/", "/account", "/admin"):
         assert 'href="/admin"' in client.get(path).text, path
 

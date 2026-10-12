@@ -53,9 +53,9 @@ GOOGLE_CLIENT_ID = os.environ.get("EBMS_GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("EBMS_GOOGLE_CLIENT_SECRET", "")
 DISCORD_CLIENT_ID = os.environ.get("EBMS_DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.environ.get("EBMS_DISCORD_CLIENT_SECRET", "")
-# 로그인할 때 OAuth가 확인한 이메일이 이 목록에 있으면 admin으로 지정합니다(쉼표로 구분).
-ADMIN_EMAILS = {
-    e.strip().lower() for e in os.environ.get("EBMS_ADMIN_EMAILS", "").split(",") if e.strip()
+# 이 계정 ID(user.id UUID, /account에 표시)는 로그인하거나 세션을 쓸 때 admin으로 지정합니다(쉼표로 구분).
+ADMIN_USER_IDS = {
+    u.strip().lower() for u in os.environ.get("EBMS_ADMIN_USER_IDS", "").split(",") if u.strip()
 }
 # 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 설정하면 프록시가 /api/proxy/authz로 다운로드 권한을 묻고
 # 캐시를 채울 수 있습니다. 비우면 프록시 연동을 끕니다(docs/proxy.md).

@@ -67,9 +67,7 @@ def _google_profile(data: dict) -> Profile:
     return Profile(
         oauth="google",
         oauth_user_id=str(data["sub"]),
-        email=data.get("email"),
-        email_verified=bool(data.get("email_verified")),
-        name=data.get("name") or data.get("email") or "",
+        name=data.get("name") or "",
     )
 
 
@@ -77,8 +75,6 @@ def _discord_profile(data: dict) -> Profile:
     return Profile(
         oauth="discord",
         oauth_user_id=str(data["id"]),
-        email=data.get("email"),
-        email_verified=bool(data.get("verified")),
         name=data.get("global_name") or data.get("username") or "",
     )
 
@@ -92,7 +88,7 @@ OAUTHS = {
             authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
             token_url="https://oauth2.googleapis.com/token",
             userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
-            scope="openid email profile",
+            scope="openid profile",
             pkce=True,
             parse_profile=_google_profile,
         ),
@@ -102,7 +98,7 @@ OAUTHS = {
             authorize_url="https://discord.com/oauth2/authorize",
             token_url="https://discord.com/api/oauth2/token",
             userinfo_url="https://discord.com/api/users/@me",
-            scope="identify email",
+            scope="identify",
             pkce=False,
             parse_profile=_discord_profile,
         ),
@@ -388,7 +384,7 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
     user = accounts.login(profile)
     if user.status != "active":
         return _message(request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403)
-    token = accounts.create_session(user.id, "web", request.headers.get("user-agent", ""))
+    token = accounts.create_session(user.id, "web")
     response = RedirectResponse(pending.get("n") or "/account", status_code=303)
     set_session_cookie(response, token)
     # 쿠키가 새 세션으로 바뀌므로 이전 웹 세션은 폐기합니다.
@@ -462,7 +458,6 @@ def delete_session(session_id: int, user: Annotated[User, Depends(web_user)]):
 _CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 # RFC 7636 code_verifier
 _VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
-DEFAULT_DEVICE_NAME = "EBMS 클라이언트"
 
 
 def is_loopback_redirect(uri: str) -> bool:
@@ -489,7 +484,7 @@ def _with_query(uri: str, params: dict) -> str:
 
 
 def _user_json(user: User) -> dict:
-    return {"id": user.id, "display_name": user.display_name, "email": user.email, "role": user.role}
+    return {"id": user.id, "display_name": user.display_name, "role": user.role}
 
 
 @router.get("/auth/client/authorize")
@@ -500,7 +495,6 @@ def client_authorize(
     state: str = "",
     code_challenge: str = "",
     code_challenge_method: str = "S256",
-    device_name: str = "",
 ):
     """클라이언트 로그인 시작. 웹에 로그인돼 있으면 1회용 코드를 붙여 클라이언트로 돌려보냅니다."""
     if (
@@ -516,9 +510,8 @@ def client_authorize(
         )
     if session is None:
         return _login_redirect(request)
-    code = accounts.create_auth_code(
-        session[0].id, code_challenge, redirect_uri, device_name.strip() or DEFAULT_DEVICE_NAME,
-    )
+    # 예전 클라이언트가 보내는 device_name(PC 호스트명)은 받지 않고 버립니다(#102).
+    code = accounts.create_auth_code(session[0].id, code_challenge, redirect_uri)
     return RedirectResponse(_with_query(redirect_uri, {"code": code, "state": state}), status_code=303)
 
 
@@ -533,7 +526,7 @@ def client_token(body: ClientTokenRequest):
     found = accounts.consume_auth_code(body.code)
     if found is None:
         raise HTTPException(status_code=400, detail="invalid or expired code")
-    user_id, challenge, device_name = found
+    user_id, challenge = found
     if not _VERIFIER_RE.fullmatch(body.code_verifier) or not hmac.compare_digest(
         _b64(hashlib.sha256(body.code_verifier.encode()).digest()), challenge
     ):
@@ -541,7 +534,7 @@ def client_token(body: ClientTokenRequest):
     user = accounts.get_user(user_id)
     if user is None or user.status != "active":
         raise HTTPException(status_code=403, detail="account suspended")
-    token = accounts.create_session(user.id, "client", device_name)
+    token = accounts.create_session(user.id, "client")
     return {
         "session_key": token,
         "expires_at": int(time.time()) + constant.CLIENT_SESSION_SECONDS,
@@ -566,7 +559,7 @@ def get_me(session: Annotated[tuple[User, int, str], Depends(api_session)]):
     return {
         **_user_json(user),
         "oauths": [
-            {"oauth": i.oauth, "name": i.name or i.email or ""}
+            {"oauth": i.oauth, "name": i.name}
             for i in accounts.list_identities(user.id)
         ],
         "session": {"kind": kind},

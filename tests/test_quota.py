@@ -71,7 +71,7 @@ def manifest_files(client, key, song_id=1):
 
 
 def admin_login(client, monkeypatch):
-    oauth(client, monkeypatch, "discord", "admin1", email="admin@example.com", name="Admin")
+    oauth(client, monkeypatch, "discord", "admin1", name="Admin", admin=True)
 
 
 # ---- 사전/플레이 판정 ----
@@ -441,8 +441,8 @@ def test_admin_user_list_batches_queries(tmp_path, client, monkeypatch):
     from ebms_server.accounts import Profile
 
     add_songs(tmp_path, 1)
-    users = [accounts.login(Profile("google", f"g{i}", f"u{i}@example.com", True, f"user{i}")) for i in range(12)]
-    accounts.link(users[0].id, Profile("discord", "d0", None, False, "user0"))
+    users = [accounts.login(Profile("google", f"g{i}", f"user{i}")) for i in range(12)]
+    accounts.link(users[0].id, Profile("discord", "d0", "user0"))
     quota.charge_play(users[1].id, 1)
     quota.add_pre_usage(users[2].id, 1234)
     quota.set_overrides(users[3].id, {"max_tickets": 9})
@@ -597,7 +597,7 @@ def test_download_slot_released_on_early_disconnect(tmp_path, client, monkeypatc
 
     key, user_id = client_login(client, monkeypatch)
     add_songs(tmp_path, 1)
-    user = User(user_id, "Alice", None, "user", "active")
+    user = User(user_id, "Alice", "user", "active")
     request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
 
     # 다른 다운로드 하나가 슬롯을 쥐고 있는 상태. 반납이 두 번 되면 이 슬롯까지 빠집니다.
