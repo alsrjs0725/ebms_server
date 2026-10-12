@@ -1,0 +1,33 @@
+{% extends "auth_base.html" %}
+
+{% block title %}{{ title }} - EBMS{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-2">{{ title }}</h1>
+<p class="text-muted small mb-4">
+    {% if shown %}시행일 {{ shown.effective_on }}{% if not is_current %} · <a href="/{{ kind }}">지금 시행 중인 판 보기</a>{% endif %}{% endif %}
+</p>
+{% if is_template and user and user.is_admin %}
+<div class="alert alert-warning small">아직 저장하지 않은 기본 템플릿입니다. <a href="/admin/policies">관리자 페이지</a>에서 내용을 채워 저장하세요.</div>
+{% endif %}
+{% if is_current or is_template %}
+{% for v in state.upcoming %}
+<div class="alert alert-info small">{{ v.effective_on }}부터 바뀐 {{ title }}이 시행됩니다. <a href="/{{ kind }}/{{ v.id }}">바뀐 내용 보기</a></div>
+{% endfor %}
+{% endif %}
+<article class="policy">
+    {{ content }}
+</article>
+{% set history = state.upcoming + ([state.current] if state.current else []) + state.past %}
+{% if history | length > 1 %}
+<h2 class="h5 mt-5">변경 이력</h2>
+<ul class="small">
+    {% for v in history %}
+    <li>
+        {% if shown and v.id == shown.id %}<strong>{{ v.effective_on }} 시행</strong>{% else %}<a href="/{{ kind }}/{{ v.id }}">{{ v.effective_on }} 시행</a>{% endif %}
+        {% if v in state.upcoming %}<span class="badge text-bg-info">예정</span>{% elif state.current and v.id == state.current.id %}<span class="badge text-bg-success">현재</span>{% endif %}
+    </li>
+    {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

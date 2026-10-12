@@ -8,6 +8,7 @@
     <dt class="col-sm-3">이름</dt><dd class="col-sm-9">{{ user.display_name }}</dd>
     {% if user.email %}<dt class="col-sm-3">이메일</dt><dd class="col-sm-9">{{ user.email }}</dd>{% endif %}
     <dt class="col-sm-3">계정 ID</dt><dd class="col-sm-9"><code>{{ user.id }}</code></dd>
+    <dt class="col-sm-3">약관</dt><dd class="col-sm-9"><a href="/terms">이용약관</a> · <a href="/privacy">개인정보 처리방침</a> <span class="text-muted small">(열람·정정·삭제 요청 방법 포함)</span></dd>
     {% if user.is_admin %}<dt class="col-sm-3">권한</dt><dd class="col-sm-9">관리자 · <a href="/admin">관리 페이지</a></dd>{% endif %}
 </dl>
 

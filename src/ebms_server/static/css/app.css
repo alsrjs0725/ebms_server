@@ -26,3 +26,15 @@
 .w-12em {
     width: 12em;
 }
+
+/* 처리방침·약관 본문의 제목 크기 */
+.policy h1,
+.policy h2 {
+    font-size: 1.15rem;
+    margin-top: 2rem;
+}
+
+.policy h3 {
+    font-size: 1rem;
+    margin-top: 1.5rem;
+}

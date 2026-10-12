@@ -1,0 +1,62 @@
+{% extends "auth_base.html" %}
+
+{% block title %}처리방침·약관 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">처리방침·약관</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">처리방침·약관</h1>
+<p class="text-muted small">
+    저장하면 시행일부터 로그인 화면과 모든 페이지 아래의 링크로 보입니다. 시행일을 미래로 두면 그날까지 지금 판을 보여주면서
+    "변경 예정"을 알립니다. 이전 판은 변경 이력으로 남습니다. 제목(<code>#</code>), 목록(<code>-</code>), 표(<code>|</code>),
+    굵게(<code>**</code>), 링크(<code>[글](주소)</code>)를 쓸 수 있습니다. <code>[[...]]</code>는 채워야 할 칸입니다.
+</p>
+
+{% for d in docs %}
+<h2 class="h5 mt-5">{{ d.title }} <a class="small" href="/{{ d.kind }}">공개 페이지</a></h2>
+{% if not d.versions %}
+<div class="alert alert-warning small">아직 저장하지 않아 기본 템플릿을 보여주고 있습니다.</div>
+{% endif %}
+{% if d.placeholders %}
+<div class="alert alert-warning small">채우지 않은 칸(<code>[[...]]</code>)이 {{ d.placeholders }}개 있습니다.</div>
+{% endif %}
+<form class="card mb-3 policy-form" data-kind="{{ d.kind }}">
+    <div class="card-body">
+        <label class="form-label small" for="{{ d.kind }}-body">내용</label>
+        <textarea class="form-control font-monospace" id="{{ d.kind }}-body" name="body" rows="20" required>{{ d.body }}</textarea>
+        <div class="row g-2 mt-2 align-items-end">
+            <div class="col-6 col-md-4">
+                <label class="form-label small" for="{{ d.kind }}-effective_on">시행일</label>
+                <input class="form-control" type="date" id="{{ d.kind }}-effective_on" name="effective_on" value="{{ today }}" required>
+            </div>
+            <div class="col d-flex gap-2">
+                <button class="btn btn-primary" type="submit">새 판으로 저장</button>
+                <button class="btn btn-outline-secondary" type="button" data-template>기본 템플릿 불러오기</button>
+            </div>
+        </div>
+    </div>
+</form>
+{% if d.versions %}
+<ul class="list-group mb-3">
+    {% for v in d.versions %}
+    <li class="list-group-item d-flex justify-content-between align-items-center small">
+        <span>
+            <a href="/{{ d.kind }}/{{ v.id }}">{{ v.effective_on }} 시행</a>
+            {% if v in d.state.upcoming %}<span class="badge text-bg-info">예정</span>{% elif d.state.current and v.id == d.state.current.id %}<span class="badge text-bg-success">현재</span>{% endif %}
+            <span class="text-muted">· 저장 <span data-time="{{ v.created_at }}"></span></span>
+        </span>
+        <button class="btn btn-sm btn-outline-danger" type="button" data-delete="{{ v.id }}">삭제</button>
+    </li>
+    {% endfor %}
+</ul>
+{% endif %}
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_policies.js') }}"></script>
+{% endblock %}

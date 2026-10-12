@@ -10,6 +10,7 @@ API 버전 3에서 사전 청크(`/api/pre/assethash`, `/api/pre/asset/{chunk_id
 | --- | --- | --- |
 | GET | `/` | 웹 메인 페이지 (HTML) |
 | GET | `/static/{path}` | 정적 파일 (CSS/JS/아이콘) |
+| GET | `/privacy`, `/terms` | 개인정보 처리방침·이용약관 (HTML, 로그인 불필요). 지난 판은 `/privacy/{판 id}` |
 | GET | `/api/version` | API 버전. `auth`에 로그인 가능한 OAuth 목록(예: `["google", "discord"]`) |
 | GET | `/api/notices` | 지금 게시 중인 공지 (로그인 불필요) |
 | GET | `/api/pre/charthash` | 차트 청크별 SHA-256 목록 |

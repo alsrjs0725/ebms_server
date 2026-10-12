@@ -245,6 +245,20 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 개인정보 처리방침(kind=privacy)·이용약관(terms)의 판. 저장할 때마다 행을 더해 변경 이력으로 남깁니다.
+    # effective_on은 시행일(KST, YYYY-MM-DD)입니다. 행이 없으면 src/ebms_server/policy_templates/의 템플릿을 씁니다.
+    """
+        CREATE TABLE IF NOT EXISTS policy(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            kind VARCHAR(16) NOT NULL,
+            body MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            effective_on CHAR(10) NOT NULL,
+            created_at BIGINT UNSIGNED NOT NULL,
+            created_by CHAR(36),
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
