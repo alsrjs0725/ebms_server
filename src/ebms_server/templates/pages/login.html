@@ -9,7 +9,7 @@
 <p class="text-muted small">다른 계정으로 로그인하려면 아래 버튼을 누르세요.</p>
 {% endif %}
 {% if oauths %}
-<div class="d-grid gap-2" style="max-width: 320px">
+<div class="d-grid gap-2 mw-login">
     {% for p in oauths %}
     <a class="btn btn-lg btn-outline-dark" href="/auth/{{ p.name }}/start?next={{ next | urlencode }}">{{ p.label }}로 로그인</a>
     {% endfor %}
