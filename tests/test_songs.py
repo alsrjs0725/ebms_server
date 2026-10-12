@@ -1,5 +1,6 @@
 """관리자 곡 관리(검색·파일 구조·파일 받기·삭제) 테스트."""
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,7 @@ def test_songs_require_admin(client, monkeypatch):
     assert client.get("/api/admin/songs/1/zip").status_code == 403
     assert client.get("/api/admin/songs/1/file", params={"path": "a.bms"}).status_code == 403
     assert client.delete("/api/admin/songs/1").status_code == 403
+    assert client.get("/api/admin/songs/deleted").status_code == 403
 
 
 def test_search_and_files(client, monkeypatch):
@@ -79,7 +81,8 @@ def test_delete_song(client, monkeypatch):
         cur.execute("SELECT LENGTH(data) FROM chart_chunk ORDER BY id DESC LIMIT 1")
         chunk_size = cur.fetchone()[0]
 
-    assert client.delete("/api/admin/songs/1").json() == {"ok": True}
+    r = client.request("DELETE", "/api/admin/songs/1", json={"reason": "  저작권 요청  "})
+    assert r.json() == {"ok": True}
     assert client.delete("/api/admin/songs/1").status_code == 404
     assert client.get("/api/admin/songs/1").status_code == 404
     assert [s["song_id"] for s in manifest_songs()] == [2]
@@ -109,3 +112,100 @@ def test_delete_waits_for_import(client, monkeypatch):
         assert client.delete("/api/admin/songs/1").status_code == 409
     assert client.get("/api/admin/songs/1").status_code == 200
 
+
+
+def test_deleted_log_and_gap(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n"}))
+    upload(client, "b.zip", make_zip({"b.bms": b"#TITLE B\n"}))
+    assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "x" * 1001}).status_code == 400
+    assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "중복 곡"}).status_code == 200
+    assert client.delete("/api/admin/songs/1").status_code == 200  # 사유 없이도 지움
+
+    rows = client.get("/api/admin/songs/deleted").json()
+    assert [r["song_id"] for r in rows] == [2, 1]
+    assert rows[0]["folder"] == "b" and rows[0]["reason"] == "중복 곡" and rows[0]["charts"] == 1
+    assert rows[0]["deleted_by_name"] == "Admin" and rows[0]["deleted_at"] > 0
+    assert rows[1]["reason"] == ""
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"q": "중복"}).json()] == [2]
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"before": 2}).json()] == [1]
+
+    # AUTO_INCREMENT가 되돌아가도(오래된 MySQL 재시작·복원) 지운 번호는 다시 쓰지 않습니다.
+    with db_module.connect() as con, con.cursor() as cur:
+        try:
+            cur.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'song'")
+        except Exception:
+            cur.execute("ALTER TABLE song AUTO_INCREMENT = 1")
+        con.commit()
+    again = upload(client, "c.zip", make_zip({"c.bms": b"#TITLE C\n"}))
+    assert again["songs"][0]["song_id"] == 3
+    assert client.get("/api/admin/songs/2").status_code == 404
+
+
+def test_unuse_and_restore(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    wav = os.urandom(2000)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "kick.wav": wav}))
+    before = client.get("/api/admin/songs/1").json()
+    assert client.request("DELETE", "/api/admin/songs/1", json={"reason": "잠시 내림"}).status_code == 200
+
+    # 곡 zip과 차트를 별도 폴더로 옮겨 둡니다.
+    folder = constant.UNUSED_DIR / "1"
+    sha = before["charts"][0]["sha256"]
+    assert (folder / "charts" / f"{sha}.bms").read_bytes() == b"#TITLE A\n"
+    with zipfile.ZipFile(folder / "song.zip") as zf:
+        assert zf.read("kick.wav") == wav
+    assert manifest_songs() == []
+
+    assert client.post("/api/admin/songs/1/restore").json()["files"] == before["files"]
+    assert client.post("/api/admin/songs/1/restore").status_code == 404
+    assert not folder.exists()
+    assert client.get("/api/admin/songs/deleted").json() == []
+    assert client.get("/api/admin/songs/1/file", params={"path": "kick.wav"}).content == wav
+    songs = manifest_songs()
+    assert [s["song_id"] for s in songs] == [1] and songs[0]["charts"] == [sha]
+    # 다시 사용 중지할 수도 있습니다.
+    assert client.delete("/api/admin/songs/1").status_code == 200
+
+
+def test_unuse_chart_missing_from_song_zip(client, monkeypatch):
+    """곡 zip에 없는 차트는 차트 청크에서 꺼내 옮겨 두고, 복원할 때 차트 행이 없으면 청크에 다시 넣습니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "b.bme": b"#TITLE B\n"}))
+    database = db_module.Database()
+    # 곡 zip에서 a.bms를 뺍니다(차트는 차트 청크에만 있음).
+    data = make_zip({"b.bme": b"#TITLE B\n"})
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(
+            "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = 1",
+            (len(data), hashlib.sha256(data).hexdigest(), json.dumps(db_module.zip_entries(data))),
+        )
+        cur.execute("DELETE FROM song_part WHERE song_id = 1")
+        database._insert_song_parts(cur, 1, data)
+        con.commit()
+    sha_a = hashlib.sha256(b"#TITLE A\n").hexdigest()
+
+    assert client.delete("/api/admin/songs/1").status_code == 200
+    charts = constant.UNUSED_DIR / "1" / "charts"
+    assert (charts / f"{sha_a}.bms").read_bytes() == b"#TITLE A\n"
+    assert len(list(charts.iterdir())) == 2
+
+    # 차트 행이 없어졌어도 옮겨 둔 차트로 되살립니다.
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM chart WHERE id = %s", (sha_a,))
+        con.commit()
+    assert client.post("/api/admin/songs/1/restore").status_code == 200
+    assert sorted(c["sha256"] for c in client.get("/api/admin/songs/1").json()["charts"]) == sorted(
+        [sha_a, hashlib.sha256(b"#TITLE B\n").hexdigest()]
+    )
+
+
+def test_restore_conflict(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n"}))
+    client.delete("/api/admin/songs/1")
+    upload(client, "a2.zip", make_zip({"a.bms": b"#TITLE A\n"}))  # 같은 차트가 곡 2로
+    r = client.post("/api/admin/songs/1/restore")
+    assert r.status_code == 409 and "#2" in r.json()["detail"]
+    assert (constant.UNUSED_DIR / "1" / "song.zip").exists()
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted").json()] == [1]

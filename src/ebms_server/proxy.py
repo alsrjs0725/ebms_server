@@ -11,6 +11,7 @@ nginx auth_request는 2xx면 통과, 401·403이면 거부로만 구분하므로
 원래 상태 코드와 내용은 X-Ebms-Status·X-Ebms-Detail·X-Ebms-Retry-After 헤더로 알려줍니다.
 """
 import hmac
+import json
 import re
 
 from fastapi import APIRouter, HTTPException, Request
@@ -53,7 +54,13 @@ def match_route(uri: str) -> tuple[str, int, str] | None:
     return None
 
 
+# 프록시가 받는 응답 헤더 크기에 맞춰 detail을 자릅니다(삭제 사유가 길 수 있음).
+DETAIL_MAX = 300
+
+
 def _deny(status: int, detail: str, retry_after: int | None = None) -> Response:
+    # 프록시가 '{"detail":"$ebms_detail"}'에 그대로 넣으므로 JSON 문자열 안에 들어갈 ASCII로 바꿉니다.
+    detail = json.dumps(detail[:DETAIL_MAX], ensure_ascii=True)[1:-1]
     headers = {"X-Ebms-Status": str(status), "X-Ebms-Detail": detail}
     if retry_after is not None:
         headers["X-Ebms-Retry-After"] = str(retry_after)
@@ -79,6 +86,14 @@ def _requested_bytes(request: Request, etag: str, size: int) -> int:
     return size if rng is None else rng[1] - rng[0] + 1
 
 
+def missing_song(song_id: int) -> tuple[int, str]:
+    """없는 곡의 (상태 코드, detail). 지운 곡(결번)이면 410과 삭제 사유, 아니면 404."""
+    reason = Database().deleted_reason(song_id)
+    if reason is None:
+        return 404, "song not found"
+    return 410, f"song deleted: {reason}" if reason else "song deleted"
+
+
 def authorize(request: Request) -> Response:
     route = match_route(request.headers.get("x-original-uri", ""))
     if route is None:
@@ -92,7 +107,9 @@ def authorize(request: Request) -> Response:
 
     blob = Database().open_blob(table, row_id)
     if blob is None:
-        return _deny(404, "song not found" if table == "song" else "File not found")
+        if table == "song":
+            return _deny(*missing_song(row_id))
+        return _deny(404, "File not found")
     etag = f'"{blob.sha256}"'
     headers = {"X-Ebms-Sha256": blob.sha256, "X-Ebms-Limit-Rate": "0", "X-Ebms-User": user.id}
 
