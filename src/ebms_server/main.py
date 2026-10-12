@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, auth, constant, downloads, importer, notices, proxy
+from . import admin, audit, auth, constant, downloads, importer, notices, proxy
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -37,6 +37,35 @@ def configure_logging() -> None:
         handlers=[console_handler, file_handler],
         force=True,
     )
+    configure_audit_log(formatter)
+    configure_access_log()
+
+
+def configure_audit_log(formatter: logging.Formatter) -> None:
+    """관리자 접속기록을 audit.log에도 따로 남깁니다(ebms.log에도 같이 들어감)."""
+    audit_logger = logging.getLogger(audit.__name__)
+    for handler in audit_logger.handlers[:]:
+        audit_logger.removeHandler(handler)
+        handler.close()
+    audit_logger.addHandler(audit.file_handler(formatter))
+
+
+def configure_access_log() -> None:
+    """uvicorn 접근 로그(접속 IP·경로)를 stdout(docker 로그) 대신 var/log/access.log에 남기고
+    constant.ACCESS_LOG_DAYS일이 지나면 지웁니다."""
+    access_logger = logging.getLogger("uvicorn.access")
+    for handler in access_logger.handlers[:]:
+        access_logger.removeHandler(handler)
+        handler.close()
+    handler = logging.handlers.TimedRotatingFileHandler(
+        constant.LOG_DIR / "access.log",
+        when="midnight",
+        backupCount=constant.ACCESS_LOG_DAYS,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    access_logger.addHandler(handler)
+    access_logger.propagate = False
 
 
 def backfill_pre_chunks() -> None:

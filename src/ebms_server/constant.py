@@ -16,6 +16,8 @@ TMP_DIR = BASE_DIR / "var" / "tmp"
 # 관리자 페이지에서 올린 zip을 풀어두는 임시 폴더. 등록이 끝나면 지웁니다.
 IMPORT_DIR = BASE_DIR / "var" / "import"
 LOG_DIR = BASE_DIR / "var" / "log"
+# HTTP 접근 로그(var/log/access.log, 접속 IP·경로)를 날마다 돌려 남기는 일수. 처리방침의 보유기간과 맞춥니다.
+ACCESS_LOG_DAYS = 30
 # 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
 UNUSED_DIR = BASE_DIR / "var" / "unused"
 BYTE_PER_CHUNK = 64 * 1024 * 1024
