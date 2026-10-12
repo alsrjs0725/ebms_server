@@ -2,19 +2,23 @@
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
+- 곡 관리: 곡 검색·삭제, 곡 zip의 파일 구조 보기·파일 받기
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 - 서버 로그 조회: 수준·로거·검색어 필터
 """
+import json
 import logging
+import mimetypes
 import time
+import urllib.parse
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import auth, constant, db, importer, logs, quota
+from . import auth, constant, db, downloads, importer, logs, quota
 from .accounts import User
 from .templating import templates
 
@@ -24,6 +28,8 @@ logger = logging.getLogger(__name__)
 ROLES = ("user", "admin")
 STATUSES = ("active", "banned")
 SEARCH_LIMIT = 50
+# 곡을 지울 때 임포트 배치가 쓰기 잠금을 놓기를 기다리는 시간(초)
+DELETE_LOCK_TIMEOUT = 10
 
 
 def web_admin(session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)]) -> User:
@@ -102,6 +108,55 @@ def _with_usage(cur, users: list[dict]) -> list[dict]:
     return result
 
 
+def search_songs(q: str = "", before: int | None = None) -> list[dict]:
+    """곡 번호·폴더명·차트 파일명으로 찾습니다(대소문자 무시). 최근 등록 순, 최대 SEARCH_LIMIT곡.
+    before를 주면 그보다 작은 번호만(다음 쪽)."""
+    where = []
+    params: list = []
+    q = q.strip()
+    if q:
+        like = _like(q.lower())
+        cond = "LOWER(s.folder) LIKE %s OR s.id IN (SELECT song_id FROM chart WHERE LOWER(filename) LIKE %s)"
+        params += [like, like]
+        if q.isdigit():
+            cond = "s.id = %s OR " + cond
+            params.insert(0, int(q))
+        where.append(f"({cond})")
+    if before is not None:
+        where.append("s.id < %s")
+        params.append(before)
+    sql = (
+        "SELECT s.id, s.folder, s.size, (SELECT COUNT(*) FROM chart c WHERE c.song_id = s.id) FROM song s"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + f" ORDER BY s.id DESC LIMIT {SEARCH_LIMIT}"
+    )
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [
+            {"id": song_id, "folder": folder, "size": size, "charts": charts}
+            for song_id, folder, size, charts in cur.fetchall()
+        ]
+
+
+def get_song_detail(song_id: int) -> dict:
+    """곡 정보와 곡 zip의 파일 목록. 파일마다 차트면 chart(sha256)가 붙습니다."""
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT id, folder, size, sha256, files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="song not found")
+        cur.execute("SELECT id, filename, size FROM chart WHERE song_id = %s ORDER BY filename", (song_id,))
+        charts = [{"sha256": sha256, "path": path, "size": size} for sha256, path, size in cur.fetchall()]
+    by_path = {chart["path"]: chart["sha256"] for chart in charts}
+    files = []
+    for entry in json.loads(row[4]) if row[4] else []:
+        item = {"path": entry["path"], "size": entry["size"], "comp_size": entry["comp_size"], "kind": entry.get("kind")}
+        if entry["path"] in by_path:
+            item["chart"] = by_path[entry["path"]]
+        files.append(item)
+    return {"id": row[0], "folder": row[1], "size": row[2], "sha256": row[3], "charts": charts, "files": files}
+
+
 def get_user_detail(user_id: str) -> dict:
     with db.connect() as con, con.cursor() as cur:
         cur.execute(f"SELECT {', '.join(USER_COLUMNS)} FROM user WHERE id = %s", (user_id,))
@@ -138,19 +193,26 @@ def admin_page(
     )
 
 
+@router.get("/admin/songs", response_class=HTMLResponse)
 @router.get("/admin/import", response_class=HTMLResponse)
-def import_page(
+def songs_page(
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
 ):
+    """곡 관리(검색·삭제·파일 보기)와 곡 임포트 탭. /admin/import는 임포트 탭을 엽니다."""
     if session is None:
         return auth._login_redirect(request)
     if not session[0].is_admin:
         return _forbidden(request)
     return templates.TemplateResponse(
         request=request,
-        name="pages/admin_import.html",
-        context={"user": session[0], "formats": constant.BMS_FORMAT},
+        name="pages/admin_songs.html",
+        context={
+            "user": session[0],
+            "formats": constant.BMS_FORMAT,
+            "tab": "import" if request.url.path == "/admin/import" else "songs",
+            "limit": SEARCH_LIMIT,
+        },
     )
 
 
@@ -252,6 +314,70 @@ def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
     get_user_detail(user_id)
     quota.refill_tickets(user_id)
     return get_user_detail(user_id)
+
+
+@router.get("/api/admin/songs")
+def list_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
+    return search_songs(q, before)
+
+
+@router.get("/api/admin/songs/{song_id}")
+def get_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
+    return get_song_detail(song_id)
+
+
+@router.delete("/api/admin/songs/{song_id}")
+def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
+    """곡을 지웁니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다. 임포트가 쓰기 잠금을 오래 잡고 있으면 409."""
+    try:
+        deleted = db.Database().delete_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    if not deleted:
+        raise HTTPException(status_code=404, detail="song not found")
+    logger.info(f"song {song_id} deleted by {admin.id}")
+    return {"ok": True}
+
+
+@router.get("/api/admin/songs/{song_id}/zip")
+def download_song_zip(song_id: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
+    """곡 zip 전체. 티켓·사용량은 쓰지 않습니다."""
+    return downloads.blob_response(request, "song", song_id, f"song_{song_id}.zip", "song not found")
+
+
+@router.get("/api/admin/songs/{song_id}/file")
+def download_song_file(song_id: int, path: str, admin: Annotated[User, Depends(web_admin)]):
+    """곡 zip의 파일 하나를 압축을 풀어 내려줍니다. 티켓·사용량은 쓰지 않습니다."""
+    files = db.Database().get_song_files(song_id)
+    if files is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    entry = next((f for f in files if f["path"] == path), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    blob = db.Database().open_blob("song", song_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    try:
+        start, decompressor = downloads._zip_member(blob, entry)
+    except ValueError:
+        blob.close()
+        raise HTTPException(status_code=500, detail="broken song file")
+    body = downloads._iter_member(blob, start, entry["comp_size"], decompressor)
+    name = urllib.parse.quote(path.rsplit("/", 1)[-1])
+
+    @downloads._once
+    def cleanup():
+        try:
+            body.close()
+        finally:
+            blob.close()
+
+    return downloads.ReleasingStreamingResponse(
+        body,
+        on_close=cleanup,
+        media_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
+        headers={"Content-Length": str(entry["size"]), "Content-Disposition": f"attachment; filename*=UTF-8''{name}"},
+    )
 
 
 class UploadStart(BaseModel):
