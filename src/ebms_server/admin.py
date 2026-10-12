@@ -13,7 +13,7 @@ import time
 import urllib.parse
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
@@ -110,9 +110,22 @@ def _with_usage(cur, users: list[dict]) -> list[dict]:
     return result
 
 
-def search_songs(q: str = "", before: int | None = None) -> list[dict]:
-    """곡 번호·폴더명·차트 파일명으로 찾습니다(대소문자 무시). 최근 등록 순, 최대 SEARCH_LIMIT곡.
-    before를 주면 그보다 작은 번호만(다음 쪽)."""
+def _paged(cur, select: str, source: str, where: list[str], params: list, order: str, page: int) -> tuple[list, int]:
+    """(page쪽의 행들, 전체 개수). 쪽마다 SEARCH_LIMIT개, page는 1부터."""
+    cond = " WHERE " + " AND ".join(where) if where else ""
+    cur.execute(f"SELECT COUNT(*) FROM {source}{cond}", tuple(params))
+    total = cur.fetchone()[0]
+    offset = (page - 1) * SEARCH_LIMIT
+    cur.execute(f"SELECT {select} FROM {source}{cond} ORDER BY {order} LIMIT {SEARCH_LIMIT} OFFSET {offset}", tuple(params))
+    return list(cur.fetchall()), total
+
+
+def _page_json(items: list[dict], total: int, page: int) -> dict:
+    return {"items": items, "total": total, "page": page, "pages": max(1, -(-total // SEARCH_LIMIT))}
+
+
+def search_songs(q: str = "", page: int = 1) -> dict:
+    """곡 번호·폴더명·차트 파일명으로 찾습니다(대소문자 무시). 최근 등록 순으로 쪽마다 SEARCH_LIMIT곡."""
     where = []
     params: list = []
     q = q.strip()
@@ -124,28 +137,21 @@ def search_songs(q: str = "", before: int | None = None) -> list[dict]:
             cond = "s.id = %s OR " + cond
             params.insert(0, int(q))
         where.append(f"({cond})")
-    if before is not None:
-        where.append("s.id < %s")
-        params.append(before)
-    sql = (
-        "SELECT s.id, s.folder, s.size, (SELECT COUNT(*) FROM chart c WHERE c.song_id = s.id) FROM song s"
-        + (" WHERE " + " AND ".join(where) if where else "")
-        + f" ORDER BY s.id DESC LIMIT {SEARCH_LIMIT}"
-    )
     with db.connect() as con, con.cursor() as cur:
-        cur.execute(sql, tuple(params))
-        return [
-            {"id": song_id, "folder": folder, "size": size, "charts": charts}
-            for song_id, folder, size, charts in cur.fetchall()
-        ]
+        rows, total = _paged(
+            cur,
+            "s.id, s.folder, s.size, (SELECT COUNT(*) FROM chart c WHERE c.song_id = s.id)",
+            "song s", where, params, "s.id DESC", page,
+        )
+    items = [{"id": song_id, "folder": folder, "size": size, "charts": charts} for song_id, folder, size, charts in rows]
+    return _page_json(items, total, page)
 
 
 DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at")
 
 
-def search_deleted_songs(q: str = "", before: int | None = None) -> list[dict]:
-    """지운 곡 기록을 곡 번호·폴더명·사유로 찾습니다. 번호 내림차순, 최대 SEARCH_LIMIT개.
-    before를 주면 그보다 작은 번호만(다음 쪽)."""
+def search_deleted_songs(q: str = "", page: int = 1) -> dict:
+    """사용 중지한 곡을 곡 번호·폴더명·사유로 찾습니다. 번호 내림차순으로 쪽마다 SEARCH_LIMIT개."""
     where = []
     params: list = []
     q = q.strip()
@@ -157,21 +163,14 @@ def search_deleted_songs(q: str = "", before: int | None = None) -> list[dict]:
             cond = "d.song_id = %s OR " + cond
             params.insert(0, int(q))
         where.append(f"({cond})")
-    if before is not None:
-        where.append("d.song_id < %s")
-        params.append(before)
     columns = ", ".join(f"d.{name}" for name in DELETED_COLUMNS)
-    sql = (
-        f"SELECT {columns}, u.display_name FROM deleted_song d LEFT JOIN user u ON u.id = d.deleted_by"
-        + (" WHERE " + " AND ".join(where) if where else "")
-        + f" ORDER BY d.song_id DESC LIMIT {SEARCH_LIMIT}"
-    )
     with db.connect() as con, con.cursor() as cur:
-        cur.execute(sql, tuple(params))
-        return [
-            {**dict(zip(DELETED_COLUMNS, row)), "deleted_by_name": row[-1]}
-            for row in cur.fetchall()
-        ]
+        rows, total = _paged(
+            cur, f"{columns}, u.display_name", "deleted_song d LEFT JOIN user u ON u.id = d.deleted_by",
+            where, params, "d.song_id DESC", page,
+        )
+    items = [{**dict(zip(DELETED_COLUMNS, row)), "deleted_by_name": row[-1]} for row in rows]
+    return _page_json(items, total, page)
 
 
 def get_song_detail(song_id: int) -> dict:
@@ -353,13 +352,13 @@ def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 
 @router.get("/api/admin/songs")
-def list_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
-    return search_songs(q, before)
+def list_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", page: Annotated[int, Query(ge=1)] = 1):
+    return search_songs(q, page)
 
 
 @router.get("/api/admin/songs/deleted")
-def list_deleted_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
-    return search_deleted_songs(q, before)
+def list_deleted_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", page: Annotated[int, Query(ge=1)] = 1):
+    return search_deleted_songs(q, page)
 
 
 @router.get("/api/admin/songs/{song_id}")

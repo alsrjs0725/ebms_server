@@ -43,13 +43,20 @@ def test_search_and_files(client, monkeypatch):
     upload(client, "Alpha.zip", make_zip({"a.bms": b"#TITLE A\n", "snd/kick.wav": wav}))
     upload(client, "beta.zip", make_zip({"Beta Song.bme": b"#TITLE B\n"}))
 
-    assert [s["id"] for s in client.get("/api/admin/songs").json()] == [2, 1]
-    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "alp"}).json()] == [1]
+    assert [s["id"] for s in client.get("/api/admin/songs").json()["items"]] == [2, 1]
+    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "alp"}).json()["items"]] == [1]
     # 차트 파일명과 곡 번호로도 찾습니다.
-    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "beta song"}).json()] == [2]
-    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "1"}).json()] == [1]
-    assert client.get("/api/admin/songs", params={"before": 2}).json()[0]["id"] == 1
-    assert client.get("/api/admin/songs", params={"q": "100%"}).json() == []
+    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "beta song"}).json()["items"]] == [2]
+    assert [s["id"] for s in client.get("/api/admin/songs", params={"q": "1"}).json()["items"]] == [1]
+    # 쪽마다 SEARCH_LIMIT곡
+    monkeypatch.setattr(admin, "SEARCH_LIMIT", 1)
+    page2 = client.get("/api/admin/songs", params={"page": 2}).json()
+    assert [s["id"] for s in page2["items"]] == [1]
+    assert (page2["total"], page2["page"], page2["pages"]) == (2, 2, 2)
+    assert client.get("/api/admin/songs", params={"page": 3}).json()["items"] == []
+    assert client.get("/api/admin/songs", params={"page": 0}).status_code == 422
+    monkeypatch.setattr(admin, "SEARCH_LIMIT", 50)
+    assert client.get("/api/admin/songs", params={"q": "100%"}).json()["items"] == []
 
     song = client.get("/api/admin/songs/1").json()
     assert song["folder"] == "Alpha" and len(song["charts"]) == 1
@@ -122,13 +129,15 @@ def test_deleted_log_and_gap(client, monkeypatch):
     assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "중복 곡"}).status_code == 200
     assert client.delete("/api/admin/songs/1").status_code == 200  # 사유 없이도 지움
 
-    rows = client.get("/api/admin/songs/deleted").json()
+    rows = client.get("/api/admin/songs/deleted").json()["items"]
     assert [r["song_id"] for r in rows] == [2, 1]
     assert rows[0]["folder"] == "b" and rows[0]["reason"] == "중복 곡" and rows[0]["charts"] == 1
     assert rows[0]["deleted_by_name"] == "Admin" and rows[0]["deleted_at"] > 0
     assert rows[1]["reason"] == ""
-    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"q": "중복"}).json()] == [2]
-    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"before": 2}).json()] == [1]
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"q": "중복"}).json()["items"]] == [2]
+    monkeypatch.setattr(admin, "SEARCH_LIMIT", 1)
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"page": 2}).json()["items"]] == [1]
+    monkeypatch.setattr(admin, "SEARCH_LIMIT", 50)
 
     # AUTO_INCREMENT가 되돌아가도(오래된 MySQL 재시작·복원) 지운 번호는 다시 쓰지 않습니다.
     with db_module.connect() as con, con.cursor() as cur:
@@ -160,7 +169,7 @@ def test_unuse_and_restore(client, monkeypatch):
     assert client.post("/api/admin/songs/1/restore").json()["files"] == before["files"]
     assert client.post("/api/admin/songs/1/restore").status_code == 404
     assert not folder.exists()
-    assert client.get("/api/admin/songs/deleted").json() == []
+    assert client.get("/api/admin/songs/deleted").json()["items"] == []
     assert client.get("/api/admin/songs/1/file", params={"path": "kick.wav"}).content == wav
     songs = manifest_songs()
     assert [s["song_id"] for s in songs] == [1] and songs[0]["charts"] == [sha]
@@ -208,4 +217,4 @@ def test_restore_conflict(client, monkeypatch):
     r = client.post("/api/admin/songs/1/restore")
     assert r.status_code == 409 and "#2" in r.json()["detail"]
     assert (constant.UNUSED_DIR / "1" / "song.zip").exists()
-    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted").json()] == [1]
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted").json()["items"]] == [1]
