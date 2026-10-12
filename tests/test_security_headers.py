@@ -26,7 +26,7 @@ def test_security_headers_on_all_responses(client):
 
 
 def test_pages_work_under_csp(client, monkeypatch):
-    oauth(client, monkeypatch, "discord", "admin1", email="admin@example.com", name="Admin")
+    oauth(client, monkeypatch, "discord", "admin1", name="Admin", admin=True)
     assert client.post("/api/admin/notices", json={"title": "공지", "body": "본문"}).status_code == 200
     seen_assets = set()
     for path in PAGES:

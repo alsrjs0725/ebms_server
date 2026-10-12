@@ -102,7 +102,6 @@ SCHEMA = [
         CREATE TABLE IF NOT EXISTS user(
             id CHAR(36) NOT NULL,
             display_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
-            email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
             role VARCHAR(16) NOT NULL DEFAULT 'user',
             status VARCHAR(16) NOT NULL DEFAULT 'active',
             created_at BIGINT UNSIGNED NOT NULL,
@@ -123,8 +122,6 @@ SCHEMA = [
             user_id CHAR(36) NOT NULL,
             oauth VARCHAR(16) NOT NULL,
             oauth_user_id VARCHAR(255) NOT NULL,
-            email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
-            name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             linked_at BIGINT UNSIGNED NOT NULL,
 
             PRIMARY KEY (id),
@@ -139,7 +136,6 @@ SCHEMA = [
             token_sha256 CHAR(64) NOT NULL,
             user_id CHAR(36) NOT NULL,
             kind VARCHAR(16) NOT NULL,
-            device_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             created_at BIGINT UNSIGNED NOT NULL,
             last_used_at BIGINT UNSIGNED NOT NULL,
             expires_at BIGINT UNSIGNED NOT NULL,
@@ -158,7 +154,6 @@ SCHEMA = [
             user_id CHAR(36) NOT NULL,
             code_challenge VARCHAR(128) NOT NULL,
             redirect_uri VARCHAR(255) NOT NULL,
-            device_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             created_at BIGINT UNSIGNED NOT NULL,
             expires_at BIGINT UNSIGNED NOT NULL,
             used_at BIGINT UNSIGNED,
@@ -270,6 +265,14 @@ MISSING_COLUMNS = [
     ("user", "refill_seconds", "INT UNSIGNED"),
     ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
     ("user", "pre_throttled_kbps", "INT UNSIGNED"),
+]
+# 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
+DROPPED_COLUMNS = [
+    ("user", "email"),
+    ("user_identity", "email"),
+    ("user_identity", "name"),
+    ("session", "device_name"),
+    ("auth_code", "device_name"),
 ]
 
 
@@ -740,6 +743,23 @@ class Database:
                 if cur.fetchone()[0] == 0:
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     self.logger.info(f"generate_database: Added column {table}.{column}")
+            for table, column in DROPPED_COLUMNS:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                    """,
+                    (table, column),
+                )
+                if cur.fetchone()[0] == 0:
+                    continue
+                if (table, column) == ("user_identity", "name"):
+                    # 예전에는 user.display_name도 OAuth 계정 이름으로 채웠습니다. 이 컬럼이 남아 있으면 아직
+                    # 정리하지 않은 DB이므로 표시 이름도 비우고, 다음 로그인 때 닉네임을 새로 정하게 합니다.
+                    cur.execute("UPDATE user SET display_name = ''")
+                    self.logger.info("generate_database: Cleared user.display_name taken from OAuth")
+                cur.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                self.logger.info(f"generate_database: Dropped column {table}.{column}")
             cur.execute(
                 """
                 SELECT IS_NULLABLE FROM information_schema.COLUMNS

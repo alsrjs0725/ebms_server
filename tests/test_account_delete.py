@@ -16,8 +16,8 @@ def count(table: str, column: str, value: str) -> int:
 def test_delete_account_removes_user_data(client, monkeypatch):
     key, user_id = client_login(client, monkeypatch)
     web_token = client.cookies.get(constant.SESSION_COOKIE)
-    other_token = accounts.create_session(user_id, "web", "other device")
-    accounts.create_auth_code(user_id, "c" * 43, "http://127.0.0.1:1/cb", "pc")
+    other_token = accounts.create_session(user_id, "web")
+    accounts.create_auth_code(user_id, "c" * 43, "http://127.0.0.1:1/cb")
     assert quota.charge_play(user_id, 1)
     now = int(time.time())
     with db_module.connect() as con, con.cursor() as cur:
@@ -64,7 +64,7 @@ def test_delete_account_requires_web_session(client, monkeypatch):
 
 
 def test_last_admin_cannot_delete(client, monkeypatch):
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com")
+    oauth(client, monkeypatch, "google", "g1", admin=True)
     admin_id = me(client).id
     assert me(client).is_admin
     r = client.delete("/api/account")
@@ -73,15 +73,15 @@ def test_last_admin_cannot_delete(client, monkeypatch):
 
     # 다른 관리자가 있으면 탈퇴 가능
     client.post("/auth/logout")
-    oauth(client, monkeypatch, "discord", "d2", email="admin@example.com")
+    oauth(client, monkeypatch, "discord", "d2", admin=True)
     assert me(client).is_admin
     client.post("/auth/logout")
-    oauth(client, monkeypatch, "google", "g1", email="admin@example.com")
+    oauth(client, monkeypatch, "google", "g1")
     assert me(client).id == admin_id
     assert client.delete("/api/account").status_code == 204
     assert accounts.get_user(admin_id) is None
     # 남은 관리자는 마지막이라 거부
-    oauth(client, monkeypatch, "discord", "d2", email="admin@example.com")
+    oauth(client, monkeypatch, "discord", "d2")
     assert client.delete("/api/account").status_code == 409
 
 

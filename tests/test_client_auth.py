@@ -23,6 +23,7 @@ def authorize(client, challenge, **extra):
         "state": "st",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        # 예전 클라이언트가 보내던 값. 서버는 무시합니다(#102).
         "device_name": "my pc",
         **extra,
     }
@@ -59,12 +60,13 @@ def test_full_flow_and_bearer(client, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["id"] == user_id
-    assert body["oauths"] == [{"oauth": "google", "name": "Alice"}]
+    assert body["oauths"] == [{"oauth": "google", "name": ""}]
     assert body["session"]["kind"] == "client"
-    # 클라이언트 세션은 기기 목록에 이름과 함께 나옴
+    assert "email" not in body
+    # 클라이언트 세션은 기기 목록에 종류로만 나오고, 보낸 기기 이름은 저장하지 않음
     sessions = accounts.list_sessions(user_id)
     client_session = next(s for s in sessions if s.kind == "client")
-    assert client_session.device_name == "my pc"
+    assert not hasattr(client_session, "device_name")
     assert client_session.expires_at - client_session.created_at == constant.CLIENT_SESSION_SECONDS
 
     r = client.post("/api/auth/client/logout", headers={"Authorization": f"Bearer {key}"})

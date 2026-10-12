@@ -20,8 +20,11 @@ def execute(sql, args=()):
         con.commit()
 
 
-def new_user(puid, email=None):
-    return accounts.login(Profile("google", puid, email, True, puid)).id
+def new_user(puid, admin=False):
+    uid = accounts.signup(Profile("google", puid), puid).id
+    if admin:
+        execute("UPDATE user SET role = 'admin' WHERE id = %s", (uid,))
+    return uid
 
 
 def test_months_before():
@@ -33,7 +36,7 @@ def test_months_before():
 def test_purge_sessions(client, monkeypatch):
     monkeypatch.setattr(constant, "RETENTION_SESSION_DAYS", 30)
     uid = new_user("u1")
-    session = "INSERT INTO session (token_sha256, user_id, kind, device_name, created_at, last_used_at, expires_at, revoked_at) VALUES (%s, %s, 'web', 'dev', 0, 0, %s, %s)"
+    session = "INSERT INTO session (token_sha256, user_id, kind, created_at, last_used_at, expires_at, revoked_at) VALUES (%s, %s, 'web', 0, 0, %s, %s)"
     execute(session, ("live", uid, NOW + DAY, None))
     execute(session, ("expired-recent", uid, NOW - 10 * DAY, None))
     execute(session, ("expired-old", uid, NOW - 31 * DAY, None))
@@ -88,14 +91,14 @@ def test_purge_inactive_users(client, monkeypatch):
     monkeypatch.setattr(constant, "RETENTION_INACTIVE_USER_DAYS", 365)
     old = new_user("old")
     client_user = new_user("client")
-    admin = new_user("admin", email="admin@example.com")
+    admin = new_user("admin", admin=True)
     recent = new_user("recent")
     for uid in (old, client_user, admin):
         execute("UPDATE user SET last_login_at = %s WHERE id = %s", (NOW - 400 * DAY, uid))
     execute("UPDATE user SET last_login_at = %s WHERE id = %s", (NOW - 10 * DAY, recent))
     # 로그인은 오래됐어도 클라이언트 세션을 최근에 썼으면 남깁니다.
     execute(
-        "INSERT INTO session (token_sha256, user_id, kind, device_name, created_at, last_used_at, expires_at) VALUES ('t', %s, 'client', '', 0, %s, %s)",
+        "INSERT INTO session (token_sha256, user_id, kind, created_at, last_used_at, expires_at) VALUES ('t', %s, 'client', 0, %s, %s)",
         (client_user, NOW - DAY, NOW + 80 * DAY),
     )
 

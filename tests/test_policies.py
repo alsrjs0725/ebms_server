@@ -18,7 +18,7 @@ def test_policy_pages_show_template(client):
 
 def test_policy_admin_only(client, monkeypatch):
     assert client.post("/api/admin/policies/privacy", json={"body": "x"}).status_code == 401
-    oauth(client, monkeypatch, "google", "u1", email="user@example.com")
+    oauth(client, monkeypatch, "google", "u1")
     assert client.post("/api/admin/policies/privacy", json={"body": "x"}).status_code == 403
     assert client.get("/admin/policies").status_code == 403
 

@@ -6,7 +6,7 @@
 
 | 데이터 | 테이블 | 기본 보유기간 | env |
 | --- | --- | --- | --- |
-| 만료·해지된 로그인 세션(기기 이름, 사용 시각) | `session` | 만료 또는 해지 후 **30일** | `EBMS_RETENTION_SESSION_DAYS` |
+| 만료·해지된 로그인 세션(종류, 사용 시각) | `session` | 만료 또는 해지 후 **30일** | `EBMS_RETENTION_SESSION_DAYS` |
 | 곡별 다운로드 기록(마지막 차감 시각) | `download_grant` | 재차감 면제 기간(`grant_seconds`, 기본 30분)이 끝나면 **바로** | `EBMS_RETENTION_GRANT_DAYS` (0: 바로, -1: 지우지 않음) |
 | 월별 사전 다운로드 사용량 | `pre_usage` | 이번 달 포함 **12개월** | `EBMS_RETENTION_PRE_USAGE_MONTHS` |
 | 오래 쓰지 않은 계정 | `user`와 연결된 모든 행 | **지우지 않음**(기본 0) | `EBMS_RETENTION_INACTIVE_USER_DAYS` |
