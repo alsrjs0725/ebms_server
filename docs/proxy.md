@@ -127,5 +127,29 @@ OAuth 앱의 리다이렉트 주소도 새 도메인(`https://ebms.example.com/a
 
 - 비밀값을 바꾸면 홈서버 env와 VM 설정을 함께 바꿉니다(VM은 `setup.sh`를 새 값으로 다시 실행). 둘이 다르면 큰 파일 요청이 `500`이 됩니다.
 - 캐시 비우기: `sudo rm -rf /var/cache/nginx/ebms/* && sudo systemctl reload nginx`
-- 로그: `/var/log/nginx/access.log`, `/var/log/nginx/error.log`
+- 로그: `/var/log/nginx/access.log`, `/var/log/nginx/error.log`(NPM은 `~/npm/data/logs/proxy-host-*_access.log`, `*_error.log`)
+
+### 로그 보관
+
+VM의 접근·오류 로그에는 접속 IP(접근 로그는 User-Agent·Referer·경로도)가 남습니다. 바꾸면 개인정보 처리방침의 보유기간도 함께 고칩니다.
+
+| 설치 방식 | 설정 | 보관 |
+| --- | --- | --- |
+| Nginx Proxy Manager | `deploy/proxy/npm/logrotate.conf`(compose가 컨테이너의 `/etc/logrotate.d/nginx-proxy-manager`에 붙임). NPM이 이틀마다 logrotate를 돌림 | 주 단위 회전 × 4개: 지금 파일 + 4주, 최대 약 6주 |
+| `setup.sh`(VM의 nginx) | Ubuntu nginx 패키지 기본 `/etc/logrotate.d/nginx`(매일 회전, `rotate 14`) | 약 14일 |
+
+NPM은 기본값이 접근 로그 4주, 오류 로그 10주이고 이미지 버전에 따라 바뀔 수 있어 저장소의 `logrotate.conf`로 고정합니다. logrotate 상태 파일은 `./logrotate-state`에 남겨 컨테이너를 다시 만들어도 회전 주기가 처음부터 다시 세어지지 않게 합니다.
+
+이미 띄운 NPM에 적용하려면 VM에서:
+
+```bash
+cd ~/npm
+# 저장소의 deploy/proxy/npm/docker-compose.yml, logrotate.conf를 이 폴더로 복사한 뒤
+mkdir -p logrotate-state
+docker compose up -d                                         # 컨테이너를 새 설정으로 다시 만듦
+docker compose exec npm logrotate -d /etc/logrotate.d/nginx-proxy-manager   # 설정 확인(실제로 돌리지 않음)
+ls -la data/logs/                                            # .gz가 5개 이상 쌓이지 않는지 몇 주 뒤 확인
+```
+
+`setup.sh`로 설치했다면 `cat /etc/logrotate.d/nginx`로 `rotate` 값을 확인합니다.
 - `EBMS_PROXY_SECRET`을 비우면 연동이 꺼지고 다운로드를 홈서버가 직접 처리합니다(`/api/proxy/authz`는 404).

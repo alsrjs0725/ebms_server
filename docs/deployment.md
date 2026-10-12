@@ -11,6 +11,21 @@
 - 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
 - 서버 로그와 임포트 대기 폴더(`var/log`, `var/tmp`)는 `ebms-var` 볼륨에 유지됩니다.
 
+### 로그 보관
+
+접속 IP처럼 개인정보가 담긴 로그는 아래 기간만 남기고 지웁니다. 바꾸면 개인정보 처리방침의 보유기간도 함께 고칩니다.
+
+| 로그 | 위치 | 담기는 정보 | 보관 |
+| --- | --- | --- | --- |
+| HTTP 접근 로그 | `var/log/access.log` | 접속 IP, 시각, 메서드·경로, 상태코드 | 날마다 회전, **30일**(`constant.ACCESS_LOG_DAYS`) |
+| 서버 앱 로그 | `var/log/ebms.log` | 사용자·관리자 id(오류, 곡 삭제·임포트 등) | 7일 단위 회전 × 53개, 약 1년 |
+| 관리자 접속기록 | `var/log/audit.log` | 관리자 id, 접속 IP, 행위, 대상 사용자 id | 7일 단위 회전 × 53개, **1년 이상**([admin.md](admin.md)) |
+| 컨테이너 stdout(`docker compose logs`) | docker json-file | 서버 앱 로그와 같은 내용(접근 로그는 없음) | 컨테이너마다 10MB × 3개(`docker-compose.yml`의 `x-logging`) |
+
+- 접근 로그는 stdout(docker 로그)에 나가지 않습니다. 볼 때는 `docker compose exec ebms tail -f var/log/access.log`.
+- 이 설정 전에 쌓인 docker 로그는 컨테이너를 다시 만들 때(`docker compose up -d`) 지워집니다.
+- VM 프록시의 로그 보관은 [proxy.md](proxy.md#로그-보관)에 있습니다.
+
 ## TLS 리버스 프록시 (필수)
 
 > 홈서버를 직접 공개하지 않고 외부 VM(오라클 무료 VM 등)에서 캐시·접속 제한까지 맡기려면 [proxy.md](proxy.md)를 따르세요. 아래는 같은 호스트에 프록시를 두는 경우입니다.
