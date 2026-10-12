@@ -1,8 +1,17 @@
+# 컨테이너 stdout 로그(docker logs)의 크기 한도. 기본 json-file 드라이버는 설정이 없으면 무기한 쌓습니다.
+# 접속 IP가 담긴 HTTP 접근 로그는 stdout이 아니라 var/log/access.log에 남깁니다(docs/deployment.md#로그-보관).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   mysql:
     image: mysql:8.4
     # ports를 열지 않음: compose 내부 네트워크에서 ebms 컨테이너만 접근
     restart: unless-stopped
+    logging: *logging
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-ebms}
       MYSQL_USER: ${MYSQL_USER:-ebms}
@@ -30,6 +39,7 @@ services:
     image: ${EBMS_IMAGE:-ghcr.io/alsrjs0725/ebms_server:latest}
     build: .
     restart: unless-stopped
+    logging: *logging
     depends_on:
       mysql:
         condition: service_healthy

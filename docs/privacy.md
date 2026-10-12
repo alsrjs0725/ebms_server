@@ -19,8 +19,4 @@
 
 ## 서버 밖의 로그
 
-DB 밖의 로그는 이 작업이 지우지 않습니다.
-
-- 서버 앱 로그 `var/log/ebms.log`: 7일 단위 회전 × 53개(약 1년).
-- docker 로그(uvicorn 접근 로그, 접속 IP 포함): `docker-compose.yml`에 `logging` 설정이 없으면 docker 기본값(무기한)입니다.
-- 앞단 프록시(오라클 VM)의 접근 로그: 프록시의 logrotate 설정을 따릅니다.
+DB 밖의 로그는 이 작업이 아니라 로그 회전으로 지워집니다. 보관 기간은 [deployment.md](deployment.md#로그-보관)(홈서버: 접근 로그 30일, 앱 로그 약 1년, 관리자 접속기록 1년 이상, docker 로그 10MB × 3개)와 [proxy.md](proxy.md#로그-보관)(오라클 VM: 최대 약 6주)에 있습니다.

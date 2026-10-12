@@ -5,6 +5,8 @@
 - 곡 관리: 곡 검색·삭제(사용 중지)·복원, 곡 zip의 파일 구조 보기·파일 받기
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 - 서버 로그 조회: 수준·로거·검색어 필터
+
+사용자 정보를 보거나 바꾸면 audit.record로 관리자 접속기록을 남깁니다.
 """
 import json
 import logging
@@ -18,7 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import auth, constant, db, downloads, importer, logs, quota
+from . import audit, auth, constant, db, downloads, importer, logs, quota
 from .accounts import User
 from .templating import templates
 
@@ -212,13 +214,15 @@ def admin_page(
     user = session[0]
     if not user.is_admin:
         return _forbidden(request)
+    users = search_users(q)
+    audit.record(request, user.id, "user.search", [u["id"] for u in users], q=q)
     return templates.TemplateResponse(
         request=request,
         name="pages/admin.html",
         context={
             "user": user,
             "settings": quota.get_settings(),
-            "users": search_users(q),
+            "users": users,
             "q": q,
             "limit": SEARCH_LIMIT,
             "now": int(time.time()),
@@ -286,13 +290,17 @@ def put_settings(values: dict, admin: Annotated[User, Depends(web_admin)]):
 
 
 @router.get("/api/admin/users")
-def list_users(admin: Annotated[User, Depends(web_admin)], q: str = ""):
-    return search_users(q)
+def list_users(request: Request, admin: Annotated[User, Depends(web_admin)], q: str = ""):
+    users = search_users(q)
+    audit.record(request, admin.id, "user.search", [u["id"] for u in users], q=q)
+    return users
 
 
 @router.get("/api/admin/users/{user_id}")
-def get_user(user_id: str, admin: Annotated[User, Depends(web_admin)]):
-    return get_user_detail(user_id)
+def get_user(user_id: str, request: Request, admin: Annotated[User, Depends(web_admin)]):
+    detail = get_user_detail(user_id)
+    audit.record(request, admin.id, "user.view", user_id)
+    return detail
 
 
 class UserUpdate(BaseModel):
@@ -305,7 +313,7 @@ class UserUpdate(BaseModel):
 
 
 @router.put("/api/admin/users/{user_id}")
-def put_user(user_id: str, body: UserUpdate, admin: Annotated[User, Depends(web_admin)]):
+def put_user(user_id: str, body: UserUpdate, request: Request, admin: Annotated[User, Depends(web_admin)]):
     """보낸 항목만 바꿉니다. 한도 항목에 null을 보내면 전역 기본값을 따릅니다."""
     get_user_detail(user_id)
     values = body.model_dump(exclude_unset=True)
@@ -338,14 +346,17 @@ def put_user(user_id: str, body: UserUpdate, admin: Annotated[User, Depends(web_
         with db.connect() as con, con.cursor() as cur:
             cur.execute(f"UPDATE user SET {', '.join(updates)} WHERE id = %s", tuple(params))
             con.commit()
+    changes = body.model_dump(exclude_unset=True)
+    audit.record(request, admin.id, "user.update", user_id, **{k: "null" if v is None else v for k, v in changes.items()})
     return get_user_detail(user_id)
 
 
 @router.post("/api/admin/users/{user_id}/refill")
-def refill(user_id: str, admin: Annotated[User, Depends(web_admin)]):
+def refill(user_id: str, request: Request, admin: Annotated[User, Depends(web_admin)]):
     """티켓을 최대치로 채웁니다."""
     get_user_detail(user_id)
     quota.refill_tickets(user_id)
+    audit.record(request, admin.id, "user.refill", user_id)
     return get_user_detail(user_id)
 
 
