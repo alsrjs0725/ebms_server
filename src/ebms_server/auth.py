@@ -656,7 +656,8 @@ def get_me(session: Annotated[tuple[User, int, str], Depends(api_session)]):
     return {
         **_user_json(user),
         "oauths": [
-            {"oauth": i.oauth}
+            # name은 계정 이름을 받지 않아 항상 빈 값. 필수 필드로 읽는 예전 클라이언트 호환용입니다.
+            {"oauth": i.oauth, "name": ""}
             for i in accounts.list_identities(user.id)
         ],
         "session": {"kind": kind},

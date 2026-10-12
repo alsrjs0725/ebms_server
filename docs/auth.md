@@ -62,7 +62,7 @@ OAuth 계정 ID(Google `sub`, Discord `id`)만 저장합니다. 이메일·계�
 | GET | `/auth/client/authorize` | 웹 쿠키(없으면 `/login`으로) | 쿼리: `redirect_uri`(`http://127.0.0.1:<포트>/…`만 허용), `state`, `code_challenge`(base64url SHA-256), `code_challenge_method=S256`. 예전 클라이언트가 보내는 `device_name`은 무시합니다. 값이 틀리면 `400` 페이지 |
 | POST | `/api/auth/client/token` | - | JSON `{"code", "code_verifier"}` → `{"session_key", "expires_at", "user": {"id", "display_name", "role"}}`. 코드가 없거나 만료·사용됐거나 verifier가 틀리면 `400`(코드는 한 번 시도하면 폐기), 정지된 계정은 `403` |
 | POST | `/api/auth/client/logout` | Bearer | 현재 세션키 폐기. `204` |
-| GET | `/api/me` | Bearer 또는 웹 쿠키 | 내 계정: `id`, `display_name`, `role`, `oauths`(`[{"oauth"}]`), `session.kind`(`client`/`web`), `tickets`, `pre`([다운로드](download.md) 참고) |
+| GET | `/api/me` | Bearer 또는 웹 쿠키 | 내 계정: `id`, `display_name`, `role`, `oauths`(`[{"oauth", "name"}]`, `name`은 예전 클라이언트 호환용으로 항상 빈 값), `session.kind`(`client`/`web`), `tickets`, `pre`([다운로드](download.md) 참고) |
 
 - `Authorization` 헤더가 있으면 쿠키는 보지 않습니다. 세션키가 틀리거나 만료·폐기됐으면 `401` + `WWW-Authenticate: Bearer`입니다.
 - 웹 쿠키 값은 세션키로 쓸 수 없고, 그 반대도 마찬가지입니다.
