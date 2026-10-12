@@ -30,6 +30,8 @@ STATUSES = ("active", "banned")
 SEARCH_LIMIT = 50
 # 곡을 지울 때 임포트 배치가 쓰기 잠금을 놓기를 기다리는 시간(초)
 DELETE_LOCK_TIMEOUT = 10
+# 삭제 사유 최대 글자 수
+REASON_MAX = 1000
 
 
 def web_admin(session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)]) -> User:
@@ -135,6 +137,40 @@ def search_songs(q: str = "", before: int | None = None) -> list[dict]:
         return [
             {"id": song_id, "folder": folder, "size": size, "charts": charts}
             for song_id, folder, size, charts in cur.fetchall()
+        ]
+
+
+DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at")
+
+
+def search_deleted_songs(q: str = "", before: int | None = None) -> list[dict]:
+    """지운 곡 기록을 곡 번호·폴더명·사유로 찾습니다. 번호 내림차순, 최대 SEARCH_LIMIT개.
+    before를 주면 그보다 작은 번호만(다음 쪽)."""
+    where = []
+    params: list = []
+    q = q.strip()
+    if q:
+        like = _like(q.lower())
+        cond = "LOWER(d.folder) LIKE %s OR LOWER(d.reason) LIKE %s"
+        params += [like, like]
+        if q.isdigit():
+            cond = "d.song_id = %s OR " + cond
+            params.insert(0, int(q))
+        where.append(f"({cond})")
+    if before is not None:
+        where.append("d.song_id < %s")
+        params.append(before)
+    columns = ", ".join(f"d.{name}" for name in DELETED_COLUMNS)
+    sql = (
+        f"SELECT {columns}, u.display_name FROM deleted_song d LEFT JOIN user u ON u.id = d.deleted_by"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + f" ORDER BY d.song_id DESC LIMIT {SEARCH_LIMIT}"
+    )
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [
+            {**dict(zip(DELETED_COLUMNS, row)), "deleted_by_name": row[-1]}
+            for row in cur.fetchall()
         ]
 
 
@@ -321,21 +357,34 @@ def list_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: 
     return search_songs(q, before)
 
 
+@router.get("/api/admin/songs/deleted")
+def list_deleted_songs(admin: Annotated[User, Depends(web_admin)], q: str = "", before: int | None = None):
+    return search_deleted_songs(q, before)
+
+
 @router.get("/api/admin/songs/{song_id}")
 def get_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
     return get_song_detail(song_id)
 
 
+class SongDelete(BaseModel):
+    reason: str = ""
+
+
 @router.delete("/api/admin/songs/{song_id}")
-def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
-    """곡을 지웁니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다. 임포트가 쓰기 잠금을 오래 잡고 있으면 409."""
+def delete_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: SongDelete | None = None):
+    """곡을 지우고 사유와 함께 기록합니다. 번호는 결번으로 남습니다. 클라이언트는 다음 동기화 때 목록에서 뺍니다.
+    임포트가 쓰기 잠금을 오래 잡고 있으면 409."""
+    reason = (body.reason if body else "").strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
     try:
-        deleted = db.Database().delete_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+        deleted = db.Database().delete_song(song_id, reason, admin.id, timeout=DELETE_LOCK_TIMEOUT)
     except TimeoutError:
         raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
     if not deleted:
         raise HTTPException(status_code=404, detail="song not found")
-    logger.info(f"song {song_id} deleted by {admin.id}")
+    logger.info(f"song {song_id} deleted by {admin.id}: {reason}")
     return {"ok": True}
 
 

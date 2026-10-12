@@ -28,6 +28,7 @@ def test_songs_require_admin(client, monkeypatch):
     assert client.get("/api/admin/songs/1/zip").status_code == 403
     assert client.get("/api/admin/songs/1/file", params={"path": "a.bms"}).status_code == 403
     assert client.delete("/api/admin/songs/1").status_code == 403
+    assert client.get("/api/admin/songs/deleted").status_code == 403
 
 
 def test_search_and_files(client, monkeypatch):
@@ -79,7 +80,8 @@ def test_delete_song(client, monkeypatch):
         cur.execute("SELECT LENGTH(data) FROM chart_chunk ORDER BY id DESC LIMIT 1")
         chunk_size = cur.fetchone()[0]
 
-    assert client.delete("/api/admin/songs/1").json() == {"ok": True}
+    r = client.request("DELETE", "/api/admin/songs/1", json={"reason": "  저작권 요청  "})
+    assert r.json() == {"ok": True}
     assert client.delete("/api/admin/songs/1").status_code == 404
     assert client.get("/api/admin/songs/1").status_code == 404
     assert [s["song_id"] for s in manifest_songs()] == [2]
@@ -109,3 +111,31 @@ def test_delete_waits_for_import(client, monkeypatch):
         assert client.delete("/api/admin/songs/1").status_code == 409
     assert client.get("/api/admin/songs/1").status_code == 200
 
+
+
+def test_deleted_log_and_gap(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n"}))
+    upload(client, "b.zip", make_zip({"b.bms": b"#TITLE B\n"}))
+    assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "x" * 1001}).status_code == 400
+    assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "중복 곡"}).status_code == 200
+    assert client.delete("/api/admin/songs/1").status_code == 200  # 사유 없이도 지움
+
+    rows = client.get("/api/admin/songs/deleted").json()
+    assert [r["song_id"] for r in rows] == [2, 1]
+    assert rows[0]["folder"] == "b" and rows[0]["reason"] == "중복 곡" and rows[0]["charts"] == 1
+    assert rows[0]["deleted_by_name"] == "Admin" and rows[0]["deleted_at"] > 0
+    assert rows[1]["reason"] == ""
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"q": "중복"}).json()] == [2]
+    assert [r["song_id"] for r in client.get("/api/admin/songs/deleted", params={"before": 2}).json()] == [1]
+
+    # AUTO_INCREMENT가 되돌아가도(오래된 MySQL 재시작·복원) 지운 번호는 다시 쓰지 않습니다.
+    with db_module.connect() as con, con.cursor() as cur:
+        try:
+            cur.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'song'")
+        except Exception:
+            cur.execute("ALTER TABLE song AUTO_INCREMENT = 1")
+        con.commit()
+    again = upload(client, "c.zip", make_zip({"c.bms": b"#TITLE C\n"}))
+    assert again["songs"][0]["song_id"] == 3
+    assert client.get("/api/admin/songs/2").status_code == 404

@@ -12,6 +12,7 @@ import stat
 import struct
 import zipfile
 import threading
+import time
 import zlib
 from collections import defaultdict
 from collections.abc import Iterator
@@ -209,6 +210,21 @@ SCHEMA = [
 
             PRIMARY KEY (user_id, month),
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 지운 곡 기록. 지운 곡 번호는 결번으로 남고 다시 쓰지 않습니다.
+    """
+        CREATE TABLE IF NOT EXISTS deleted_song(
+            song_id INT UNSIGNED NOT NULL,
+            folder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            size BIGINT UNSIGNED NOT NULL,
+            sha256 CHAR(64) NOT NULL,
+            charts INT UNSIGNED NOT NULL,
+            reason TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            deleted_by CHAR(36),
+            deleted_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (song_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 클라이언트에 띄울 공지. starts_at·ends_at이 NULL이면 제한 없음입니다.
@@ -1185,8 +1201,9 @@ class Database:
             return None, 0
 
         cur.execute(
-            "INSERT INTO song (size, sha256, folder, files) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
             (
+                self._next_song_id(cur),
                 len(data),
                 hashlib.sha256(data).hexdigest(),
                 root.resolve().name,
@@ -1197,6 +1214,17 @@ class Database:
         self._insert_song_parts(cur, song_id, data)
         self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
         return song_id, len(data)
+
+    def _next_song_id(self, cur) -> int | None:
+        """새 곡 번호. 보통은 None(AUTO_INCREMENT)이고, 지운 곡 번호가 가장 크면 그 뒤 번호를 정해 결번을 다시 쓰지 않게 합니다
+        (AUTO_INCREMENT가 되돌아가는 경우: 오래된 MySQL 재시작, 백업 복원 등)."""
+        cur.execute("SELECT MAX(song_id) FROM deleted_song")
+        deleted = cur.fetchone()[0]
+        if deleted is None:
+            return None
+        cur.execute("SELECT MAX(id) FROM song")
+        current = cur.fetchone()[0]
+        return deleted + 1 if current is None or current < deleted else None
 
     def _insert_song_parts(self, cur, song_id: int, data: bytes) -> None:
         step = constant.BLOB_READ_SIZE
@@ -1396,8 +1424,11 @@ class Database:
             row = cur.fetchone()
             return row[0] if row else None
 
-    def delete_song(self, song_id: int, timeout: float | None = None) -> bool:
+    def delete_song(
+        self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
+    ) -> bool:
         """곡을 지우고 그 곡이 든 매니페스트·사전 청크를 다시 만듭니다. 없는 곡이면 False.
+        지운 곡은 deleted_song에 사유와 함께 남기고, 그 번호는 다시 쓰지 않습니다.
 
         차트 청크에서는 뺄 수 없으므로 차트 행은 song_id만 비워 남기고, 같은 차트를 다시 임포트하면 새 곡에 붙습니다.
         임포트 배치가 쓰기 잠금을 잡고 있으면 timeout(초)까지 기다리고, 넘으면 TimeoutError.
@@ -1407,9 +1438,19 @@ class Database:
         try:
             with connect() as con, con.cursor() as cur:
                 try:
-                    cur.execute("SELECT id FROM song WHERE id = %s FOR UPDATE", (song_id,))
-                    if cur.fetchone() is None:
+                    cur.execute("SELECT folder, size, sha256 FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    row = cur.fetchone()
+                    if row is None:
                         return False
+                    cur.execute("SELECT COUNT(*) FROM chart WHERE song_id = %s", (song_id,))
+                    charts = cur.fetchone()[0]
+                    cur.execute(
+                        """
+                        INSERT INTO deleted_song (song_id, folder, size, sha256, charts, reason, deleted_by, deleted_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (song_id, row[0], row[1], row[2], charts, reason, deleted_by, int(time.time())),
+                    )
                     cur.execute("UPDATE chart SET song_id = NULL WHERE song_id = %s", (song_id,))
                     cur.execute("DELETE FROM download_grant WHERE song_id = %s", (song_id,))
                     cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
