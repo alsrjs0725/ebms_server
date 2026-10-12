@@ -36,7 +36,6 @@ class Identity:
     id: int
     oauth: str
     oauth_user_id: str
-    name: str
     linked_at: int
 
 
@@ -51,10 +50,9 @@ class Session:
 
 @dataclass
 class Profile:
-    """OAuth가 알려준 사용자 정보. 이메일은 받지 않습니다(#102)."""
+    """OAuth가 알려준 계정 식별자. 이메일·계정 이름은 받지 않습니다(#102)."""
     oauth: str
     oauth_user_id: str
-    name: str
 
 
 def token_hash(token: str) -> str:
@@ -77,59 +75,73 @@ def get_user(user_id: str) -> User | None:
     return User(*row) if row else None
 
 
-def login(profile: Profile) -> User:
-    """OAuth 계정으로 로그인합니다. 처음 보는 OAuth 계정이면 새 user를 만듭니다.
+NICKNAME_MAX = 32
+
+
+def clean_nickname(text: str) -> str | None:
+    """앞뒤 공백을 지운 닉네임. 비었거나 너무 길거나 제어문자가 있으면 None."""
+    text = text.strip()
+    if not text or len(text) > NICKNAME_MAX or any(ord(c) < 0x20 or ord(c) == 0x7F for c in text):
+        return None
+    return text
+
+
+def login(profile: Profile) -> User | None:
+    """OAuth 계정으로 로그인합니다. 처음 보는 OAuth 계정이면 None(가입 필요, signup)입니다.
 
     다른 OAuth 계정을 기존 user에 자동으로 합치지 않습니다.
     """
-    for attempt in range(2):
-        try:
-            return _login(profile)
-        except pymysql.err.IntegrityError:
-            # 같은 OAuth 계정의 첫 로그인이 동시에 들어와 다른 쪽이 먼저 만든 경우. 다시 찾으면 있습니다.
-            if attempt:
-                raise
-    raise AssertionError("unreachable")
-
-
-def _login(profile: Profile) -> User:
     now = int(time.time())
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(
+            "SELECT user_id FROM user_identity WHERE oauth = %s AND oauth_user_id = %s",
+            (profile.oauth, profile.oauth_user_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        user_id = row[0]
+        cur.execute("UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id))
+        _promote_admin(cur, user_id)
+        con.commit()
+    return get_user(user_id)
+
+
+def signup(profile: Profile, nickname: str) -> User:
+    """사용자가 정한 닉네임으로 새 user를 만들고 OAuth 계정을 연결합니다.
+
+    같은 OAuth 계정의 가입이 동시에 들어와 다른 쪽이 먼저 만들었으면 그 user로 로그인합니다.
+    """
+    now = int(time.time())
+    user_id = str(uuid.uuid4())
     with db.connect() as con, con.cursor() as cur:
         try:
             cur.execute(
-                "SELECT user_id FROM user_identity WHERE oauth = %s AND oauth_user_id = %s",
-                (profile.oauth, profile.oauth_user_id),
+                "INSERT INTO user (id, display_name, created_at, last_login_at) VALUES (%s, %s, %s, %s)",
+                (user_id, nickname, now, now),
             )
-            row = cur.fetchone()
-            if row:
-                user_id = row[0]
-                cur.execute(
-                    "UPDATE user_identity SET name = %s WHERE oauth = %s AND oauth_user_id = %s",
-                    (profile.name, profile.oauth, profile.oauth_user_id),
-                )
-            else:
-                user_id = str(uuid.uuid4())
-                cur.execute(
-                    "INSERT INTO user (id, display_name, created_at) VALUES (%s, %s, %s)",
-                    (user_id, profile.name, now),
-                )
-                _insert_identity(cur, user_id, profile, now)
-            cur.execute("UPDATE user SET last_login_at = %s WHERE id = %s", (now, user_id))
+            _insert_identity(cur, user_id, profile, now)
             _promote_admin(cur, user_id)
             con.commit()
-        except Exception:
+        except pymysql.err.IntegrityError:
             con.rollback()
-            raise
+            user = login(profile)
+            if user is None:
+                raise
+            return user
     return get_user(user_id)
+
+
+def set_nickname(user_id: str, nickname: str) -> None:
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE user SET display_name = %s WHERE id = %s", (nickname, user_id))
+        con.commit()
 
 
 def _insert_identity(cur, user_id: str, profile: Profile, now: int) -> None:
     cur.execute(
-        """
-        INSERT INTO user_identity (user_id, oauth, oauth_user_id, name, linked_at)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (user_id, profile.oauth, profile.oauth_user_id, profile.name, now),
+        "INSERT INTO user_identity (user_id, oauth, oauth_user_id, linked_at) VALUES (%s, %s, %s, %s)",
+        (user_id, profile.oauth, profile.oauth_user_id, now),
     )
 
 
@@ -160,7 +172,7 @@ def list_identities(user_id: str) -> list[Identity]:
     with db.connect() as con, con.cursor() as cur:
         cur.execute(
             """
-            SELECT id, oauth, oauth_user_id, name, linked_at
+            SELECT id, oauth, oauth_user_id, linked_at
             FROM user_identity WHERE user_id = %s ORDER BY id
             """,
             (user_id,),

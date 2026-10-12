@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Annotated, Callable
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 STATE_COOKIE = "ebms_oauth"
+# 처음 보는 OAuth 계정으로 로그인한 뒤 닉네임을 정하기 전까지 그 계정을 기억하는 쿠키
+SIGNUP_COOKIE = "ebms_signup"
 _fallback_secret = secrets.token_bytes(32)
 
 
@@ -63,20 +65,13 @@ class OAuth:
         return f"{constant.PUBLIC_URL}/auth/{self.name}/callback"
 
 
+# 계정 식별자만 씁니다. 이메일·계정 이름·사진 등은 응답에 있어도 버립니다(#102).
 def _google_profile(data: dict) -> Profile:
-    return Profile(
-        oauth="google",
-        oauth_user_id=str(data["sub"]),
-        name=data.get("name") or "",
-    )
+    return Profile(oauth="google", oauth_user_id=str(data["sub"]))
 
 
 def _discord_profile(data: dict) -> Profile:
-    return Profile(
-        oauth="discord",
-        oauth_user_id=str(data["id"]),
-        name=data.get("global_name") or data.get("username") or "",
-    )
+    return Profile(oauth="discord", oauth_user_id=str(data["id"]))
 
 
 OAUTHS = {
@@ -88,7 +83,7 @@ OAUTHS = {
             authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
             token_url="https://oauth2.googleapis.com/token",
             userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
-            scope="openid profile",
+            scope="openid",
             pkce=True,
             parse_profile=_google_profile,
         ),
@@ -382,15 +377,90 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
         return RedirectResponse(pending.get("n") or "/account", status_code=303)
 
     user = accounts.login(profile)
+    next_url = pending.get("n") or "/account"
+    if user is None:
+        # 처음 보는 OAuth 계정. 닉네임을 정해야 계정을 만듭니다.
+        response = RedirectResponse("/signup", status_code=303)
+        response.set_cookie(
+            SIGNUP_COOKIE,
+            sign({
+                "p": profile.oauth,
+                "u": profile.oauth_user_id,
+                "n": next_url,
+                "exp": int(time.time()) + constant.SIGNUP_SECONDS,
+            }),
+            max_age=constant.SIGNUP_SECONDS, path="/signup",
+            httponly=True, samesite="lax", secure=_secure_cookie(),
+        )
+        return response
+    return _start_web_session(request, user, next_url, session)
+
+
+def _start_web_session(request: Request, user: User, next_url: str, session) -> Response:
+    """웹 세션을 만들어 next_url로 보냅니다. 닉네임이 없으면 먼저 닉네임을 정하게 합니다."""
     if user.status != "active":
         return _message(request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403)
     token = accounts.create_session(user.id, "web")
-    response = RedirectResponse(pending.get("n") or "/account", status_code=303)
+    if not user.display_name:
+        next_url = f"/account/nickname?{urllib.parse.urlencode({'next': next_url})}"
+    response = RedirectResponse(next_url, status_code=303)
     set_session_cookie(response, token)
     # 쿠키가 새 세션으로 바뀌므로 이전 웹 세션은 폐기합니다.
     if session is not None:
         accounts.revoke_session(session[0].id, session[1])
     return response
+
+
+_NICKNAME_ERROR = f"닉네임은 1~{accounts.NICKNAME_MAX}자로 정해 주세요."
+
+
+def _nickname_form(request: Request, action: str, next_url: str, value: str = "", error: str = "",
+                   status_code: int = 200, signup: bool = False) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/nickname.html",
+        context={
+            "action": action, "next": next_url, "value": value, "error": error,
+            "signup": signup, "max_length": accounts.NICKNAME_MAX,
+        },
+        status_code=status_code,
+    )
+
+
+def _pending_signup(request: Request) -> dict | None:
+    pending = unsign(request.cookies.get(SIGNUP_COOKIE))
+    if pending is None or pending.get("p") not in OAUTHS or not pending.get("u"):
+        return None
+    return pending
+
+
+@router.get("/signup", response_class=HTMLResponse)
+def signup_page(request: Request):
+    pending = _pending_signup(request)
+    if pending is None:
+        return RedirectResponse("/login", status_code=303)
+    return _nickname_form(request, "/signup", pending["n"], signup=True)
+
+
+@router.post("/signup")
+def signup(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+    nickname: Annotated[str, Form()] = "",
+):
+    pending = _pending_signup(request)
+    if pending is None:
+        return _message(request, "가입 실패", "가입 요청이 만료됐습니다. 다시 로그인해 주세요.", 400)
+    cleaned = accounts.clean_nickname(nickname)
+    if cleaned is None:
+        return _nickname_form(
+            request, "/signup", pending["n"], nickname, _NICKNAME_ERROR, 400, signup=True,
+        )
+    user = accounts.signup(Profile(pending["p"], pending["u"]), cleaned)
+    response = _start_web_session(request, user, safe_next(pending["n"]), session)
+    response.delete_cookie(SIGNUP_COOKIE, path="/signup")
+    return response
+
 
 
 @router.post("/auth/logout")
@@ -433,6 +503,33 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
             **_quota_json(user.id),
         },
     )
+
+
+@router.get("/account/nickname", response_class=HTMLResponse)
+def nickname_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+    next: str | None = None,
+):
+    if session is None:
+        return _login_redirect(request)
+    return _nickname_form(request, "/account/nickname", safe_next(next), session[0].display_name)
+
+
+@router.post("/account/nickname")
+def set_nickname(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(optional_session)],
+    nickname: Annotated[str, Form()] = "",
+    next: Annotated[str, Form()] = "/account",
+):
+    if session is None:
+        return _login_redirect(request)
+    cleaned = accounts.clean_nickname(nickname)
+    if cleaned is None:
+        return _nickname_form(request, "/account/nickname", safe_next(next), nickname, _NICKNAME_ERROR, 400)
+    accounts.set_nickname(session[0].id, cleaned)
+    return RedirectResponse(safe_next(next), status_code=303)
 
 
 @router.delete("/api/account/identities/{identity_id}", status_code=204)
@@ -559,7 +656,7 @@ def get_me(session: Annotated[tuple[User, int, str], Depends(api_session)]):
     return {
         **_user_json(user),
         "oauths": [
-            {"oauth": i.oauth, "name": i.name}
+            {"oauth": i.oauth}
             for i in accounts.list_identities(user.id)
         ],
         "session": {"kind": kind},

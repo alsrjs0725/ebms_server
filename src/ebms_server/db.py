@@ -122,7 +122,6 @@ SCHEMA = [
             user_id CHAR(36) NOT NULL,
             oauth VARCHAR(16) NOT NULL,
             oauth_user_id VARCHAR(255) NOT NULL,
-            name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             linked_at BIGINT UNSIGNED NOT NULL,
 
             PRIMARY KEY (id),
@@ -257,6 +256,7 @@ MISSING_COLUMNS = [
 DROPPED_COLUMNS = [
     ("user", "email"),
     ("user_identity", "email"),
+    ("user_identity", "name"),
     ("session", "device_name"),
     ("auth_code", "device_name"),
 ]
@@ -737,9 +737,15 @@ class Database:
                     """,
                     (table, column),
                 )
-                if cur.fetchone()[0]:
-                    cur.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-                    self.logger.info(f"generate_database: Dropped column {table}.{column}")
+                if cur.fetchone()[0] == 0:
+                    continue
+                if (table, column) == ("user_identity", "name"):
+                    # 예전에는 user.display_name도 OAuth 계정 이름으로 채웠습니다. 이 컬럼이 남아 있으면 아직
+                    # 정리하지 않은 DB이므로 표시 이름도 비우고, 다음 로그인 때 닉네임을 새로 정하게 합니다.
+                    cur.execute("UPDATE user SET display_name = ''")
+                    self.logger.info("generate_database: Cleared user.display_name taken from OAuth")
+                cur.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                self.logger.info(f"generate_database: Dropped column {table}.{column}")
             cur.execute(
                 """
                 SELECT IS_NULLABLE FROM information_schema.COLUMNS

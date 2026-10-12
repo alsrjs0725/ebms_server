@@ -60,7 +60,7 @@ def test_full_flow_and_bearer(client, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["id"] == user_id
-    assert body["oauths"] == [{"oauth": "google", "name": "Alice"}]
+    assert body["oauths"] == [{"oauth": "google"}]
     assert body["session"]["kind"] == "client"
     assert "email" not in body
     # 클라이언트 세션은 기기 목록에 종류로만 나오고, 보낸 기기 이름은 저장하지 않음

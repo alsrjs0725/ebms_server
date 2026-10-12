@@ -40,7 +40,7 @@
 
 <h2 class="h5">사용자</h2>
 <form class="d-flex gap-2 mb-3" method="get" action="/admin">
-    <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="이름, 계정 ID" aria-label="사용자 검색">
+    <input class="form-control" type="search" name="q" value="{{ q }}" placeholder="닉네임, 계정 ID" aria-label="사용자 검색">
     <button class="btn btn-outline-secondary" type="submit">검색</button>
 </form>
 {% if users | length >= limit %}<p class="text-muted small">최근 로그인 순으로 {{ limit }}명까지 보여줍니다.</p>{% endif %}

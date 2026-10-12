@@ -441,8 +441,8 @@ def test_admin_user_list_batches_queries(tmp_path, client, monkeypatch):
     from ebms_server.accounts import Profile
 
     add_songs(tmp_path, 1)
-    users = [accounts.login(Profile("google", f"g{i}", f"user{i}")) for i in range(12)]
-    accounts.link(users[0].id, Profile("discord", "d0", "user0"))
+    users = [accounts.signup(Profile("google", f"g{i}"), f"user{i}") for i in range(12)]
+    accounts.link(users[0].id, Profile("discord", "d0"))
     quota.charge_play(users[1].id, 1)
     quota.add_pre_usage(users[2].id, 1234)
     quota.set_overrides(users[3].id, {"max_tickets": 9})

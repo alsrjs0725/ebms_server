@@ -41,6 +41,7 @@ def client(monkeypatch):
 def oauth(client, monkeypatch, oauth, puid, *, name="tester", link=False, next=None, admin=False):
     """start → (가짜 oauth) → callback 을 거친 callback 응답을 반환합니다.
 
+    처음 보는 계정이면 name을 닉네임으로 가입까지 마치고 그 응답을 반환합니다.
     admin이면 로그인한 계정 ID를 EBMS_ADMIN_USER_IDS에 넣습니다(다음 요청부터 관리자).
     """
     params = {}
@@ -57,7 +58,7 @@ def oauth(client, monkeypatch, oauth, puid, *, name="tester", link=False, next=N
 
     def fake_fetch_profile(p, code, verifier):
         seen["verifier"] = verifier
-        return Profile(oauth, puid, name)
+        return Profile(oauth, puid)
 
     monkeypatch.setattr(auth, "fetch_profile", fake_fetch_profile)
     r = client.get(
@@ -69,6 +70,9 @@ def oauth(client, monkeypatch, oauth, puid, *, name="tester", link=False, next=N
         # PKCE: 쿠키에 둔 verifier가 보낸 challenge와 맞아야 함
         challenge = auth._b64(__import__("hashlib").sha256(seen["verifier"].encode()).digest())
         assert query["code_challenge"] == [challenge]
+    if r.status_code == 303 and r.headers["location"] == "/signup":
+        assert client.get("/signup").status_code == 200
+        r = client.post("/signup", data={"nickname": name}, follow_redirects=False)
     if admin:
         monkeypatch.setattr(constant, "ADMIN_USER_IDS", constant.ADMIN_USER_IDS | {me(client).id})
     return r
@@ -258,7 +262,55 @@ def test_no_email_or_device_name_stored(client, monkeypatch):
         assert cur.fetchall() == ()
     assert "Chrome" not in client.get("/account").text
     assert "email" not in client.get("/api/me").json()
-    assert {p.scope for p in auth.OAUTHS.values()} == {"openid profile", "identify"}
+    assert {p.scope for p in auth.OAUTHS.values()} == {"openid", "identify"}
+
+
+def test_signup_asks_nickname(client, monkeypatch):
+    """처음 로그인하면 OAuth 계정 이름 대신 직접 정한 닉네임으로 가입합니다(#102)."""
+    r = client.get("/auth/google/start", params={"next": "/admin"}, follow_redirects=False)
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["state"][0]
+    monkeypatch.setattr(auth, "fetch_profile", lambda p, code, verifier: Profile("google", "g1"))
+    r = client.get("/auth/google/callback", params={"code": "c", "state": state}, follow_redirects=False)
+    assert r.headers["location"] == "/signup"
+    assert constant.SESSION_COOKIE not in client.cookies
+    assert 'name="nickname"' in client.get("/signup").text
+
+    for bad in ("", "   ", "x" * 33, "a\x01b"):
+        assert client.post("/signup", data={"nickname": bad}, follow_redirects=False).status_code == 400
+    r = client.post("/signup", data={"nickname": "  닉네임  "}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/admin"
+    user = me(client)
+    assert user.display_name == "닉네임"
+    # 가입 쿠키는 한 번 쓰면 지움
+    assert client.get("/signup", follow_redirects=False).headers["location"] == "/login"
+    # 다시 로그인하면 바로 같은 계정
+    oauth(client, monkeypatch, "google", "g1", name="ignored")
+    assert me(client).id == user.id and me(client).display_name == "닉네임"
+
+
+def test_signup_without_cookie(client):
+    assert client.get("/signup", follow_redirects=False).headers["location"] == "/login"
+    assert client.post("/signup", data={"nickname": "a"}).status_code == 400
+
+
+def test_change_nickname(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1", name="Alice")
+    assert client.post("/account/nickname", data={"nickname": ""}).status_code == 400
+    r = client.post("/account/nickname", data={"nickname": "Bob", "next": "//evil.com"}, follow_redirects=False)
+    assert r.headers["location"] == "/account"
+    assert me(client).display_name == "Bob"
+    client.post("/auth/logout")
+    assert client.post("/account/nickname", data={"nickname": "x"}, follow_redirects=False).status_code == 303
+
+
+def test_missing_nickname_asked_after_login(client, monkeypatch):
+    oauth(client, monkeypatch, "google", "g1", name="Alice")
+    accounts.set_nickname(me(client).id, "")
+    client.post("/auth/logout")
+    r = oauth(client, monkeypatch, "google", "g1", next="/admin")
+    assert r.headers["location"] == "/account/nickname?next=%2Fadmin"
+    r = client.post("/account/nickname", data={"nickname": "New", "next": "/admin"}, follow_redirects=False)
+    assert r.headers["location"] == "/admin"
 
 
 def test_old_columns_dropped_on_start(client, monkeypatch):
@@ -266,6 +318,8 @@ def test_old_columns_dropped_on_start(client, monkeypatch):
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("ALTER TABLE user ADD COLUMN email VARCHAR(255)")
         cur.execute("ALTER TABLE user_identity ADD COLUMN email VARCHAR(255)")
+        cur.execute("ALTER TABLE user_identity ADD COLUMN name VARCHAR(255) NOT NULL DEFAULT ''")
+        cur.execute("INSERT INTO user (id, display_name, created_at) VALUES ('u1', 'OAuth Name', 0)")
         cur.execute("ALTER TABLE session ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
         cur.execute("ALTER TABLE auth_code ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
         con.commit()
@@ -275,9 +329,17 @@ def test_old_columns_dropped_on_start(client, monkeypatch):
             """
             SELECT COUNT(*) FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN ('email', 'device_name')
+               OR (TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_identity' AND COLUMN_NAME = 'name')
             """
         )
         assert cur.fetchone()[0] == 0
+        # OAuth에서 가져온 표시 이름도 비움(다음 로그인 때 닉네임을 정함)
+        cur.execute("SELECT display_name FROM user WHERE id = 'u1'")
+        assert cur.fetchone()[0] == ""
+    # 이미 정리한 DB에서 다시 시작하면 닉네임을 건드리지 않음
+    accounts.set_nickname("u1", "Nick")
+    Database().generate_database()
+    assert accounts.get_user("u1").display_name == "Nick"
 
 
 def test_banned_user_cannot_login(client, monkeypatch):

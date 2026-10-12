@@ -50,7 +50,7 @@ USER_COLUMNS = ("id", "display_name", "role", "status", "created_at", "last_logi
 
 
 def search_users(q: str = "") -> list[dict]:
-    """이름·계정 ID·연결된 OAuth 이름으로 찾습니다(대소문자 무시). 최근 로그인 순, 최대 SEARCH_LIMIT명."""
+    """닉네임·계정 ID로 찾습니다(대소문자 무시). 최근 로그인 순, 최대 SEARCH_LIMIT명."""
     columns = ", ".join(USER_COLUMNS)
     with db.connect() as con, con.cursor() as cur:
         if q.strip():
@@ -60,10 +60,9 @@ def search_users(q: str = "") -> list[dict]:
                 f"""
                 SELECT {columns} FROM user
                 WHERE id = %s OR LOWER(display_name) LIKE %s
-                   OR id IN (SELECT user_id FROM user_identity WHERE LOWER(name) LIKE %s)
                 ORDER BY last_login_at DESC, created_at DESC LIMIT {SEARCH_LIMIT}
                 """,
-                (q.strip(), like, like),
+                (q.strip(), like),
             )
         else:
             cur.execute(f"SELECT {columns} FROM user ORDER BY last_login_at DESC, created_at DESC LIMIT {SEARCH_LIMIT}")
