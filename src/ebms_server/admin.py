@@ -3,6 +3,7 @@
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
+- 서버 로그 조회: 수준·로거·검색어 필터
 """
 import logging
 import time
@@ -13,7 +14,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import auth, constant, db, importer, quota
+from . import auth, constant, db, importer, logs, quota
 from .accounts import User
 from .templating import templates
 
@@ -150,6 +151,22 @@ def import_page(
         request=request,
         name="pages/admin_import.html",
         context={"user": session[0], "formats": constant.BMS_FORMAT},
+    )
+
+
+@router.get("/admin/logs", response_class=HTMLResponse)
+def logs_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
+):
+    if session is None:
+        return auth._login_redirect(request)
+    if not session[0].is_admin:
+        return _forbidden(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/admin_logs.html",
+        context={"user": session[0], "levels": logs.LEVELS, "loggers": logs.loggers()},
     )
 
 
@@ -293,3 +310,19 @@ def get_job(job_id: str, admin: Annotated[User, Depends(web_admin)]):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job.json()
+
+
+@router.get("/api/admin/logs")
+def search_logs(
+    admin: Annotated[User, Depends(web_admin)],
+    level: str = "",
+    logger: str = "",
+    q: str = "",
+    cursor: str = "",
+    limit: int = 200,
+):
+    """서버 로그를 최신부터 거릅니다. level은 최소 수준, logger는 이름 또는 상위 이름."""
+    try:
+        return logs.search(level=level, logger=logger, q=q, cursor=cursor, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
