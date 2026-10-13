@@ -466,6 +466,10 @@ function songLine(song) {
         badge.className = "badge text-bg-danger";
         badge.textContent = "실패";
         li.append(badge, " " + song.error);
+    } else if (song.skipped === "unused") {
+        badge.className = "badge text-bg-warning";
+        badge.textContent = `사용 중지 곡 #${song.song_id}`;
+        li.append(badge, " 사용 중지한 곡이라 가져오지 않았습니다. 다시 쓰려면 사용 중지 목록에서 복원하세요.");
     } else {
         badge.className = song.new_song ? "badge text-bg-success" : "badge text-bg-secondary";
         badge.textContent = song.new_song ? `새 곡 #${song.song_id}` : `기존 곡 #${song.song_id}`;
@@ -481,9 +485,10 @@ function songLine(song) {
     return li;
 }
 
-// 곡 결과의 수준: failed, conflict, new, added, same
+// 곡 결과의 수준: failed, skipped, conflict, new, added, same
 function songLevel(song) {
     if (song.error) return "failed";
+    if (song.skipped) return "skipped";
     if (song.conflicts && song.conflicts.length) return "conflict";
     if (song.new_song) return "new";
     if (song.new_charts || (song.added_files && song.added_files.length)) return "added";
@@ -531,11 +536,12 @@ function jobCard(job) {
     body.append(title);
 
     const failed = job.songs.filter((s) => s.error);
-    const ok = job.songs.length - failed.length;
+    const skipped = job.songs.filter((s) => songLevel(s) === "skipped");
+    const ok = job.songs.length - failed.length - skipped.length;
     const conflicts = job.songs.filter((s) => songLevel(s) === "conflict").length;
     const line = document.createElement("div");
     line.className = "small";
-    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 충돌 ${conflicts} · 실패 ${failed.length}`;
+    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 충돌 ${conflicts} · 사용 중지로 건너뜀 ${skipped.length} · 실패 ${failed.length}`;
     body.append(line);
     if (job.status === "running" && job.total) {
         const p = document.createElement("div");
@@ -559,7 +565,8 @@ function jobCard(job) {
         else body.append(Object.assign(document.createElement("div"), { className: "small text-muted", textContent: "필터에 맞는 곡이 없습니다." }));
     } else {
         if (failed.length) body.append(songList(failed, `실패 ${failed.length}곡`, true));
-        if (ok) body.append(songList(job.songs.filter((s) => !s.error), `성공 ${ok}곡`, false));
+        if (skipped.length) body.append(songList(skipped, `사용 중지로 건너뜀 ${skipped.length}곡`, false));
+        if (ok) body.append(songList(job.songs.filter((s) => !s.error && !s.skipped), `성공 ${ok}곡`, false));
     }
     card.append(body);
     return card;
