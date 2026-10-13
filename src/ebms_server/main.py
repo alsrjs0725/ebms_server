@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, audit, auth, constant, downloads, importer, notices, policies, proxy, retention
+from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, proxy, retention
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -163,6 +163,7 @@ app.include_router(proxy.router)
 app.include_router(admin.router)
 app.include_router(notices.router)
 app.include_router(policies.router)
+app.include_router(home.router)
 app.middleware("http")(auth.refresh_session_cookie)
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -171,7 +172,7 @@ def read_root(request: Request, session: Annotated[tuple | None, Depends(auth.op
     return templates.TemplateResponse(
         request=request,
         name="pages/root.html",
-        context={"user": session[0] if session else None},
+        context={"user": session[0] if session else None, "home": home.content()},
     )
 
 @app.get("/api/version")

@@ -270,6 +270,17 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 관리자가 고치는 웹 페이지 글(name=home: 메인화면 소개 글). 행이 없으면 코드의 기본값을 씁니다.
+    """
+        CREATE TABLE IF NOT EXISTS site_text(
+            name VARCHAR(32) NOT NULL,
+            body MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            updated_at BIGINT UNSIGNED NOT NULL,
+            updated_by CHAR(36),
+
+            PRIMARY KEY (name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
 ]
 
 # 이전 버전에서 만든 테이블에 없는 컬럼
