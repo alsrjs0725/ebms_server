@@ -72,7 +72,7 @@ def oauth(client, monkeypatch, oauth, puid, *, name="tester", link=False, next=N
         assert query["code_challenge"] == [challenge]
     if r.status_code == 303 and r.headers["location"] == "/signup":
         assert client.get("/signup").status_code == 200
-        r = client.post("/signup", data={"nickname": name}, follow_redirects=False)
+        r = client.post("/signup", data={"nickname": name, "agree": "1"}, follow_redirects=False)
     if admin:
         monkeypatch.setattr(constant, "ADMIN_USER_IDS", constant.ADMIN_USER_IDS | {me(client).id})
     return r
@@ -287,8 +287,12 @@ def test_signup_asks_nickname(client, monkeypatch):
     assert 'name="nickname"' in client.get("/signup").text
 
     for bad in ("", "   ", "x" * 33, "a\x01b"):
-        assert client.post("/signup", data={"nickname": bad}, follow_redirects=False).status_code == 400
-    r = client.post("/signup", data={"nickname": "  닉네임  "}, follow_redirects=False)
+        assert client.post("/signup", data={"nickname": bad, "agree": "1"}, follow_redirects=False).status_code == 400
+    # 약관에 동의하지 않으면 가입하지 않음
+    page = client.post("/signup", data={"nickname": "닉네임"}, follow_redirects=False)
+    assert page.status_code == 400 and "동의해야 가입할 수 있습니다" in page.text
+    assert constant.SESSION_COOKIE not in client.cookies
+    r = client.post("/signup", data={"nickname": "  닉네임  ", "agree": "1"}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/admin"
     user = me(client)
     assert user.display_name == "닉네임"

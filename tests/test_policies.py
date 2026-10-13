@@ -60,3 +60,38 @@ def test_render_escapes_and_formats():
     assert "javascript:" not in out.split("<a ")[-1].split(">")[0] and 'href="javascript' not in out
     assert "<th>a</th>" in out and "<td>&lt;x&gt;</td>" in out
     assert "&lt;script&gt;" in out and "<script>" not in out
+
+
+def _start_signup(client, monkeypatch, puid):
+    import urllib.parse
+    from ebms_server import auth
+    from ebms_server.accounts import Profile
+    r = client.get("/auth/google/start", follow_redirects=False)
+    state = urllib.parse.parse_qs(urllib.parse.urlparse(r.headers["location"]).query)["state"][0]
+    monkeypatch.setattr(auth, "fetch_profile", lambda p, code, verifier: Profile("google", puid))
+    r = client.get("/auth/google/callback", params={"code": "c", "state": state}, follow_redirects=False)
+    assert r.headers["location"] == "/signup"
+
+
+def test_signup_requires_agreement(client, monkeypatch):
+    from ebms_server import db
+    admin_login(client, monkeypatch)
+    terms = client.post("/api/admin/policies/terms", json={"body": "약관 첫 판", "effective_on": "2020-01-01"}).json()
+    client.post("/auth/logout")
+
+    _start_signup(client, monkeypatch, "agree1")
+    page = client.get("/signup").text
+    assert "약관 첫 판" in page and "ebms_session" in page and 'name="agree"' in page
+    assert f'name="terms_version" value="{terms["id"]}"' in page and 'name="privacy_version" value=""' in page
+
+    form = {"nickname": "동의", "terms_version": str(terms["id"]), "privacy_version": ""}
+    assert client.post("/signup", data=form, follow_redirects=False).status_code == 400
+    # 화면을 연 뒤 약관이 바뀌면 다시 동의를 받음
+    assert client.post("/signup", data={**form, "agree": "1", "terms_version": ""}, follow_redirects=False).status_code == 409
+    r = client.post("/signup", data={**form, "agree": "1"}, follow_redirects=False)
+    assert r.status_code == 303
+    user_id = client.get("/api/me").json()["id"]
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT terms_version, privacy_version, agreed_at FROM user WHERE id = %s", (user_id,))
+        row = cur.fetchone()
+    assert row[0] == terms["id"] and row[1] is None and row[2] > 0

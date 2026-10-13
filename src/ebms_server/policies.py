@@ -76,6 +76,25 @@ def state(kind: str, now: float | None = None) -> dict:
     }
 
 
+def signup_versions(now: float | None = None) -> tuple[int | None, int | None]:
+    """가입 화면이 보여주는 (이용약관, 개인정보 처리방침) 판 id. 템플릿이면 None."""
+    return tuple((state(kind, now)["current"] or {}).get("id") for kind in ("terms", "privacy"))
+
+
+def signup_docs(now: float | None = None) -> list[dict]:
+    """가입 화면에 보여줄 이용약관·개인정보 처리방침(지금 판, 없으면 템플릿)."""
+    docs = []
+    for kind in ("terms", "privacy"):
+        current = state(kind, now)["current"]
+        docs.append({
+            "kind": kind,
+            "title": KINDS[kind],
+            "version": current["id"] if current else None,
+            "content": render(_strip_title(current["body"] if current else template(kind))),
+        })
+    return docs
+
+
 def current_body(kind: str, now: float | None = None) -> str:
     current = state(kind, now)["current"]
     return current["body"] if current else template(kind)

@@ -38,3 +38,9 @@
     font-size: 1rem;
     margin-top: 1.5rem;
 }
+
+/* 가입 화면의 약관 상자. 길면 상자 안에서 스크롤합니다. */
+.policy-box {
+    max-height: 16rem;
+    overflow-y: auto;
+}
