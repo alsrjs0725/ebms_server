@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | GET·PUT | `/api/admin/settings` | 전역 기본값. PUT은 보낸 항목만 바꾸고, 하나라도 틀리면 아무것도 바꾸지 않고 `400`. 항목: `max_tickets`, `refill_seconds`, `grant_seconds`, `pre_monthly_bytes`(바이트), `pre_throttled_kbps` |
 | GET | `/api/admin/users?q=` | 사용자 목록(최근 로그인 순 50명). 각 항목에 `overrides`, `tickets`, `pre` |
-| GET·PUT | `/api/admin/users/{id}` | 사용자 상세·수정. PUT 항목: `status`(`active`/`banned`), `max_tickets`, `refill_seconds`, `pre_monthly_bytes`, `pre_throttled_kbps`(null이면 전역 기본값). 자기 자신은 정지할 수 없음 |
+| GET·PUT | `/api/admin/users/{id}` | 사용자 상세·수정. PUT 항목: `status`(`active`/`banned`), `banned_until`(정지가 끝나는 unix 초, `status`와 함께. 없으면 무기한, 정지가 끝나면 자동 해제), `max_tickets`, `refill_seconds`, `pre_monthly_bytes`, `pre_throttled_kbps`(null이면 전역 기본값). 자기 자신은 정지할 수 없음 |
 | POST | `/api/admin/users/{id}/refill` | 티켓을 최대치로 채움 |
 | GET | `/api/admin/songs?q=&page=` | 곡 목록(번호 내림차순, 쪽마다 50곡, `page`는 1부터) → `{items, total, page, pages}`. 각 항목 `{id, folder, size, charts}` |
 | GET·DELETE | `/api/admin/songs/{id}` | 곡 상세 `{id, folder, size, sha256, charts, files}`(파일마다 `{path, size, comp_size, kind}`, 차트면 `chart`) · 사용 중지(본문 `{reason}`, 1000자까지, 생략 가능). 없으면 `404`, 임포트 중이라 잠금을 못 잡으면 `409` |

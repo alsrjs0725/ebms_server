@@ -111,6 +111,8 @@ SCHEMA = [
             refill_seconds INT UNSIGNED,
             pre_monthly_bytes BIGINT UNSIGNED,
             pre_throttled_kbps INT UNSIGNED,
+            -- 정지(status='banned')가 끝나는 시각. NULL이면 무기한입니다.
+            banned_until BIGINT UNSIGNED,
 
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -224,6 +226,16 @@ SCHEMA = [
             PRIMARY KEY (song_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 탈퇴한 OAuth 계정의 재가입 제한(accounts.delete_user). OAuth 계정 ID 원문 대신 HMAC(setting의 rejoin_salt)만 두고,
+    # until이 지나면 정리 작업(retention)이 지웁니다. until이 NULL이면 무기한 정지 중에 탈퇴한 경우입니다.
+    """
+        CREATE TABLE IF NOT EXISTS rejoin_block(
+            key_sha256 CHAR(64) NOT NULL,
+            until BIGINT UNSIGNED,
+
+            PRIMARY KEY (key_sha256)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 클라이언트에 띄울 공지. starts_at·ends_at이 NULL이면 제한 없음입니다.
     """
         CREATE TABLE IF NOT EXISTS notice(
@@ -265,6 +277,7 @@ MISSING_COLUMNS = [
     ("user", "refill_seconds", "INT UNSIGNED"),
     ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
     ("user", "pre_throttled_kbps", "INT UNSIGNED"),
+    ("user", "banned_until", "BIGINT UNSIGNED"),
 ]
 # 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
 DROPPED_COLUMNS = [

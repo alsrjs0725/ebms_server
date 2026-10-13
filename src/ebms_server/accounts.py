@@ -4,6 +4,7 @@
 세션과 권한은 모두 user.id에 붙습니다. 세션 토큰은 원문 대신 sha256만 저장합니다.
 """
 import hashlib
+import hmac
 import secrets
 import time
 import uuid
@@ -25,10 +26,17 @@ class User:
     display_name: str
     role: str
     status: str
+    # 정지가 끝나는 시각. None이면 무기한(정지가 아니면 의미 없음)
+    banned_until: int | None = None
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def is_banned(self) -> bool:
+        """지금 정지 중인지. 끝나는 시각이 지난 정지는 정지가 아닙니다(정리 작업이 status를 되돌림)."""
+        return self.status != "active" and (self.banned_until is None or self.banned_until > time.time())
 
 
 @dataclass
@@ -70,7 +78,7 @@ def _promote_admin(cur, user_id: str) -> None:
 
 def get_user(user_id: str) -> User | None:
     with db.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT id, display_name, role, status FROM user WHERE id = %s", (user_id,))
+        cur.execute("SELECT id, display_name, role, status, banned_until FROM user WHERE id = %s", (user_id,))
         row = cur.fetchone()
     return User(*row) if row else None
 
@@ -226,7 +234,7 @@ def authenticate(token: str, kind: str) -> tuple[User, int] | None:
     with db.connect() as con, con.cursor() as cur:
         cur.execute(
             """
-            SELECT s.id, s.last_used_at, u.id, u.display_name, u.role, u.status
+            SELECT s.id, s.last_used_at, u.id, u.display_name, u.role, u.status, u.banned_until
             FROM session s JOIN user u ON u.id = s.user_id
             WHERE s.token_sha256 = %s AND s.kind = %s AND s.revoked_at IS NULL AND s.expires_at > %s
             """,
@@ -237,7 +245,7 @@ def authenticate(token: str, kind: str) -> tuple[User, int] | None:
             return None
         session_id, last_used_at, *user_row = row
         user = User(*user_row)
-        if user.status != "active":
+        if user.is_banned:
             return None
         # env에 UUID를 넣고 재시작하면 다시 로그인하지 않아도 다음 요청부터 관리자가 됩니다.
         if user.id in constant.ADMIN_USER_IDS and user.role != "admin":
@@ -325,27 +333,74 @@ def consume_auth_code(code: str) -> tuple[str, str] | None:
 # user를 가리키는 테이블. FK ON DELETE CASCADE로도 지워지지만, 외래 키를 강제하지 않는 환경에서도
 # 남지 않도록 user보다 먼저 직접 지웁니다.
 USER_TABLES = ("user_identity", "session", "auth_code", "user_ticket", "download_grant", "pre_usage")
+REJOIN_SALT_SETTING = "rejoin_salt"
+
+
+def _rejoin_key(cur, oauth: str, oauth_user_id: str) -> str:
+    """재가입 제한에 쓰는 OAuth 계정의 키. 원래 ID를 남기지 않도록 DB에 둔 salt로 HMAC합니다."""
+    cur.execute("SELECT value FROM setting WHERE name = %s", (REJOIN_SALT_SETTING,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (REJOIN_SALT_SETTING, secrets.token_hex(32))
+        )
+        cur.execute("SELECT value FROM setting WHERE name = %s", (REJOIN_SALT_SETTING,))
+        row = cur.fetchone()
+    return hmac.new(row[0].encode(), f"{oauth}:{oauth_user_id}".encode(), hashlib.sha256).hexdigest()
+
+
+@dataclass
+class RejoinBlock:
+    # 재가입할 수 있게 되는 시각. None이면 무기한
+    until: int | None
+
+
+def rejoin_block(profile: Profile) -> RejoinBlock | None:
+    """이 OAuth 계정이 탈퇴 후 재가입 제한 중이면 RejoinBlock, 아니면 None."""
+    now = int(time.time())
+    with db.connect() as con, con.cursor() as cur:
+        key = _rejoin_key(cur, profile.oauth, profile.oauth_user_id)
+        cur.execute("SELECT until FROM rejoin_block WHERE key_sha256 = %s", (key,))
+        row = cur.fetchone()
+        con.commit()
+    if row is None or (row[0] is not None and row[0] <= now):
+        return None
+    return RejoinBlock(row[0])
 
 
 def delete_user(user_id: str) -> str:
     """계정과 계정에 딸린 데이터를 지웁니다. 반환값: "ok", "not_found", "last_admin"(마지막 관리자라 거부)
 
+    정지된 계정도 탈퇴할 수 있습니다. 연결된 OAuth 계정은 REJOIN_BLOCK_HOURS 동안, 정지 중이었으면
+    정지가 끝날 때까지(무기한 정지면 무기한) 다시 가입할 수 없도록 키(HMAC)만 rejoin_block에 남깁니다.
     지운 곡 기록(deleted_song.deleted_by)은 곡 복원에 필요하므로 남기고 누가 지웠는지만 비웁니다.
     """
+    now = int(time.time())
     with db.connect() as con, con.cursor() as cur:
         try:
-            cur.execute("SELECT role FROM user WHERE id = %s FOR UPDATE", (user_id,))
+            cur.execute(
+                "SELECT id, display_name, role, status, banned_until FROM user WHERE id = %s FOR UPDATE", (user_id,)
+            )
             row = cur.fetchone()
             if row is None:
                 result = "not_found"
             else:
-                if row[0] == "admin":
+                user = User(*row)
+                if user.is_admin:
                     # 두 관리자가 동시에 탈퇴해 관리자가 0명이 되지 않도록 관리자 행을 잠근 뒤 셉니다.
                     cur.execute("SELECT id FROM user WHERE role = 'admin' AND status = 'active' FOR UPDATE")
                     others = [r[0] for r in cur.fetchall() if r[0] != user_id]
                     if not others:
                         con.commit()
                         return "last_admin"
+                until = now + int(constant.REJOIN_BLOCK_HOURS * 3600)
+                if user.is_banned:
+                    until = None if user.banned_until is None else max(until, user.banned_until)
+                cur.execute("SELECT oauth, oauth_user_id FROM user_identity WHERE user_id = %s", (user_id,))
+                for oauth, oauth_user_id in cur.fetchall():
+                    key = _rejoin_key(cur, oauth, oauth_user_id)
+                    cur.execute("DELETE FROM rejoin_block WHERE key_sha256 = %s", (key,))
+                    cur.execute("INSERT INTO rejoin_block (key_sha256, until) VALUES (%s, %s)", (key, until))
                 cur.execute("UPDATE deleted_song SET deleted_by = NULL WHERE deleted_by = %s", (user_id,))
                 for table in USER_TABLES:
                     cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))

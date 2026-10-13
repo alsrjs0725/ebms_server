@@ -7,6 +7,7 @@ OAuth 진행 중에만 필요한 state·PKCE verifier는 DB 대신 서명된 단
 이후 `Authorization: Bearer <세션키>`로 API를 호출합니다.
 """
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -34,6 +35,8 @@ router = APIRouter()
 STATE_COOKIE = "ebms_oauth"
 # 처음 보는 OAuth 계정으로 로그인한 뒤 닉네임을 정하기 전까지 그 계정을 기억하는 쿠키
 SIGNUP_COOKIE = "ebms_signup"
+# 정지된 계정이 로그인했을 때 탈퇴 화면(/account/withdraw)에서 쓸 서명 쿠키. 정지 계정은 세션을 만들지 않습니다.
+WITHDRAW_COOKIE = "ebms_withdraw"
 _fallback_secret = secrets.token_bytes(32)
 
 
@@ -366,6 +369,9 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
         # 연결은 시작할 때와 같은 계정으로 로그인돼 있을 때만 허용합니다.
         if session is None or session[0].id != link_user_id:
             return _message(request, "연결 실패", "로그인 상태가 바뀌었습니다. 다시 로그인한 뒤 연결해 주세요.", 400)
+        if accounts.rejoin_block(profile):
+            return _message(request, "연결 실패", "최근 탈퇴한 계정의 로그인 수단은 재가입 제한이 끝난 뒤 연결할 수 있습니다.",
+                            403, back="/account")
         result = accounts.link(link_user_id, profile)
         if result == "taken":
             return _message(
@@ -379,6 +385,9 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
     user = accounts.login(profile)
     next_url = pending.get("n") or "/account"
     if user is None:
+        block = accounts.rejoin_block(profile)
+        if block:
+            return _rejoin_blocked(request, block)
         # 처음 보는 OAuth 계정. 닉네임을 정해야 계정을 만듭니다.
         response = RedirectResponse("/signup", status_code=303)
         response.set_cookie(
@@ -396,10 +405,43 @@ def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, sess
     return _start_web_session(request, user, next_url, session)
 
 
+def _format_time(ts: int) -> str:
+    return datetime.datetime.fromtimestamp(ts, quota.KST).strftime("%Y-%m-%d %H:%M")
+
+
+def _rejoin_blocked(request: Request, block: accounts.RejoinBlock) -> HTMLResponse:
+    if block.until is None:
+        when = "정지 중에 탈퇴한 계정이라 다시 가입할 수 없습니다."
+    else:
+        when = f"{_format_time(block.until)}(KST)부터 다시 가입할 수 있습니다."
+    return _message(request, "가입 제한", f"최근 탈퇴한 계정입니다. {when}", 403)
+
+
+def _ban_text(user: User) -> str:
+    if user.banned_until is None:
+        return "무기한 정지된 계정입니다."
+    return f"{_format_time(user.banned_until)}(KST)까지 정지된 계정입니다."
+
+
 def _start_web_session(request: Request, user: User, next_url: str, session) -> Response:
-    """웹 세션을 만들어 next_url로 보냅니다. 닉네임이 없으면 먼저 닉네임을 정하게 합니다."""
-    if user.status != "active":
-        return _message(request, "로그인 불가", "정지된 계정입니다. 관리자에게 문의해 주세요.", 403)
+    """웹 세션을 만들어 next_url로 보냅니다. 닉네임이 없으면 먼저 닉네임을 정하게 합니다.
+
+    정지된 계정은 세션 대신 탈퇴만 할 수 있는 서명 쿠키를 주고 안내 화면을 보여 줍니다.
+    """
+    if user.is_banned:
+        response = templates.TemplateResponse(
+            request=request,
+            name="pages/banned.html",
+            context={"ban_text": _ban_text(user)},
+            status_code=403,
+        )
+        response.set_cookie(
+            WITHDRAW_COOKIE,
+            sign({"t": "withdraw", "u": user.id, "exp": int(time.time()) + constant.SIGNUP_SECONDS}),
+            max_age=constant.SIGNUP_SECONDS, path="/account/withdraw",
+            httponly=True, samesite="lax", secure=_secure_cookie(),
+        )
+        return response
     token = accounts.create_session(user.id, "web")
     if not user.display_name:
         next_url = f"/account/nickname?{urllib.parse.urlencode({'next': next_url})}"
@@ -456,7 +498,11 @@ def signup(
         return _nickname_form(
             request, "/signup", pending["n"], nickname, _NICKNAME_ERROR, 400, signup=True,
         )
-    user = accounts.signup(Profile(pending["p"], pending["u"]), cleaned)
+    profile = Profile(pending["p"], pending["u"])
+    block = accounts.rejoin_block(profile)
+    if block:
+        return _rejoin_blocked(request, block)
+    user = accounts.signup(profile, cleaned)
     response = _start_web_session(request, user, safe_next(pending["n"]), session)
     response.delete_cookie(SIGNUP_COOKIE, path="/signup")
     return response
@@ -500,6 +546,7 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
             "linkable": [p for p in configured_oauths() if p.name not in linked],
             "sessions": accounts.list_sessions(user.id),
             "current_session_id": session_id,
+            "rejoin_hours": constant.REJOIN_BLOCK_HOURS,
             **_quota_json(user.id),
         },
     )
@@ -559,6 +606,41 @@ def delete_account(user: Annotated[User, Depends(web_user)]):
         raise HTTPException(status_code=409, detail="마지막 관리자는 탈퇴할 수 없습니다. 다른 관리자를 먼저 지정하세요.")
     response = Response(status_code=204)
     response.delete_cookie(constant.SESSION_COOKIE, path="/")
+    return response
+
+
+def _withdraw_user(request: Request) -> User | None:
+    """정지된 계정이 로그인할 때 받은 탈퇴용 쿠키의 user. 없거나 만료됐거나 정지가 풀렸으면 None."""
+    pending = unsign(request.cookies.get(WITHDRAW_COOKIE))
+    user = accounts.get_user(pending["u"]) if pending and pending.get("t") == "withdraw" else None
+    return user if user is not None and user.is_banned else None
+
+
+@router.get("/account/withdraw", response_class=HTMLResponse)
+def withdraw_page(request: Request):
+    user = _withdraw_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/withdraw.html",
+        context={"ban_text": _ban_text(user)},
+    )
+
+
+@router.post("/account/withdraw")
+def withdraw(request: Request, agree: Annotated[str, Form()] = ""):
+    """정지된 계정의 탈퇴. 확인란을 체크해야 합니다."""
+    user = _withdraw_user(request)
+    if user is None:
+        return _message(request, "탈퇴 실패", "요청이 만료됐습니다. 다시 로그인해 주세요.", 400)
+    if not agree:
+        return _message(request, "탈퇴 실패", "확인란을 체크해 주세요.", 400, back="/account/withdraw")
+    result = accounts.delete_user(user.id)
+    if result == "last_admin":
+        return _message(request, "탈퇴 실패", "마지막 관리자는 탈퇴할 수 없습니다.", 409)
+    response = _message(request, "탈퇴 완료", "계정과 연결된 데이터를 지웠습니다.", 200)
+    response.delete_cookie(WITHDRAW_COOKIE, path="/account/withdraw")
     return response
 
 
@@ -642,7 +724,7 @@ def client_token(body: ClientTokenRequest):
     ):
         raise HTTPException(status_code=400, detail="invalid code_verifier")
     user = accounts.get_user(user_id)
-    if user is None or user.status != "active":
+    if user is None or user.is_banned:
         raise HTTPException(status_code=403, detail="account suspended")
     token = accounts.create_session(user.id, "client")
     return {

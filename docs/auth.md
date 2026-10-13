@@ -44,9 +44,11 @@ OAuth 계정 ID(Google `sub`, Discord `id`)만 저장합니다. 이메일·계�
 | DELETE | `/api/account/identities/{id}` | 로그인 수단 연결 해제. 마지막 1개면 `409` |
 | DELETE | `/api/account/sessions/{id}` | 해당 기기 로그아웃. 없으면 `404` |
 | DELETE | `/api/account` | 회원 탈퇴. 계정과 로그인 수단·세션(클라이언트 포함)·티켓·다운로드 기록을 지우고 쿠키를 지움. 마지막 관리자면 `409` |
+| GET/POST | `/account/withdraw` | 정지된 계정의 탈퇴. 정지 계정이 로그인하면 세션 대신 이 화면용 서명 쿠키(30분)를 받음. 확인란(`agree`)을 체크해야 탈퇴 |
 
 - 처음 보는 OAuth 계정으로 로그인하면 닉네임을 정해 새 계정을 만듭니다. 다른 OAuth 계정을 자동으로 합치지 않으니, 다른 OAuth는 로그인한 상태에서 `/account`의 "연결"로 추가하세요.
 - 이미 다른 계정에 연결된 OAuth 계정은 연결할 수 없습니다(`409`).
+- 탈퇴한 로그인 수단은 `EBMS_REJOIN_BLOCK_HOURS`(기본 24시간) 동안 다시 가입하거나 다른 계정에 연결할 수 없습니다. 정지 중에 탈퇴하면 정지가 끝날 때까지(무기한 정지면 무기한)입니다. 판별에는 OAuth 계정 ID의 HMAC만 남깁니다(docs/privacy.md).
 - `/api/account`와 `/api/account/*`는 웹 세션(쿠키)으로만 쓸 수 있습니다. 세션이 없거나 만료되면 `401`, 클라이언트 세션키(Bearer)면 `403`입니다. 클라이언트는 자기 세션 로그아웃(`/api/auth/client/logout`)만 합니다.
 
 ## 클라이언트 로그인

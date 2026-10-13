@@ -74,6 +74,9 @@ CLIENT_SESSION_SECONDS = 90 * 24 * 3600
 # 클라이언트 로그인용 1회용 코드 유효기간
 AUTH_CODE_SECONDS = 60
 
+# 탈퇴한 OAuth 계정으로 다시 가입할 수 없는 시간. 정지 중에 탈퇴하면 정지가 끝날 때까지(더 길면 이 시간)입니다.
+REJOIN_BLOCK_HOURS = float(os.environ.get("EBMS_REJOIN_BLOCK_HOURS", "24"))
+
 # 개인정보 보유기간(docs/privacy.md). 지난 행은 정리 작업이 RETENTION_INTERVAL_HOURS마다 지웁니다.
 # 0이면 그 항목은 지우지 않습니다(RETENTION_GRANT_DAYS만 예외로 -1).
 # 만료·해지된 세션(기기 이름·사용 시각)을 남겨 두는 일수

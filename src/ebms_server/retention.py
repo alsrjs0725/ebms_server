@@ -91,6 +91,29 @@ def purge_inactive_users(cur, con, now: int, days: int) -> int:
     )
 
 
+def purge_rejoin_blocks(cur, con, now: int) -> int:
+    """재가입 제한 기간이 끝난 OAuth 계정 키를 지웁니다(무기한은 남김)."""
+    return _delete_rows(
+        cur, con,
+        "SELECT key_sha256 FROM rejoin_block WHERE until IS NOT NULL AND until <= %s",
+        (now,),
+        "DELETE FROM rejoin_block WHERE key_sha256 = %s AND until IS NOT NULL AND until <= %s",
+        (now,),
+    )
+
+
+def lift_expired_bans(cur, con, now: int) -> int:
+    """끝나는 시각이 지난 정지를 풉니다. 로그인·세션 확인은 이 작업 전에도 지난 정지를 정지로 보지 않습니다."""
+    cur.execute(
+        "UPDATE user SET status = 'active', banned_until = NULL "
+        "WHERE status = 'banned' AND banned_until IS NOT NULL AND banned_until <= %s",
+        (now,),
+    )
+    lifted = max(cur.rowcount, 0)
+    con.commit()
+    return lifted
+
+
 def purge(now: int | None = None) -> dict[str, int]:
     """보유기간이 지난 행을 지우고 항목별로 지운 행 수를 반환합니다. 기간이 0 이하인 항목은 건너뜁니다."""
     now = int(time.time()) if now is None else now
@@ -108,6 +131,13 @@ def purge(now: int | None = None) -> dict[str, int]:
                 continue
             try:
                 result[name] = job(cur, con, now, period)
+            except Exception:
+                con.rollback()
+                logger.exception(f"retention purge failed: {name}")
+        # 기간이 정해진 항목이라 설정과 상관없이 돕니다.
+        for name, job in (("rejoin_blocks", purge_rejoin_blocks), ("expired_bans", lift_expired_bans)):
+            try:
+                result[name] = job(cur, con, now)
             except Exception:
                 con.rollback()
                 logger.exception(f"retention purge failed: {name}")

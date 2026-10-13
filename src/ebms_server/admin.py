@@ -48,7 +48,7 @@ def _like(text: str) -> str:
     return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-USER_COLUMNS = ("id", "display_name", "role", "status", "created_at", "last_login_at", *quota.USER_LIMITS)
+USER_COLUMNS = ("id", "display_name", "role", "status", "banned_until", "created_at", "last_login_at", *quota.USER_LIMITS)
 
 
 def search_users(q: str = "") -> list[dict]:
@@ -98,7 +98,10 @@ def _with_usage(cur, users: list[dict]) -> list[dict]:
             "id": user["id"],
             "display_name": user["display_name"],
             "role": user["role"],
-            "status": user["status"],
+            # 끝나는 시각이 지난 정지는 정리 작업이 되돌리기 전이라도 정지가 아닌 것으로 보여 줍니다.
+            "status": "banned" if User(user["id"], user["display_name"], user["role"], user["status"],
+                                       user["banned_until"]).is_banned else "active",
+            "banned_until": user["banned_until"] if user["status"] == "banned" else None,
             "created_at": user["created_at"],
             "last_login_at": user["last_login_at"],
             "oauths": oauths[user["id"]],
@@ -306,6 +309,8 @@ def get_user(user_id: str, request: Request, admin: Annotated[User, Depends(web_
 class UserUpdate(BaseModel):
     role: str | None = None
     status: str | None = None
+    # status를 "banned"로 바꿀 때 정지가 끝나는 시각(unix 초). 없거나 null이면 무기한
+    banned_until: int | None = None
     max_tickets: int | None = None
     refill_seconds: int | None = None
     pre_monthly_bytes: int | None = None
@@ -319,6 +324,7 @@ def put_user(user_id: str, body: UserUpdate, request: Request, admin: Annotated[
     values = body.model_dump(exclude_unset=True)
     role = values.pop("role", None)
     status = values.pop("status", None)
+    banned_until = values.pop("banned_until", None)
     if "role" in body.model_fields_set:
         if role not in ROLES:
             raise HTTPException(status_code=400, detail=f"role must be one of {', '.join(ROLES)}")
@@ -329,6 +335,12 @@ def put_user(user_id: str, body: UserUpdate, request: Request, admin: Annotated[
             raise HTTPException(status_code=400, detail=f"status must be one of {', '.join(STATUSES)}")
         if status != "active" and user_id == admin.id:
             raise HTTPException(status_code=400, detail="cannot suspend yourself")
+        if status != "banned":
+            banned_until = None
+        elif banned_until is not None and banned_until <= time.time():
+            raise HTTPException(status_code=400, detail="banned_until must be in the future")
+    elif banned_until is not None:
+        raise HTTPException(status_code=400, detail="banned_until needs status")
     try:
         quota.set_overrides(user_id, values)
     except ValueError as e:
@@ -342,6 +354,8 @@ def put_user(user_id: str, body: UserUpdate, request: Request, admin: Annotated[
         if status is not None:
             updates.append("status = %s")
             params.append(status)
+            updates.append("banned_until = %s")
+            params.append(banned_until)
         params.append(user_id)
         with db.connect() as con, con.cursor() as cur:
             cur.execute(f"UPDATE user SET {', '.join(updates)} WHERE id = %s", tuple(params))
