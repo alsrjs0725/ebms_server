@@ -546,7 +546,6 @@ def account_page(request: Request, session: Annotated[tuple[User, int] | None, D
             "linkable": [p for p in configured_oauths() if p.name not in linked],
             "sessions": accounts.list_sessions(user.id),
             "current_session_id": session_id,
-            "rejoin_hours": constant.REJOIN_BLOCK_HOURS,
             **_quota_json(user.id),
         },
     )

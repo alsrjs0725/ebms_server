@@ -13,6 +13,12 @@ def count(table: str, column: str, value: str) -> int:
         return cur.fetchone()[0]
 
 
+def count_all(table: str) -> int:
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        return cur.fetchone()[0]
+
+
 def test_delete_account_removes_user_data(client, monkeypatch):
     key, user_id = client_login(client, monkeypatch)
     web_token = client.cookies.get(constant.SESSION_COOKIE)
@@ -51,20 +57,8 @@ def test_delete_account_removes_user_data(client, monkeypatch):
     assert client.get("/api/me", headers={"Authorization": f"Bearer {key}"}).status_code == 401
     assert client.get("/account", follow_redirects=False).status_code == 303
 
-    # 하루 동안은 같은 OAuth 계정으로 다시 가입할 수 없음
-    r = oauth(client, monkeypatch, "google", "g1")
-    assert r.status_code == 403
-    assert "다시 가입할 수 있습니다" in r.text
-    assert not client.cookies.get(constant.SESSION_COOKIE)
-    # 원래 ID 대신 키만 남음
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT key_sha256, until FROM rejoin_block")
-        rows = cur.fetchall()
-    assert len(rows) == 1 and "g1" not in rows[0][0]
-    assert now + 23 * 3600 < rows[0][1] <= int(time.time()) + 24 * 3600
-
-    # 기간이 지나면 정리 작업이 지우고 새 계정으로 가입됨
-    assert retention.purge(now=rows[0][1])["rejoin_blocks"] == 1
+    # 정지가 아닌 탈퇴는 아무것도 남기지 않고 바로 새 계정으로 가입됨
+    assert count_all("rejoin_block") == 0
     oauth(client, monkeypatch, "google", "g1")
     assert me(client).id != user_id
 
@@ -144,6 +138,12 @@ def test_banned_user_can_withdraw(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g2")
     assert oauth(client, monkeypatch, "discord", "d1", link=True).status_code == 403
 
+    # 정지가 끝나면 정리 작업이 키를 지우고 다시 가입 가능
+    assert retention.purge(now=until)["rejoin_blocks"] == 2
+    client.post("/auth/logout")
+    oauth(client, monkeypatch, "google", "g1")
+    assert me(client).id != user_id
+
     # 쿠키 없이 탈퇴 화면은 쓸 수 없음
     client.cookies.clear()
     assert client.get("/account/withdraw", follow_redirects=False).status_code == 303
@@ -173,11 +173,9 @@ def test_expired_ban(client, monkeypatch):
     assert me(client).id == user_id
     assert retention.purge(now=now)["expired_bans"] == 1
     assert accounts.get_user(user_id).status == "active"
-    # 정지가 끝난 뒤 탈퇴는 일반 탈퇴(하루 제한)
+    # 정지가 끝난 뒤 탈퇴는 일반 탈퇴(재가입 제한 없음)
     assert client.delete("/api/account").status_code == 204
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT until FROM rejoin_block")
-        assert cur.fetchone()[0] >= now + 24 * 3600
+    assert count_all("rejoin_block") == 0
 
 
 def test_admin_ban_with_end(client, monkeypatch):

@@ -371,11 +371,10 @@ def rejoin_block(profile: Profile) -> RejoinBlock | None:
 def delete_user(user_id: str) -> str:
     """계정과 계정에 딸린 데이터를 지웁니다. 반환값: "ok", "not_found", "last_admin"(마지막 관리자라 거부)
 
-    정지된 계정도 탈퇴할 수 있습니다. 연결된 OAuth 계정은 REJOIN_BLOCK_HOURS 동안, 정지 중이었으면
-    정지가 끝날 때까지(무기한 정지면 무기한) 다시 가입할 수 없도록 키(HMAC)만 rejoin_block에 남깁니다.
+    정지된 계정도 탈퇴할 수 있습니다. 정지 중에 탈퇴하면 연결된 OAuth 계정으로 정지가 끝날 때까지(무기한 정지면
+    무기한) 다시 가입할 수 없도록 키(HMAC)만 rejoin_block에 남깁니다. 정지가 아니면 아무것도 남기지 않습니다.
     지운 곡 기록(deleted_song.deleted_by)은 곡 복원에 필요하므로 남기고 누가 지웠는지만 비웁니다.
     """
-    now = int(time.time())
     with db.connect() as con, con.cursor() as cur:
         try:
             cur.execute(
@@ -393,14 +392,14 @@ def delete_user(user_id: str) -> str:
                     if not others:
                         con.commit()
                         return "last_admin"
-                until = now + int(constant.REJOIN_BLOCK_HOURS * 3600)
                 if user.is_banned:
-                    until = None if user.banned_until is None else max(until, user.banned_until)
-                cur.execute("SELECT oauth, oauth_user_id FROM user_identity WHERE user_id = %s", (user_id,))
-                for oauth, oauth_user_id in cur.fetchall():
-                    key = _rejoin_key(cur, oauth, oauth_user_id)
-                    cur.execute("DELETE FROM rejoin_block WHERE key_sha256 = %s", (key,))
-                    cur.execute("INSERT INTO rejoin_block (key_sha256, until) VALUES (%s, %s)", (key, until))
+                    cur.execute("SELECT oauth, oauth_user_id FROM user_identity WHERE user_id = %s", (user_id,))
+                    for oauth, oauth_user_id in cur.fetchall():
+                        key = _rejoin_key(cur, oauth, oauth_user_id)
+                        cur.execute("DELETE FROM rejoin_block WHERE key_sha256 = %s", (key,))
+                        cur.execute(
+                            "INSERT INTO rejoin_block (key_sha256, until) VALUES (%s, %s)", (key, user.banned_until)
+                        )
                 cur.execute("UPDATE deleted_song SET deleted_by = NULL WHERE deleted_by = %s", (user_id,))
                 for table in USER_TABLES:
                     cur.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
