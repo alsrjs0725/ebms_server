@@ -115,8 +115,10 @@ def login(profile: Profile) -> User | None:
     return get_user(user_id)
 
 
-def signup(profile: Profile, nickname: str) -> User:
+def signup(profile: Profile, nickname: str, agreed: tuple[int | None, int | None] = (None, None)) -> User:
     """사용자가 정한 닉네임으로 새 user를 만들고 OAuth 계정을 연결합니다.
+
+    agreed는 가입 화면에서 동의한 (이용약관, 개인정보 처리방침) 판 id입니다(템플릿이었으면 None).
 
     같은 OAuth 계정의 가입이 동시에 들어와 다른 쪽이 먼저 만들었으면 그 user로 로그인합니다.
     """
@@ -125,8 +127,11 @@ def signup(profile: Profile, nickname: str) -> User:
     with db.connect() as con, con.cursor() as cur:
         try:
             cur.execute(
-                "INSERT INTO user (id, display_name, created_at, last_login_at) VALUES (%s, %s, %s, %s)",
-                (user_id, nickname, now, now),
+                """
+                INSERT INTO user (id, display_name, created_at, last_login_at, terms_version, privacy_version, agreed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (user_id, nickname, now, now, agreed[0], agreed[1], now),
             )
             _insert_identity(cur, user_id, profile, now)
             _promote_admin(cur, user_id)

@@ -454,16 +454,21 @@ def _start_web_session(request: Request, user: User, next_url: str, session) -> 
 
 
 _NICKNAME_ERROR = f"닉네임은 1~{accounts.NICKNAME_MAX}자로 정해 주세요."
+_AGREE_ERROR = "이용약관과 개인정보 처리방침에 동의해야 가입할 수 있습니다."
 
 
 def _nickname_form(request: Request, action: str, next_url: str, value: str = "", error: str = "",
-                   status_code: int = 200, signup: bool = False) -> HTMLResponse:
+                   status_code: int = 200, signup: bool = False, agree_error: str = "") -> HTMLResponse:
+    # policies가 auth를 가져오므로 여기서 가져옵니다
+    from . import policies
+
     return templates.TemplateResponse(
         request=request,
         name="pages/nickname.html",
         context={
             "action": action, "next": next_url, "value": value, "error": error,
-            "signup": signup, "max_length": accounts.NICKNAME_MAX,
+            "signup": signup, "max_length": accounts.NICKNAME_MAX, "agree_error": agree_error,
+            "policies": policies.signup_docs() if signup else [],
         },
         status_code=status_code,
     )
@@ -489,20 +494,33 @@ def signup(
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(optional_session)],
     nickname: Annotated[str, Form()] = "",
+    agree: Annotated[bool, Form()] = False,
+    terms_version: Annotated[str, Form()] = "",
+    privacy_version: Annotated[str, Form()] = "",
 ):
+    from . import policies
+
     pending = _pending_signup(request)
     if pending is None:
         return _message(request, "가입 실패", "가입 요청이 만료됐습니다. 다시 로그인해 주세요.", 400)
     cleaned = accounts.clean_nickname(nickname)
-    if cleaned is None:
+    if cleaned is None or not agree:
         return _nickname_form(
-            request, "/signup", pending["n"], nickname, _NICKNAME_ERROR, 400, signup=True,
+            request, "/signup", pending["n"], nickname, "" if cleaned else _NICKNAME_ERROR, 400, signup=True,
+            agree_error="" if agree else _AGREE_ERROR,
+        )
+    # 화면을 연 뒤 판이 바뀌었으면 바뀐 내용을 다시 보여주고 동의를 받습니다
+    agreed = policies.signup_versions()
+    if (terms_version, privacy_version) != tuple("" if v is None else str(v) for v in agreed):
+        return _nickname_form(
+            request, "/signup", pending["n"], nickname, status_code=409, signup=True,
+            agree_error="약관이 바뀌었습니다. 바뀐 내용을 확인하고 다시 동의해 주세요.",
         )
     profile = Profile(pending["p"], pending["u"])
     block = accounts.rejoin_block(profile)
     if block:
         return _rejoin_blocked(request, block)
-    user = accounts.signup(profile, cleaned)
+    user = accounts.signup(profile, cleaned, agreed)
     response = _start_web_session(request, user, safe_next(pending["n"]), session)
     response.delete_cookie(SIGNUP_COOKIE, path="/signup")
     return response

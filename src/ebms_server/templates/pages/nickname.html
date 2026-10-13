@@ -5,11 +5,23 @@
 {% block content %}
 <h1 class="h3 mb-4">{{ "가입" if signup else "닉네임 설정" }}</h1>
 {% if signup %}<p>EBMS에서 쓸 닉네임을 정해 주세요. 로그인한 계정의 이름이나 이메일은 가져오지 않습니다.</p>{% endif %}
-<form method="post" action="{{ action }}" class="mw-login">
+<form method="post" action="{{ action }}" class="{{ '' if signup else 'mw-login' }}">
     <label class="form-label" for="nickname">닉네임</label>
-    <input class="form-control{% if error %} is-invalid{% endif %}" type="text" id="nickname" name="nickname" value="{{ value }}" maxlength="{{ max_length }}" required autofocus>
+    <input class="form-control mw-login{% if error %} is-invalid{% endif %}" type="text" id="nickname" name="nickname" value="{{ value }}" maxlength="{{ max_length }}" required autofocus>
     {% if error %}<div class="invalid-feedback">{{ error }}</div>{% endif %}
     <input type="hidden" name="next" value="{{ next }}">
+    {% if signup %}
+    {% for d in policies %}
+    <h2 class="h6 mt-4">{{ d.title }} <a class="small fw-normal" href="/{{ d.kind }}" target="_blank" rel="noopener">새 창에서 보기</a></h2>
+    <div class="policy policy-box border rounded p-3 small">{{ d.content }}</div>
+    <input type="hidden" name="{{ d.kind }}_version" value="{{ d.version if d.version is not none else '' }}">
+    {% endfor %}
+    <div class="form-check mt-3">
+        <input class="form-check-input{% if agree_error %} is-invalid{% endif %}" type="checkbox" id="agree" name="agree" value="1" required>
+        <label class="form-check-label" for="agree">이용약관과 개인정보 처리방침을 읽었으며 동의합니다.</label>
+        {% if agree_error %}<div class="invalid-feedback">{{ agree_error }}</div>{% endif %}
+    </div>
+    {% endif %}
     <button class="btn btn-primary mt-3" type="submit">{{ "가입" if signup else "저장" }}</button>
 </form>
 {% endblock %}

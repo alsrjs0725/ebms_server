@@ -37,7 +37,7 @@ OAuth 계정 ID(Google `sub`, Discord `id`)만 저장합니다. 이메일·계�
 | GET | `/login?next=<경로>` | 로그인 수단 선택. 로그인 후 `next`(같은 사이트 경로만, 기본 `/account`)로 이동 |
 | GET | `/auth/{oauth}/start` | OAuth 로그인 화면으로 이동. `?link=1`이면 로그인한 계정에 연결 |
 | GET | `/auth/{oauth}/callback` | OAuth가 돌아오는 주소. 계정을 찾으면 웹 세션 쿠키(`ebms_session`, 30일, 쓸 때마다 연장)를 발급, 처음 보는 계정이면 `/signup`으로 |
-| GET/POST | `/signup` | 처음 보는 OAuth 계정의 가입. 닉네임(1~32자)을 받아 계정을 만들고 로그인 |
+| GET/POST | `/signup` | 처음 보는 OAuth 계정의 가입. 지금 시행 중인 이용약관·개인정보 처리방침을 보여주고, 닉네임(1~32자)과 동의 체크(`agree`)를 받아 계정을 만들고 로그인. 동의하지 않으면 `400`, 화면을 연 뒤 판이 바뀌었으면 `409`로 다시 보여줌. 동의한 판(`user.terms_version`·`privacy_version`, 템플릿이면 NULL)과 시각(`agreed_at`)을 남김 |
 | GET/POST | `/account/nickname` | 닉네임 변경. 닉네임이 없는 계정은 로그인 직후 이 화면으로 |
 | POST | `/auth/logout` | 현재 웹 세션 종료 |
 | GET | `/account` | 설정(내 계정): 연결된 로그인 수단(연결·해제), 로그인된 기기(로그아웃), 계정 삭제 |

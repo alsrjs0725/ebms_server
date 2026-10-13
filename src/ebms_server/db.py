@@ -113,6 +113,10 @@ SCHEMA = [
             pre_throttled_kbps INT UNSIGNED,
             -- 정지(status='banned')가 끝나는 시각. NULL이면 무기한입니다.
             banned_until BIGINT UNSIGNED,
+            -- 가입할 때 동의한 이용약관·개인정보 처리방침의 판(policy.id, 템플릿이었으면 NULL)과 동의 시각
+            terms_version INT UNSIGNED,
+            privacy_version INT UNSIGNED,
+            agreed_at BIGINT UNSIGNED,
 
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -278,6 +282,9 @@ MISSING_COLUMNS = [
     ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
     ("user", "pre_throttled_kbps", "INT UNSIGNED"),
     ("user", "banned_until", "BIGINT UNSIGNED"),
+    ("user", "terms_version", "INT UNSIGNED"),
+    ("user", "privacy_version", "INT UNSIGNED"),
+    ("user", "agreed_at", "BIGINT UNSIGNED"),
 ]
 # 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
 DROPPED_COLUMNS = [
