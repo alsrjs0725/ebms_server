@@ -4,6 +4,9 @@
 
 {% block content %}
 <h1 class="h3 mb-3">EBMS</h1>
+{% if home %}
+<div class="mb-4 home-content">{{ home }}</div>
+{% endif %}
 {% if user %}
 <p><strong>{{ user.display_name }}</strong>님, 환영합니다.</p>
 <div class="list-group mw-menu">

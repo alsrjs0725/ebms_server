@@ -1,0 +1,40 @@
+{% extends "auth_base.html" %}
+
+{% block title %}메인화면 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">메인화면</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">메인화면 <a class="small" href="/">메인화면 보기</a></h1>
+<p class="text-muted small">
+    소개 글, 클라이언트 다운로드 링크, 문의 연락처 등을 적으면 저장하는 즉시 메인화면 위쪽에 보입니다. 비워서 저장하면 아무것도 보여주지 않습니다.
+    제목(<code>#</code>), 목록(<code>-</code>), 표(<code>|</code>), 굵게(<code>**</code>), 링크(<code>[글](주소)</code>, http(s)·mailto)를 쓸 수 있습니다.
+</p>
+{% if not saved %}
+<div class="alert alert-warning small">아직 저장하지 않아 기본 글을 보여주고 있습니다.</div>
+{% endif %}
+{% if placeholders %}
+<div class="alert alert-warning small">채우지 않은 칸(<code>[[...]]</code>)이 {{ placeholders }}개 있습니다.</div>
+{% endif %}
+<form class="card mb-3" id="home-form">
+    <div class="card-body">
+        <label class="form-label small" for="home-body">내용</label>
+        <textarea class="form-control font-monospace" id="home-body" name="body" rows="16">{{ body }}</textarea>
+        <div class="d-flex gap-2 mt-2">
+            <button class="btn btn-primary" type="submit">저장</button>
+            <button class="btn btn-outline-secondary" type="button" data-default>기본 글 불러오기</button>
+            {% if saved %}
+            <span class="text-muted small align-self-center">저장 <span data-time="{{ saved.updated_at }}"></span></span>
+            {% endif %}
+        </div>
+    </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_home.js') }}"></script>
+{% endblock %}
