@@ -1,0 +1,11 @@
+{% extends "auth_base.html" %}
+
+{% block title %}로그인 불가 - EBMS{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">로그인 불가</h1>
+<p>{{ ban_text }} 문의는 관리자에게 해 주세요.</p>
+<p class="text-muted">정지 중에도 탈퇴할 수 있습니다. 탈퇴하면 정지가 끝날 때까지 같은 로그인 수단으로 다시 가입할 수 없습니다.</p>
+<a class="btn btn-primary" href="/login">돌아가기</a>
+<a class="btn btn-outline-danger ms-2" href="/account/withdraw">탈퇴하기</a>
+{% endblock %}

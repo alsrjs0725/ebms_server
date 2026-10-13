@@ -53,7 +53,7 @@
             <div>
                 <strong>{{ u.display_name or "(이름 없음)" }}</strong>
                 {% if u.role == "admin" %}<span class="badge text-bg-dark">관리자</span>{% endif %}
-                {% if u.status != "active" %}<span class="badge text-bg-danger">정지</span>{% endif %}
+                {% if u.status != "active" %}<span class="badge text-bg-danger">정지{% if u.banned_until %} ~<span data-date="{{ u.banned_until }}"></span>{% else %} (무기한){% endif %}</span>{% endif %}
                 <br><small class="text-muted">{{ u.oauths | join(", ") }} · <code>{{ u.id }}</code></small>
             </div>
             {% if u.id != user.id %}
