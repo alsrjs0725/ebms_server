@@ -1198,6 +1198,7 @@ class Database:
         Returns:
             등록한 곡 정보 {"song_id", "new_song", "charts", "new_charts"}. 기존 곡에 파일을 더했으면 "added_files",
             내용이 달라 넣지 못한 파일이 있으면 "conflicts"(경로 목록)가 붙습니다. 등록하지 못하면 None.
+            사용 중지한 곡과 차트가 겹치면 넣지 않고 "skipped": "unused"와 그 곡 번호를 돌려줍니다.
             차트가 기존 곡 여러 개와 겹치면 AmbiguousSongError.
         """
         with self.batch() as batch:
@@ -1233,6 +1234,22 @@ class Database:
 
             bms_files.append((file_path, size, sha256))
         return bms_files, sorted(song_ids)
+
+    def _deleted_song_for_charts(self, bms_files: list, cur) -> int | None:
+        """폴더의 차트 중 사용 중지한 곡의 차트(song_id가 비어 남은 차트 행)가 있으면 그 곡 번호, 없으면 None.
+        사용 중지 기록(deleted_song)에 없는 차트는 보지 않습니다."""
+        for _, size, sha256 in bms_files:
+            cur.execute("SELECT 1 FROM chart WHERE id = %s AND size = %s AND song_id IS NULL", (sha256, size))
+            if cur.fetchone() is None:
+                continue
+            cur.execute(
+                "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s ORDER BY song_id DESC LIMIT 1",
+                (f'%"{sha256}"%',),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return row[0]
+        return None
 
     def _insert_new_song(self, root: pathlib.Path, cur) -> tuple[int | None, int]:
         """곡 zip을 넣고 (song_id, zip 크기)를 반환합니다. 패킷 한도를 넘으면 (None, 0)."""
@@ -1762,6 +1779,14 @@ class SongBatch:
         cur.execute("SAVEPOINT song")
         try:
             bms_files, existing = self.db._find_bms_files_and_existing_songs(root, cur)
+            deleted = self.db._deleted_song_for_charts(bms_files, cur)
+            if deleted is not None:
+                # 사용 중지한 곡은 다시 들이지 않습니다(되살리려면 복원). 원본은 처리한 것으로 보고 지웁니다.
+                cur.execute("RELEASE SAVEPOINT song")
+                self.logger.warning(f"insert_song: Skipped unused song[{deleted}][{root}]")
+                if remove:
+                    self._remove.append(root)
+                return {"song_id": deleted, "new_song": False, "skipped": "unused", "charts": len(bms_files), "new_charts": 0}
             if len(existing) > 1:
                 raise AmbiguousSongError(
                     f"차트가 기존 곡 여러 개({', '.join(map(str, existing))})와 겹쳐 어느 곡에 넣을지 정할 수 없어 "

@@ -10,7 +10,7 @@ from ebms_server import admin, constant, db as db_module
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_client_auth import client_login
-from test_import import import_dir, make_zip, upload  # noqa: F401
+from test_import import import_dir, make_zip, upload, wait  # noqa: F401
 from test_quota import admin_login
 
 
@@ -96,18 +96,17 @@ def test_delete_song(client, monkeypatch):
     with zipfile.ZipFile(io.BytesIO(client.get("/api/admin/songs/2/zip").content)) as zf:
         assert zf.namelist() == ["b.bms"]
 
-    # 같은 차트를 다시 넣으면 차트 청크는 그대로 두고 새 곡에 차트를 붙입니다.
+    # 같은 차트를 다시 넣으면 건너뛰고 차트 청크·차트 행도 그대로 둡니다.
     again = upload(client, "a2.zip", make_zip({"a.bms": chart}))
-    assert again["songs"][0]["new_song"] and again["songs"][0]["song_id"] == 3
+    assert again["songs"][0]["skipped"] == "unused" and again["songs"][0]["song_id"] == 1
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT song_id FROM chart WHERE size = %s", (len(chart),))
-        assert cur.fetchone()[0] == 3
+        assert cur.fetchone()[0] is None
         cur.execute("SELECT COUNT(*) FROM chart_chunk")
         assert cur.fetchone()[0] == chunks
         cur.execute("SELECT LENGTH(data) FROM chart_chunk ORDER BY id DESC LIMIT 1")
         assert cur.fetchone()[0] == chunk_size
-    songs = {s["song_id"]: s for s in manifest_songs()}
-    assert sorted(songs) == [2, 3] and len(songs[3]["charts"]) == 1
+    assert [s["song_id"] for s in manifest_songs()] == [2]
 
 
 def test_delete_waits_for_import(client, monkeypatch):
@@ -213,8 +212,43 @@ def test_restore_conflict(client, monkeypatch):
     admin_login(client, monkeypatch)
     upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n"}))
     client.delete("/api/admin/songs/1")
-    upload(client, "a2.zip", make_zip({"a.bms": b"#TITLE A\n"}))  # 같은 차트가 곡 2로
+    upload(client, "b.zip", make_zip({"b.bms": b"#TITLE B\n"}))
+    # 임포트로는 지운 곡의 차트가 다른 곡에 붙지 않으므로 DB를 직접 바꿉니다.
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE chart SET song_id = 2 WHERE id = %s", (hashlib.sha256(b"#TITLE A\n").hexdigest(),))
+        con.commit()
     r = client.post("/api/admin/songs/1/restore")
     assert r.status_code == 409 and "#2" in r.json()["detail"]
     assert (constant.UNUSED_DIR / "1" / "song.zip").exists()
     assert [r["song_id"] for r in client.get("/api/admin/songs/deleted").json()["items"]] == [1]
+
+
+def test_unused_song_not_reimported(client, monkeypatch):
+    """사용 중지한 곡과 차트가 겹치면 다시 임포트하지 않고 건너뜁니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "b.bme": b"#TITLE B\n"}))
+    assert client.request("DELETE", "/api/admin/songs/1", json={"reason": "저작권"}).status_code == 200
+
+    # 차트 하나만 겹쳐도, 새 파일이 있어도 건너뜁니다. 같은 zip의 다른 곡은 들어갑니다.
+    job = upload(client, "again.zip", make_zip({"x/b.bme": b"#TITLE B\n", "x/new.wav": b"w", "y/c.bms": b"#TITLE C\n"}))
+    assert job["songs"] == [
+        {"folder": "again/x", "song_id": 1, "new_song": False, "skipped": "unused", "charts": 1, "new_charts": 0},
+        {"folder": "again/y", "song_id": 2, "new_song": True, "charts": 1, "new_charts": 1},
+    ]
+    assert [s["song_id"] for s in manifest_songs()] == [2]
+    assert client.get("/api/admin/songs/1").status_code == 404
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT song_id FROM chart WHERE id = %s", (hashlib.sha256(b"#TITLE B\n").hexdigest(),))
+        assert cur.fetchone()[0] is None
+
+    # var/tmp의 원본은 처리한 것으로 보고 지웁니다.
+    song = constant.TMP_DIR / "group" / "a"
+    song.mkdir(parents=True)
+    (song / "a.bms").write_bytes(b"#TITLE A\n")
+    assert wait(client, client.post("/api/admin/import/tmp").json())["songs"][0]["skipped"] == "unused"
+    assert not song.exists()
+
+    # 복원한 뒤에는 기존 곡으로 합쳐집니다.
+    assert client.post("/api/admin/songs/1/restore").status_code == 200
+    job = upload(client, "again2.zip", make_zip({"b.bme": b"#TITLE B\n", "new.wav": b"w"}))
+    assert job["songs"][0]["song_id"] == 1 and job["songs"][0]["added_files"] == ["new.wav"]
