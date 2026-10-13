@@ -21,8 +21,8 @@ EBMS(이하 "서비스")는 로그인과 곡 다운로드에 필요한 최소한
 
 | 항목 | 내용 |
 | --- | --- |
-| 이전받는 자 | Oracle Corporation ([[연락처]]) |
-| 이전 국가 | [[국가]] |
+| 이전받는 자 | Oracle Corporation (개인정보 문의: [문의 양식](https://www.oracle.com/legal/data-privacy-inquiry-form/), Global Data Protection Officer, 233 South Wacker Drive, 45th Floor, Chicago, IL 60606, USA) |
+| 이전 국가 | 미국 |
 | 이전 시기와 방법 | 서비스 이용 시 네트워크로 수시 전송 |
 | 이전 항목 | 접속 IP, 접속 시각, 요청 경로, User-Agent |
 | 목적과 보유기간 | 다운로드 중계와 접속 기록 보관, 최대 6주 |
