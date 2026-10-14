@@ -44,6 +44,12 @@ class SQLiteCursor:
             sql = sql.replace("id INTEGER NOT NULL", "id INTEGER PRIMARY KEY")
             sql = re.sub(r"PRIMARY KEY\s*\(\s*id\s*\)", "", sql, flags=re.IGNORECASE)
 
+        # 테이블 정의 안의 인덱스는 SQLite가 받지 않으므로 뺍니다(테스트에서는 인덱스가 없어도 됩니다).
+        sql = re.sub(r"^\s*INDEX \w+ \([^)]*\),?\s*$", "", sql, flags=re.IGNORECASE | re.MULTILINE)
+        if "information_schema.STATISTICS" in sql:
+            self._cur.execute("SELECT 1")
+            return
+
         sql = re.sub(r"FOR UPDATE", "", sql, flags=re.IGNORECASE)
         if "START TRANSACTION" in sql or "BEGIN" in sql:
             return

@@ -32,6 +32,11 @@ SONGS_PER_MANIFEST_CHUNK = 1000
 # 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_PRE_CHUNK
 SONGS_PER_PRE_CHUNK = 32
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
+# 난이도표(tables.py)를 읽을 때 주소 하나의 응답 시간·크기 한도
+TABLE_FETCH_TIMEOUT = 30
+TABLE_MAX_BYTES = 32 * 1024 * 1024
+# 등록한 난이도표를 모두 다시 읽는 주기(시간). 0이면 자동으로 다시 읽지 않습니다(관리자 페이지에서 직접).
+TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
 API_VERSION = 3
 # 다운로드 본문(BLOB 조각) 읽기에 쓰는 스레드 수 한도. API·로그인이 쓰는 기본 스레드 한도(40)와 따로 셉니다.

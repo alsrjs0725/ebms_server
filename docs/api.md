@@ -17,6 +17,7 @@ API 버전 3에서 사전 청크(`/api/pre/assethash`, `/api/pre/asset/{chunk_id
 | GET | `/api/pre/chart/{chunk_id}` | 차트 청크 zip 다운로드 |
 | GET | `/api/pre/assethash` | 사전 청크별 SHA-256 목록 |
 | GET | `/api/pre/asset/{chunk_id}` | 사전 청크 zip 다운로드 |
+| GET | `/api/pre/tables` | 난이도표 목록과 사전 청크별 난이도표 태그 |
 | GET | `/api/pre/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |
 | GET | `/api/pre/manifest/{chunk_id}` | 곡 매니페스트 (JSON) |
 | GET | `/api/pre/song/{song_id}/file?path=` | 곡의 사전 파일 하나 |
@@ -88,6 +89,23 @@ zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`
 - 오류: `404` `File not found`, `422` `chunk_id`가 정수가 아님
 
 이전 버전에서 등록한 곡의 사전 청크는 서버를 시작한 뒤 뒤에서 만듭니다. 아직 없는 곡은 `/api/pre/song/{song_id}/file`로 받으면 됩니다.
+
+## `GET /api/pre/tables`
+
+관리자가 등록한 난이도표와, 사전 청크마다 붙은 난이도표 태그입니다. 사전 청크에 그 난이도표의 곡(차트의 md5나 sha256이 표에 실린 곡)이 하나라도 있으면 그 표의 id가 태그로 붙습니다. 클라이언트는 사용자가 고른 표의 태그가 붙은 청크만 받으면 됩니다. 태그는 요청할 때 계산하므로 곡이 추가되거나 표가 바뀌면 다음 요청부터 반영됩니다. 차트 청크·매니페스트는 표와 상관없이 모두 받습니다.
+
+```json
+{
+  "tables": [
+    {"id": 1, "name": "発狂BMS難易度表", "symbol": "★", "url": "https://...", "charts": 3000, "matched_charts": 1200, "songs": 1100, "fetched_at": 1791315327}
+  ],
+  "chunks": {"0": [1, 2], "5": [1]}
+}
+```
+
+- `charts`: 표에 실린 차트 수, `matched_charts`: 그중 서버에 있는 차트 수, `songs`: 그 차트가 든 곡 수, `fetched_at`: 표를 마지막으로 읽은 시각(unix 초)
+- `chunks`: 사전 청크 번호 → 태그(표 id 목록). 난이도표의 곡이 없는 청크는 빠집니다.
+- 이 경로가 없는 이전 서버(`404`)라면 클라이언트는 전곡을 받습니다. 사용량에는 세지 않습니다.
 
 ## `GET /api/pre/manifest/hash`
 

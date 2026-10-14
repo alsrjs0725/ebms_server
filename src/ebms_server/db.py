@@ -270,6 +270,37 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 난이도표(tables.py). url은 관리자가 등록한 주소(HTML 또는 헤더 JSON), header_url은 실제로 읽은 헤더 JSON 주소입니다.
+    # 마지막으로 읽은 결과(fetched_at, charts)와 실패했으면 그 오류(error)를 둡니다.
+    """
+        CREATE TABLE IF NOT EXISTS difficulty_table(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            url VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            symbol VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            header_url VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+            charts INT UNSIGNED NOT NULL DEFAULT 0,
+            fetched_at BIGINT UNSIGNED,
+            error TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            created_at BIGINT UNSIGNED NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 난이도표에 실린 차트. 표가 md5나 sha256 중 하나만 줄 수 있어 없는 쪽은 ''입니다. chart.md5·chart.id와 맞춰 곡을 찾습니다.
+    """
+        CREATE TABLE IF NOT EXISTS difficulty_table_chart(
+            table_id INT UNSIGNED NOT NULL,
+            md5 CHAR(32) NOT NULL DEFAULT '',
+            sha256 CHAR(64) NOT NULL DEFAULT '',
+            level VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+
+            PRIMARY KEY (table_id, md5, sha256),
+            INDEX difficulty_table_chart_md5 (md5),
+            INDEX difficulty_table_chart_sha256 (sha256),
+            FOREIGN KEY (table_id) REFERENCES difficulty_table(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 관리자가 고치는 웹 페이지 글(name=home: 메인화면 소개 글). 행이 없으면 코드의 기본값을 씁니다.
     """
         CREATE TABLE IF NOT EXISTS site_text(
@@ -288,6 +319,8 @@ MISSING_COLUMNS = [
     ("song", "folder", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
     ("song", "files", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("chart", "filename", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
+    # 난이도표는 차트를 md5로 가리킵니다. 이전 버전에서 넣은 차트는 backfill_chart_md5가 채웁니다.
+    ("chart", "md5", "CHAR(32)"),
     ("user", "max_tickets", "INT UNSIGNED"),
     ("user", "refill_seconds", "INT UNSIGNED"),
     ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
@@ -296,6 +329,10 @@ MISSING_COLUMNS = [
     ("user", "terms_version", "INT UNSIGNED"),
     ("user", "privacy_version", "INT UNSIGNED"),
     ("user", "agreed_at", "BIGINT UNSIGNED"),
+]
+# 이전 버전에서 만든 테이블에 없는 인덱스 (테이블, 인덱스 이름, 컬럼)
+MISSING_INDEXES = [
+    ("chart", "chart_md5", "md5"),
 ]
 # 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
 DROPPED_COLUMNS = [
@@ -774,6 +811,17 @@ class Database:
                 if cur.fetchone()[0] == 0:
                     cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     self.logger.info(f"generate_database: Added column {table}.{column}")
+            for table, name, column in MISSING_INDEXES:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s
+                    """,
+                    (table, name),
+                )
+                if cur.fetchone()[0] == 0:
+                    cur.execute(f"ALTER TABLE {table} ADD INDEX {name} ({column})")
+                    self.logger.info(f"generate_database: Added index {table}.{name}")
             for table, column in DROPPED_COLUMNS:
                 cur.execute(
                     """
@@ -997,6 +1045,58 @@ class Database:
         if missing:
             self.logger.info(f"backfill_pre_chunks: Built {len(missing)} pre chunks.")
         return len(missing)
+
+    def backfill_chart_md5(self) -> int:
+        """md5가 없는 차트(이전 버전에서 넣은 차트)의 md5를 차트 청크에서 채웁니다. 채운 차트 수를 반환합니다.
+        청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 남은 차트부터 이어서 채웁니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM chart WHERE md5 IS NULL")
+            missing = {row[0] for row in cur.fetchall()}
+            if not missing:
+                return 0
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id")
+            chunk_ids = [row[0] for row in cur.fetchall()]
+        self.logger.info(f"backfill_chart_md5: Filling md5 of {len(missing)} charts.")
+        filled = 0
+        broken = False
+        for chunk_no in chunk_ids:
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
+                row = cur.fetchone()
+            if row is None:
+                continue
+            found = []
+            try:
+                with zipfile.ZipFile(io.BytesIO(row[0])) as zf:
+                    for info in zf.infolist():
+                        sha256 = info.filename.rsplit(".", 1)[0]
+                        if sha256 in missing:
+                            found.append((hashlib.md5(zf.read(info)).hexdigest(), sha256))
+            except (zipfile.BadZipFile, zlib.error):
+                self.logger.exception(f"backfill_chart_md5: Skipped broken chart chunk {chunk_no}")
+                broken = True
+                continue
+            if not found:
+                continue
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    for md5, sha256 in found:
+                        cur.execute("UPDATE chart SET md5 = %s WHERE id = %s AND md5 IS NULL", (md5, sha256))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            missing.difference_update(sha256 for _, sha256 in found)
+            filled += len(found)
+        self.logger.info(f"backfill_chart_md5: Filled md5 of {filled} charts.")
+        if missing and not broken:
+            # 어느 청크에도 없는 차트는 ''로 두어 시작할 때마다 청크를 다시 읽지 않게 합니다(난이도표 md5와 맞지 않음).
+            self.logger.warning(f"backfill_chart_md5: {len(missing)} charts are not in any chart chunk.")
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                for sha256 in missing:
+                    cur.execute("UPDATE chart SET md5 = '' WHERE id = %s AND md5 IS NULL", (sha256,))
+                con.commit()
+        return filled
 
     def get_song_data(self, song_id: int) -> bytes | None:
         """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
@@ -1389,12 +1489,13 @@ class Database:
         reattached = 0
         for (chart_file_path, size, sha256) in bms_files:
             filename = chart_file_path.relative_to(root).as_posix()
+            content = chart_file_path.read_bytes()
             cur.execute(
-                "INSERT IGNORE INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
-                (str(sha256), song_id, size, filename),
+                "INSERT IGNORE INTO chart (id, song_id, size, filename, md5) VALUES (%s, %s, %s, %s, %s)",
+                (str(sha256), song_id, size, filename, hashlib.md5(content).hexdigest()),
             )
             if cur.rowcount == 1:
-                new_charts.append((chart_arcname(sha256, chart_file_path), chart_file_path.read_bytes()))
+                new_charts.append((chart_arcname(sha256, chart_file_path), content))
             elif song_id is not None:
                 # 지운 곡의 차트는 차트 청크에 그대로 있으므로 청크에 다시 넣지 않고 곡만 붙입니다.
                 cur.execute(
@@ -1671,10 +1772,10 @@ class Database:
                         cur.execute(
                             "UPDATE chart SET song_id = %s WHERE id = %s AND size = %s", (song_id, chart_id, chart_size)
                         )
-                    for chart_id, chart_size, filename, _, _ in readd:
+                    for chart_id, chart_size, filename, _, content in readd:
                         cur.execute(
-                            "INSERT INTO chart (id, song_id, size, filename) VALUES (%s, %s, %s, %s)",
-                            (chart_id, song_id, chart_size, filename),
+                            "INSERT INTO chart (id, song_id, size, filename, md5) VALUES (%s, %s, %s, %s, %s)",
+                            (chart_id, song_id, chart_size, filename, hashlib.md5(content).hexdigest()),
                         )
                     if readd:
                         self._append_charts_to_chunk(cur, [(arcname, content) for *_, arcname, content in readd])

@@ -68,6 +68,8 @@ services:
       EBMS_RETENTION_PRE_USAGE_MONTHS: ${EBMS_RETENTION_PRE_USAGE_MONTHS:-12}
       EBMS_RETENTION_INACTIVE_USER_DAYS: ${EBMS_RETENTION_INACTIVE_USER_DAYS:-0}
       EBMS_RETENTION_INTERVAL_HOURS: ${EBMS_RETENTION_INTERVAL_HOURS:-24}
+      # 등록한 난이도표를 다시 읽는 주기(시간). 0이면 관리자 페이지에서 직접(docs/admin.md)
+      EBMS_TABLE_REFRESH_HOURS: ${EBMS_TABLE_REFRESH_HOURS:-24}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로

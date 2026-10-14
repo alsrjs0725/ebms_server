@@ -1,0 +1,65 @@
+{% extends "auth_base.html" %}
+
+{% block title %}난이도표 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">난이도표</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">난이도표</h1>
+<p class="text-muted small">
+    난이도표 주소(HTML 또는 헤더 JSON)를 등록하면 beatoraja와 같은 방식으로 읽어 차트 목록을 저장합니다.
+    사전 청크마다 그 청크에 곡이 있는 난이도표 태그가 붙고, 클라이언트는 고른 난이도표의 청크만 받을 수 있습니다.
+    곡은 차트의 md5·sha256으로 맞춥니다.
+    {% if refresh_hours > 0 %}등록한 표는 {{ refresh_hours | round(1) }}시간마다 다시 읽습니다.{% else %}자동으로 다시 읽지 않습니다.{% endif %}
+</p>
+
+<form id="create" class="card mb-5">
+    <div class="card-body">
+        <label class="form-label small" for="new-url">주소</label>
+        <div class="input-group">
+            <input class="form-control" type="url" id="new-url" name="url" maxlength="1024" placeholder="https://example.com/table.html" required>
+            <button class="btn btn-primary" type="submit">등록</button>
+        </div>
+    </div>
+</form>
+
+<h2 class="h5">등록한 난이도표</h2>
+{% if tables %}
+<div class="table-responsive">
+<table class="table table-sm align-middle">
+    <thead>
+        <tr><th>표</th><th>주소</th><th class="text-end">차트</th><th class="text-end">서버에 있는 차트</th><th class="text-end">곡</th><th>마지막으로 읽음</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for t in tables %}
+        <tr data-id="{{ t.id }}">
+            <td><span class="badge text-bg-secondary">{{ t.symbol }}</span> {{ t.name }}</td>
+            <td class="small text-break"><a href="{{ t.url }}" rel="noopener noreferrer" target="_blank">{{ t.url }}</a></td>
+            <td class="text-end">{{ t.charts }}</td>
+            <td class="text-end">{{ t.matched_charts }}</td>
+            <td class="text-end">{{ t.songs }}</td>
+            <td class="small">
+                {% if t.fetched_at %}<span data-time="{{ t.fetched_at }}"></span>{% endif %}
+                {% if t.error %}<div class="text-danger text-break">실패: {{ t.error }}</div>{% endif %}
+            </td>
+            <td class="text-nowrap">
+                <button class="btn btn-sm btn-outline-primary" type="button" data-refresh>다시 읽기</button>
+                <button class="btn btn-sm btn-outline-danger" type="button" data-delete>삭제</button>
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+</div>
+{% else %}
+<p class="text-muted">등록한 난이도표가 없습니다.</p>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_tables.js') }}"></script>
+{% endblock %}
