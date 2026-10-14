@@ -30,9 +30,9 @@
 
 ```json
 {
-  "tickets": {"available": 3, "max": 5, "refill_seconds": 60, "next_refill_at": 1791315327},
+  "tickets": {"available": 3, "max": 5, "refill_seconds": 60, "next_refill_at": 1791315327, "next_refill_in": 42},
   "pre": {"month": "2026-10", "used_bytes": 123456, "limit_bytes": 10737418240, "throttled_kbps": 500, "throttled": false}
 }
 ```
 
-`next_refill_at`은 다음 티켓 1개가 차는 시각(unix 초)이고, 가득 차 있으면 `null`입니다.
+`next_refill_at`은 다음 티켓 1개가 차는 시각(unix 초), `next_refill_in`은 그때까지 남은 초이고, 가득 차 있으면 둘 다 `null`입니다. 클라이언트 시계는 서버와 어긋날 수 있으므로 남은 시간은 `next_refill_in`으로 계산하세요.
