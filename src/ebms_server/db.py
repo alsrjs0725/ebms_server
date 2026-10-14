@@ -1993,7 +1993,7 @@ class SongBatch:
     곡과 청크 갱신이 같은 트랜잭션이라 도중에 꺼지면 배치 전체가 롤백되고, 다시 임포트하면 처음부터 들어갑니다.
     곡 하나가 실패하면 SAVEPOINT로 그 곡만 되돌리고 배치는 이어갑니다.
     새 차트가 BYTE_PER_CHUNK, 곡 데이터가 IMPORT_BATCH_BYTES, 곡 수가 IMPORT_BATCH_SONGS에 이르면 커밋합니다.
-    배치가 열려 있는 동안(커밋 전까지)만 쓰기 잠금을 잡습니다.
+    배치가 열려 있는 동안(커밋 전까지)만 쓰기 잠금을 잡습니다. max_bytes·max_songs를 바꾸면 다음 add부터 그 한도로 커밋합니다.
 
     with db.batch() as batch:
         info = batch.add(song_dir)          # 등록 정보 또는 None. 실패하면 예외(그 곡만 되돌림)
@@ -2005,7 +2005,14 @@ class SongBatch:
         self.logger = db.logger
         self._con = None
         self._cur = None
+        self.max_bytes = constant.IMPORT_BATCH_BYTES
+        self.max_songs = constant.IMPORT_BATCH_SONGS
         self._reset()
+
+    @property
+    def open(self) -> bool:
+        """커밋하지 않은 곡이 있어 쓰기 잠금을 잡고 있는지."""
+        return self._con is not None
 
     def _reset(self) -> None:
         self._charts: list[tuple[str, bytes]] = []
@@ -2143,8 +2150,8 @@ class SongBatch:
 
         if (
             self._chart_bytes >= constant.BYTE_PER_CHUNK
-            or self._song_bytes >= constant.IMPORT_BATCH_BYTES
-            or self._songs >= constant.IMPORT_BATCH_SONGS
+            or self._song_bytes >= self.max_bytes
+            or self._songs >= self.max_songs
         ):
             self.flush()
         return info

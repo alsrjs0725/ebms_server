@@ -3,6 +3,8 @@
 - 서버 시작 시와 관리자 페이지의 "var/tmp 가져오기"는 `var/tmp/`의 곡 폴더와 zip을 등록하고, 등록한 것은 지웁니다.
 - 관리자 페이지는 zip을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 하나씩 풀어 등록합니다. 작업 상태는 메모리에만 둡니다.
+- 작업을 "천천히"(Job.slow)로 돌리면 작은 배치로 커밋하고 커밋마다 쉬어 서비스(다운로드·DB 응답)에 디스크를 양보합니다.
+  돌고 있는 작업도 바꿀 수 있습니다.
 """
 import logging
 import os
@@ -45,7 +47,7 @@ def find_song_dirs(root: pathlib.Path) -> list[pathlib.Path]:
 class Job:
     """백그라운드 임포트 작업 하나의 진행 상황."""
 
-    def __init__(self, kind: str, name: str):
+    def __init__(self, kind: str, name: str, slow: bool = False):
         self.id = uuid.uuid4().hex
         self.kind = kind
         self.name = name
@@ -54,6 +56,40 @@ class Job:
         self.songs: list[dict] = []
         self.error: str | None = None
         self.started_at = int(time.time())
+        self._slow = slow
+        self._wake = threading.Event()
+        self._work_since = time.monotonic()
+        self.resting_until: float | None = None
+
+    @property
+    def slow(self) -> bool:
+        return self._slow
+
+    @slow.setter
+    def slow(self, value: bool) -> None:
+        self._slow = value
+        if not value:
+            self._wake.set()  # 쉬는 중이면 바로 이어서 진행합니다.
+
+    def apply_limits(self, batch) -> None:
+        """다음 곡을 넣기 전에 배치의 커밋 기준을 지금 속도에 맞춥니다."""
+        if self._slow:
+            batch.max_bytes, batch.max_songs = constant.IMPORT_SLOW_BATCH_BYTES, constant.IMPORT_SLOW_BATCH_SONGS
+        else:
+            batch.max_bytes, batch.max_songs = constant.IMPORT_BATCH_BYTES, constant.IMPORT_BATCH_SONGS
+
+    def rest(self, batch) -> None:
+        """천천히 모드에서 배치를 막 커밋했으면(쓰기 잠금을 놓은 상태) 일한 시간에 비례해 쉽니다."""
+        if not self._slow or batch.open:
+            return
+        now = time.monotonic()
+        seconds = min(constant.IMPORT_SLOW_REST_MAX, (now - self._work_since) * constant.IMPORT_SLOW_REST_RATIO)
+        self._wake.clear()
+        if seconds > 0 and self._slow:  # clear 전에 보통 속도로 바뀌었으면 쉬지 않습니다.
+            self.resting_until = time.time() + seconds
+            self._wake.wait(seconds)
+            self.resting_until = None
+        self._work_since = time.monotonic()
 
     def json(self) -> dict:
         return {
@@ -66,7 +102,15 @@ class Job:
             "songs": list(self.songs),
             "error": self.error,
             "started_at": self.started_at,
+            "slow": self._slow,
+            "resting": self.resting_until is not None,
         }
+
+
+def _add(batch, job: Job, song_dir: pathlib.Path, folder: str, remove: bool) -> None:
+    job.apply_limits(batch)
+    job.songs.append(_insert(batch, song_dir, folder, remove))
+    job.rest(batch)
 
 
 def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
@@ -101,7 +145,7 @@ def import_tree(root: pathlib.Path, remove: bool, job: Job | None = None) -> lis
     job.total = len(song_dirs)
     with Database().batch() as batch:
         for song_dir in song_dirs:
-            job.songs.append(_insert(batch, song_dir, song_dir.relative_to(root).as_posix(), remove))
+            _add(batch, job, song_dir, song_dir.relative_to(root).as_posix(), remove)
     return job.songs
 
 
@@ -202,7 +246,7 @@ def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> lis
                     with zf.open(info) as fin, open(target, "wb") as fout:
                         shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
                 # 곡 데이터는 배치 트랜잭션과 메모리에 들어가므로 풀어둔 폴더는 바로 지워도 됩니다.
-                job.songs.append(_insert(batch, song_dir, "/".join((stem, *root)), remove=False))
+                _add(batch, job, song_dir, "/".join((stem, *root)), remove=False)
             except Exception as e:
                 logger.exception(f"import failed[{filename}:{'/'.join(root)}]")
                 job.songs.append({"folder": "/".join((stem, *root)), "error": str(e) or type(e).__name__})
@@ -268,7 +312,7 @@ def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
     return {"id": upload_id, "received": received + len(data), "size": upload["size"]}
 
 
-def finish_upload(upload_id: str) -> Job:
+def finish_upload(upload_id: str, slow: bool = False) -> Job:
     """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다. 작업이 끝나면 zip을 지웁니다."""
     upload = _upload(upload_id)
     received = upload["path"].stat().st_size
@@ -276,7 +320,7 @@ def finish_upload(upload_id: str) -> Job:
         raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
     with _lock:
         _uploads.pop(upload_id, None)
-    job = Job("zip", upload["filename"])
+    job = Job("zip", upload["filename"], slow)
 
     def run():
         try:
@@ -294,13 +338,13 @@ def cancel_upload(upload_id: str) -> None:
         upload["path"].unlink(missing_ok=True)
 
 
-def start_tmp_job() -> Job:
+def start_tmp_job(slow: bool = False) -> Job:
     """var/tmp 임포트를 시작합니다. 이미 돌고 있으면 그 작업을 반환합니다(같은 파일을 두 번 처리하지 않도록)."""
     with _lock:
         running = next((j for j in _jobs.values() if j.kind == "tmp" and j.status == "running"), None)
     if running is not None:
         return running
-    job = Job("tmp", "var/tmp")
+    job = Job("tmp", "var/tmp", slow)
     return _start(job, lambda: import_tmp(job))
 
 
@@ -328,6 +372,14 @@ def _start(job: Job, run) -> Job:
                 break
             del _jobs[oldest]
     threading.Thread(target=target, name=f"import-{job.id[:8]}", daemon=True).start()
+    return job
+
+
+def set_slow(job_id: str, slow: bool) -> Job | None:
+    """작업의 속도를 바꿉니다. 끝난 작업은 그대로 반환합니다."""
+    job = get_job(job_id)
+    if job is not None and job.status == "running":
+        job.slow = slow
     return job
 
 

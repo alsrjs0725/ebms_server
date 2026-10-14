@@ -1,6 +1,7 @@
 """관리자 곡 임포트(zip 조각 업로드, var/tmp 가져오기) 테스트."""
 import io
 import os
+import threading
 import time
 import zipfile
 
@@ -234,3 +235,50 @@ def test_create_zip_skips_symlinks(tmp_path):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         assert sorted(zf.namelist()) == ["a.bms", "sub/x.wav"]
     assert [p.name for p in db_module.chart_files(song)] == ["a.bms"]
+
+
+def test_import_tmp_slow(client, monkeypatch):
+    """천천히 모드는 작은 배치로 커밋하고 커밋마다 쉽니다."""
+    admin_login(client, monkeypatch)
+    monkeypatch.setattr(constant, "IMPORT_SLOW_BATCH_SONGS", 1)
+    rests = []
+    monkeypatch.setattr(importer.Job, "rest", lambda self, batch: rests.append(batch.open))
+    for i in range(3):
+        song = constant.TMP_DIR / "g" / f"s{i}"
+        song.mkdir(parents=True)
+        (song / "a.bms").write_bytes(f"#TITLE {i}\n".encode())
+
+    job = wait(client, client.post("/api/admin/import/tmp", params={"slow": True}).json())
+    assert job["status"] == "done" and job["slow"]
+    assert [s["new_song"] for s in job["songs"]] == [True, True, True]
+    # 곡마다 커밋해 쓰기 잠금을 놓은 뒤 쉽니다.
+    assert rests == [False, False, False]
+
+
+def test_job_rest_and_speed_change(monkeypatch):
+    monkeypatch.setattr(constant, "IMPORT_SLOW_REST_MAX", 5)
+    batch = db_module.Database().batch()
+    job = importer.Job("tmp", "var/tmp", slow=True)
+    job.apply_limits(batch)
+    assert (batch.max_bytes, batch.max_songs) == (constant.IMPORT_SLOW_BATCH_BYTES, constant.IMPORT_SLOW_BATCH_SONGS)
+
+    # 쉬는 중에 보통 속도로 바꾸면 바로 이어서 진행합니다.
+    job._work_since -= 100
+    started = time.monotonic()
+    threading.Timer(0.1, lambda: setattr(job, "slow", False)).start()
+    job.rest(batch)
+    assert time.monotonic() - started < 2
+    assert not job.slow and not job.json()["resting"]
+    job.apply_limits(batch)
+    assert (batch.max_bytes, batch.max_songs) == (constant.IMPORT_BATCH_BYTES, constant.IMPORT_BATCH_SONGS)
+
+
+def test_set_job_speed(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    job = importer.Job("zip", "a.zip")
+    with importer._lock:
+        importer._jobs[job.id] = job
+    r = client.put(f"/api/admin/import/jobs/{job.id}/speed", json={"slow": True})
+    assert r.status_code == 200 and r.json()["slow"]
+    assert job.slow
+    assert client.put("/api/admin/import/jobs/nope/speed", json={"slow": True}).status_code == 404

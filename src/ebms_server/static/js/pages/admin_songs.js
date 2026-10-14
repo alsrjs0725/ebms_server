@@ -331,6 +331,8 @@ let currentUpload = null;
 
 const form = document.getElementById("upload");
 const scan = document.getElementById("scan");
+const scanSlow = document.getElementById("scan-slow");
+const slowUpload = document.getElementById("slow-upload");
 const cancel = document.getElementById("cancel");
 const state = document.getElementById("upload-state");
 const label = document.getElementById("upload-label");
@@ -405,14 +407,14 @@ async function uploadFile(file, index, count) {
         offset = (await res.json()).received;
         progress(file, offset, index, count);
     }
-    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish`);
+    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish?slow=${slowUpload.checked}`);
     currentUpload = null;
     return job;
 }
 
 function busy(on) {
     form.querySelectorAll("input, button[type=submit]").forEach((el) => (el.disabled = on));
-    scan.disabled = on;
+    scan.disabled = scanSlow.disabled = on;
     cancel.classList.toggle("d-none", !on);
     state.classList.toggle("d-none", !on);
 }
@@ -444,17 +446,36 @@ form.addEventListener("submit", async (e) => {
 
 cancel.addEventListener("click", () => { cancelled = true; });
 
-scan.addEventListener("click", async () => {
-    scan.disabled = true;
+async function scanTmp(slow) {
+    scan.disabled = scanSlow.disabled = true;
     try {
-        await postJson("/api/admin/import/tmp");
+        await postJson(`/api/admin/import/tmp?slow=${slow}`);
     } catch (err) {
         alert(err.message);
     } finally {
-        scan.disabled = false;
+        scan.disabled = scanSlow.disabled = false;
         refreshJobs();
     }
-});
+}
+
+scan.addEventListener("click", () => scanTmp(false));
+scanSlow.addEventListener("click", () => scanTmp(true));
+
+async function setSpeed(job, slow, button) {
+    button.disabled = true;
+    try {
+        const res = await fetch(`/api/admin/import/jobs/${job.id}/speed`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ slow }),
+        });
+        if (!res.ok) throw new Error(await detail(res));
+    } catch (err) {
+        alert(err.message);
+    } finally {
+        refreshJobs();
+    }
+}
 
 function songLine(song) {
     const li = document.createElement("li");
@@ -533,6 +554,20 @@ function jobCard(job) {
     badge.className = "badge ms-2 " + ({ running: "text-bg-primary", done: "text-bg-success", failed: "text-bg-danger" })[job.status];
     badge.textContent = ({ running: "등록 중", done: "완료", failed: "실패" })[job.status];
     title.append(name, badge);
+    if (job.slow) {
+        const slow = document.createElement("span");
+        slow.className = "badge ms-1 text-bg-secondary";
+        slow.textContent = job.status === "running" && job.resting ? "천천히 · 쉬는 중" : "천천히";
+        title.append(slow);
+    }
+    if (job.status === "running") {
+        const speed = document.createElement("button");
+        speed.type = "button";
+        speed.className = "btn btn-sm btn-outline-secondary ms-2 py-0";
+        speed.textContent = job.slow ? "보통 속도로" : "천천히 진행";
+        speed.addEventListener("click", () => setSpeed(job, !job.slow, speed));
+        title.append(speed);
+    }
     body.append(title);
 
     const failed = job.songs.filter((s) => s.error);

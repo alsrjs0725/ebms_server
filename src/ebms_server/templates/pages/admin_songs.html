@@ -95,6 +95,10 @@
             <div class="progress-bar w-0"></div>
         </div>
     </div>
+    <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" id="slow-upload">
+        <label class="form-check-label" for="slow-upload">천천히 등록(서비스 영향 최소화)</label>
+    </div>
     <button class="btn btn-primary" type="submit">업로드하고 등록</button>
     <button class="btn btn-outline-secondary d-none" type="button" id="cancel">업로드 취소</button>
 </form>
@@ -102,7 +106,12 @@
 <h2 class="h5">var/tmp 가져오기</h2>
 <p class="text-muted small">서버의 <code>var/tmp/</code>에 있는 곡 폴더와 zip을 지금 등록합니다(서버 시작 시와 같음). 등록한 폴더와 zip은 지웁니다.
     수 GB 이상이면 웹 업로드보다 zip을 내부망으로 서버의 <code>var/tmp/</code>에 복사(SMB, scp 등)한 뒤 누르는 편이 훨씬 빠릅니다. 복사 중에 누르지 않도록, 다른 이름으로 복사한 뒤 <code>.zip</code>으로 바꾸세요.</p>
-<button class="btn btn-outline-primary mb-5" type="button" id="scan">var/tmp 가져오기</button>
+<p class="text-muted small">"천천히"는 작은 단위로 나눠 등록하고 사이사이 쉬어서, 등록하는 동안에도 다운로드와 사이트 응답이 느려지지 않게 합니다(대신 두 배 이상 오래 걸림).
+    등록 중인 작업도 아래 목록에서 속도를 바꿀 수 있습니다.</p>
+<div class="mb-5">
+    <button class="btn btn-outline-primary" type="button" id="scan">var/tmp 가져오기</button>
+    <button class="btn btn-outline-secondary" type="button" id="scan-slow">var/tmp 천천히 가져오기</button>
+</div>
 
 <h2 class="h5">등록 작업</h2>
 <p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다. 지난 기록과 자세한 오류는 <a href="/admin/logs?logger=ebms_server.importer">서버 로그</a>에서 볼 수 있습니다.</p>
