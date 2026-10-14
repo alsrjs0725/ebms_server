@@ -20,6 +20,9 @@ LOG_DIR = BASE_DIR / "var" / "log"
 ACCESS_LOG_DAYS = 30
 # 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
 UNUSED_DIR = BASE_DIR / "var" / "unused"
+# 차트 청크 하나에 넣는 차트 수. 차트가 커서 BYTE_PER_CHUNK를 넘으면 그 전에 다음 청크로 넘어갑니다.
+# 바꾸면 서버 시작 뒤 기존 차트 청크를 이 크기로 다시 묶습니다(Database.rechunk_charts).
+CHARTS_PER_CHUNK = 100
 BYTE_PER_CHUNK = 64 * 1024 * 1024
 # 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
 IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
@@ -30,7 +33,8 @@ CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 SONGS_PER_MANIFEST_CHUNK = 1000
 # 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_PRE_CHUNK
-SONGS_PER_PRE_CHUNK = 32
+# 난이도표를 고른 클라이언트가 표에 없는 곡을 덜 받도록 작게 둡니다. 바꾸면 서버 시작 뒤 사전 청크를 모두 다시 만듭니다.
+SONGS_PER_PRE_CHUNK = 8
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
 # 난이도표(tables.py)를 읽을 때 주소 하나의 응답 시간·크기 한도
 TABLE_FETCH_TIMEOUT = 30

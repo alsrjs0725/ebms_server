@@ -360,6 +360,13 @@ CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
 FILE_KINDS_VERSION = 2
 # FILE_KINDS_VERSION을 적용한 버전을 저장하는 setting 이름
 FILE_KINDS_SETTING = "file_kinds_version"
+# 지금 차트 청크·사전 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK)를 저장하는 setting 이름.
+# 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
+CHART_CHUNK_SETTING = "chart_chunk_charts"
+PRE_CHUNK_SETTING = "pre_chunk_songs"
+# 차트 청크를 다시 묶는 중일 때 옛 청크의 마지막 번호와 단계(copy: 새 청크를 만드는 중, delete: 옛 청크를 지우는 중)
+CHART_RECHUNK_SETTING = "chart_rechunk_old_max"
+CHART_RECHUNK_PHASE_SETTING = "chart_rechunk_phase"
 
 
 def _header_paths(value: bytes, base: str) -> list[str]:
@@ -462,6 +469,14 @@ def zip_entries(data: bytes) -> list[dict]:
                 }
             )
         return entries
+
+
+def _zip_count(data: bytes) -> int:
+    """zip 항목 수. 비어 있으면 0."""
+    if not data:
+        return 0
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return len(zf.infolist())
 
 
 def pre_arcname(song_id: int, path: str) -> str:
@@ -862,29 +877,36 @@ class Database:
         return size + constant.PACKET_OVERHEAD <= self.max_allowed_packet
 
     def _append_charts_to_chunk(self, cur, charts: list[tuple[str, bytes]]) -> None:
-        """mutable한 chart chunk에 chart (항목 이름, 내용)들을 추가합니다. chunk가 BYTE_PER_CHUNK를 넘었다면 새 chunk를 만듭니다."""
-        cur.execute("SELECT id, size FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE")
+        """마지막 chart chunk에 chart (항목 이름, 내용)들을 추가합니다. 청크마다 CHARTS_PER_CHUNK개까지 넣고,
+        넘치거나 청크가 BYTE_PER_CHUNK를 넘으면 다음 번호의 새 청크에 이어 넣습니다."""
+        cur.execute("SELECT id FROM chart_chunk ORDER BY id DESC LIMIT 1 FOR UPDATE")
         row = cur.fetchone()
         if row is None:
             chunk_no, data = 0, b""
-        elif row[1] > constant.BYTE_PER_CHUNK:
-            chunk_no, data = row[0] + 1, b""
         else:
             chunk_no = row[0]
             cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
             data = cur.fetchone()[0]
+        count = _zip_count(data)
 
-        buf = io.BytesIO(data)
-        with zipfile.ZipFile(buf, mode="a", compression=zipfile.ZIP_STORED) as zf:
-            for arcname, content in charts:
-                zf.writestr(zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0)), content)
-        data = buf.getvalue()
+        pending = list(charts)
+        while pending:
+            if count >= constant.CHARTS_PER_CHUNK or len(data) > constant.BYTE_PER_CHUNK:
+                chunk_no, data, count = chunk_no + 1, b"", 0
+            take, pending = pending[: constant.CHARTS_PER_CHUNK - count], pending[constant.CHARTS_PER_CHUNK - count :]
+            buf = io.BytesIO(data)
+            with zipfile.ZipFile(buf, mode="a", compression=zipfile.ZIP_STORED) as zf:
+                for arcname, content in take:
+                    zf.writestr(zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0)), content)
+            data = buf.getvalue()
+            count += len(take)
+            self._write_chart_chunk(cur, chunk_no, data)
 
+    def _write_chart_chunk(self, cur, chunk_no: int, data: bytes) -> None:
         if not self._fits_packet(len(data)):
             raise RuntimeError(
                 f"chart chunk {chunk_no} ({len(data)} bytes) exceeds max_allowed_packet({self.max_allowed_packet})"
             )
-
         cur.execute(
             """
             INSERT INTO chart_chunk (id, size, sha256, data) VALUES (%s, %s, %s, %s)
@@ -892,6 +914,116 @@ class Database:
             """,
             (chunk_no, len(data), hashlib.sha256(data).hexdigest(), data),
         )
+
+    def _setting(self, cur, name: str) -> str | None:
+        cur.execute("SELECT value FROM setting WHERE name = %s", (name,))
+        row = cur.fetchone()
+        return None if row is None else row[0]
+
+    def _set_setting(self, cur, name: str, value: str | None) -> None:
+        cur.execute("DELETE FROM setting WHERE name = %s", (name,))
+        if value is not None:
+            cur.execute("INSERT INTO setting (name, value) VALUES (%s, %s)", (name, value))
+
+    def rechunk_charts(self) -> int:
+        """차트 청크의 크기(CHART_CHUNK_SETTING)가 CHARTS_PER_CHUNK와 다르면 모든 차트를 CHARTS_PER_CHUNK개씩 다시 묶습니다.
+        새 청크를 만든 수를 반환합니다.
+
+        새 청크는 기존 마지막 번호 뒤에 만들고 다 만든 뒤 옛 청크를 지우므로, 그 사이에 동기화한 클라이언트는 차트를
+        두 번 볼 뿐 빠뜨리지 않습니다. 진행 단계를 setting에 남겨 도중에 꺼지면 다음 시작 때 이어서 합니다.
+        끝날 때까지 쓰기 잠금을 잡으므로 그동안 임포트는 기다립니다. md5가 없는 차트는 이때 함께 채웁니다."""
+        with connect() as con, con.cursor() as cur:
+            if self._setting(cur, CHART_CHUNK_SETTING) == str(constant.CHARTS_PER_CHUNK):
+                return 0
+        with self._write_lock:
+            with connect() as con, con.cursor() as cur:
+                old_max = self._setting(cur, CHART_RECHUNK_SETTING)
+                phase = self._setting(cur, CHART_RECHUNK_PHASE_SETTING)
+                cur.execute("SELECT id FROM chart_chunk ORDER BY id")
+                ids = [row[0] for row in cur.fetchall()]
+                if old_max is None:
+                    if not ids:
+                        self._set_setting(cur, CHART_CHUNK_SETTING, str(constant.CHARTS_PER_CHUNK))
+                        con.commit()
+                        return 0
+                    old_max, phase = str(ids[-1]), "copy"
+                    self._set_setting(cur, CHART_RECHUNK_SETTING, old_max)
+                    self._set_setting(cur, CHART_RECHUNK_PHASE_SETTING, phase)
+                    con.commit()
+                old_max = int(old_max)
+                old_ids = [i for i in ids if i <= old_max]
+                if phase == "copy":
+                    # 지난번에 만들다 만 새 청크는 지우고 처음부터 다시 묶습니다.
+                    for chunk_no in (i for i in ids if i > old_max):
+                        cur.execute("DELETE FROM chart_chunk WHERE id = %s", (chunk_no,))
+                    cur.execute("SELECT id FROM chart WHERE md5 IS NULL")
+                    no_md5 = {row[0] for row in cur.fetchall()}
+                    con.commit()
+            self.logger.info(f"rechunk_charts: {phase} phase, {len(old_ids)} old chart chunks.")
+
+            made = 0
+            if phase == "copy":
+                made = self._copy_charts_to_new_chunks(old_ids, old_max + 1, no_md5)
+                with connect() as con, con.cursor() as cur:
+                    self._set_setting(cur, CHART_RECHUNK_PHASE_SETTING, "delete")
+                    con.commit()
+            for chunk_no in old_ids:
+                with connect() as con, con.cursor() as cur:
+                    cur.execute("DELETE FROM chart_chunk WHERE id = %s", (chunk_no,))
+                    con.commit()
+            with connect() as con, con.cursor() as cur:
+                self._set_setting(cur, CHART_RECHUNK_SETTING, None)
+                self._set_setting(cur, CHART_RECHUNK_PHASE_SETTING, None)
+                self._set_setting(cur, CHART_CHUNK_SETTING, str(constant.CHARTS_PER_CHUNK))
+                con.commit()
+        self.logger.info(f"rechunk_charts: Rewrote {len(old_ids)} chart chunks into {made}.")
+        return made
+
+    def _copy_charts_to_new_chunks(self, old_ids: list[int], first_id: int, no_md5: set[str]) -> int:
+        """old_ids 청크의 차트를 순서대로 CHARTS_PER_CHUNK개씩 first_id부터 새 청크에 씁니다. 새 청크마다 커밋합니다."""
+        chunk_no = first_id
+        entries: list[tuple[str, bytes]] = []
+        size = 0
+        md5s: list[tuple[str, str]] = []
+
+        def flush() -> None:
+            nonlocal chunk_no, entries, size, md5s
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
+                for arcname, content in entries:
+                    zf.writestr(zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0)), content)
+            with connect() as con, con.cursor() as cur:
+                try:
+                    self._write_chart_chunk(cur, chunk_no, buf.getvalue())
+                    for md5, sha256 in md5s:
+                        cur.execute("UPDATE chart SET md5 = %s WHERE id = %s AND md5 IS NULL", (md5, sha256))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            chunk_no, entries, size, md5s = chunk_no + 1, [], 0, []
+
+        for i, old in enumerate(old_ids, 1):
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (old,))
+                data = cur.fetchone()[0]
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for info in zf.infolist():
+                    content = zf.read(info)
+                    sha256 = info.filename.rsplit(".", 1)[0]
+                    if sha256 in no_md5:
+                        md5s.append((hashlib.md5(content).hexdigest(), sha256))
+                    if entries and (
+                        len(entries) >= constant.CHARTS_PER_CHUNK or size + len(content) > constant.BYTE_PER_CHUNK
+                    ):
+                        flush()
+                    entries.append((info.filename, content))
+                    size += len(content)
+            if i % 10 == 0:
+                self.logger.info(f"rechunk_charts: {i}/{len(old_ids)} old chunks read")
+        if entries:
+            flush()
+        return chunk_no - first_id
 
     def _rebuild_manifest_chunk(self, cur, chunk_no: int) -> None:
         """chunk_no에 속한 곡들의 매니페스트를 다시 만들어 저장합니다."""
@@ -1023,6 +1155,18 @@ class Database:
     def backfill_pre_chunks(self) -> int:
         """곡은 있는데 사전 청크가 없는 구간(이전 버전에서 넣은 곡)의 사전 청크를 만듭니다. 만든 청크 수를 반환합니다.
         청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 남은 청크부터 이어서 만듭니다."""
+        with self._write_lock, connect() as con, con.cursor() as cur:
+            if self._setting(cur, PRE_CHUNK_SETTING) != str(constant.SONGS_PER_PRE_CHUNK):
+                # 청크 크기가 바뀌었으면 모두 다시 만듭니다. 조각(pre_chunk_part)은 청크를 다시 만들 때 덮어쓰고,
+                # 남는 번호의 조각은 아래에서 지웁니다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받습니다.
+                cur.execute("SELECT COUNT(*) FROM pre_chunk")
+                if cur.fetchone()[0]:
+                    self.logger.info(
+                        f"backfill_pre_chunks: Rebuilding every pre chunk with {constant.SONGS_PER_PRE_CHUNK} songs."
+                    )
+                cur.execute("DELETE FROM pre_chunk")
+                self._set_setting(cur, PRE_CHUNK_SETTING, str(constant.SONGS_PER_PRE_CHUNK))
+                con.commit()
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT id FROM song")
             wanted = {row[0] // constant.SONGS_PER_PRE_CHUNK for row in cur.fetchall()}
@@ -1044,7 +1188,24 @@ class Database:
                 self.logger.info(f"backfill_pre_chunks: {i}/{len(missing)}")
         if missing:
             self.logger.info(f"backfill_pre_chunks: Built {len(missing)} pre chunks.")
+        self._drop_orphan_pre_parts()
         return len(missing)
+
+    def _drop_orphan_pre_parts(self) -> None:
+        """청크가 없는 사전 청크 조각(청크 크기를 바꾸기 전 번호)을 지웁니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT DISTINCT chunk_id FROM pre_chunk_part")
+            parts = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT id FROM pre_chunk")
+            orphans = sorted(parts - {row[0] for row in cur.fetchall()})
+        for chunk_no in orphans:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                cur.execute("SELECT id FROM pre_chunk WHERE id = %s", (chunk_no,))
+                if cur.fetchone() is None:
+                    cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
+                con.commit()
+        if orphans:
+            self.logger.info(f"backfill_pre_chunks: Dropped parts of {len(orphans)} old pre chunks.")
 
     def backfill_chart_md5(self) -> int:
         """md5가 없는 차트(이전 버전에서 넣은 차트)의 md5를 차트 청크에서 채웁니다. 채운 차트 수를 반환합니다.

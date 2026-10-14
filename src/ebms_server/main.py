@@ -69,6 +69,11 @@ def configure_access_log() -> None:
 
 
 def backfill_pre_chunks() -> None:
+    # 청크 크기(CHARTS_PER_CHUNK)가 바뀌었으면 차트 청크를 다시 묶는다. 그동안 임포트는 기다린다.
+    try:
+        Database().rechunk_charts()
+    except Exception:
+        logging.getLogger(__name__).exception("rechunk_charts failed")
     try:
         Database().backfill_pre_chunks()
     except Exception:
