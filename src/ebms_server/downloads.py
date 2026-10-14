@@ -8,12 +8,13 @@
 """
 import gzip
 import mimetypes
+import queue
 import re
 import struct
 import threading
 import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Annotated
 
 import anyio
@@ -99,6 +100,72 @@ class ReleasingStreamingResponse(StreamingResponse):
                 if aclose is not None:
                     with anyio.CancelScope(shield=True):
                         await aclose()
+
+
+class ReadAhead:
+    """BLOB 조각 iterator를 백그라운드 스레드에서 미리 읽어 두는 iterator.
+
+    조각 하나를 보내는 동안 다음 조각을 읽어 디스크 읽기와 전송이 겹치게 합니다. 조각을 하나씩 읽고 보내면
+    느린 HDD에서 읽는 동안 전송이 멈춰 속도가 들쭉날쭉해집니다. 최대 READ_AHEAD_CHUNKS개까지 쌓습니다.
+    close()는 읽기를 멈추게만 하고, 원본 iterator는 읽던 스레드가 닫습니다(다른 스레드에서 닫을 수 없음).
+    """
+
+    _END = object()
+
+    def __init__(self, chunks: Iterator[bytes], max_chunks: int | None = None):
+        self._chunks = chunks
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, max_chunks or constant.READ_AHEAD_CHUNKS))
+        self._stop = threading.Event()
+        self._done = False
+        threading.Thread(target=self._run, name="blob-read-ahead", daemon=True).start()
+
+    def _put(self, item) -> bool:
+        """큐가 비기를 기다려 넣습니다. 그 사이 close()되면 False."""
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _run(self) -> None:
+        try:
+            for chunk in self._chunks:
+                if not self._put(chunk):
+                    return
+            self._put(self._END)
+        except BaseException as e:
+            self._put(e)
+        finally:
+            close = getattr(self._chunks, "close", None)
+            if close is not None:
+                close()
+
+    def __iter__(self) -> "ReadAhead":
+        return self
+
+    def __next__(self) -> bytes:
+        if self._done:
+            raise StopIteration
+        item = self._queue.get()
+        if item is self._END:
+            self._done = True
+            raise StopIteration
+        if isinstance(item, BaseException):
+            self._done = True
+            raise item
+        return item
+
+    def close(self) -> None:
+        self._done = True
+        self._stop.set()
+        # 쌓아 둔 조각을 바로 놓아 줍니다.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
 
 def _not_modified(request: Request, etag: str) -> bool:
@@ -192,7 +259,7 @@ def blob_response(
             status = 206
             headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
         headers["Content-Length"] = str(end - start + 1)
-        gen = blob.iter_range(start, end)
+        gen = ReadAhead(blob.iter_range(start, end))
 
         @_once
         def cleanup():
