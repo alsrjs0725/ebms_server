@@ -279,6 +279,8 @@ def _message(request: Request, title: str, message: str, status_code: int, back:
 
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, session: Annotated[tuple[User, int] | None, Depends(optional_session)], next: str | None = None):
+    from . import home  # home → admin → auth 순환 import를 피합니다
+
     return templates.TemplateResponse(
         request=request,
         name="pages/login.html",
@@ -286,6 +288,7 @@ def login_page(request: Request, session: Annotated[tuple[User, int] | None, Dep
             "oauths": configured_oauths(),
             "next": safe_next(next),
             "user": session[0] if session else None,
+            "home": home.content(),
         },
     )
 
