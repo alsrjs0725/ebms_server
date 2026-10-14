@@ -19,4 +19,8 @@
 {% else %}
 <div class="alert alert-warning">설정된 로그인 수단이 없습니다. 서버 관리자에게 문의하세요.</div>
 {% endif %}
+{% if home %}
+<hr class="my-4">
+<div class="home-content">{{ home }}</div>
+{% endif %}
 {% endblock %}
