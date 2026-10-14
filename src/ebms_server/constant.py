@@ -27,6 +27,12 @@ BYTE_PER_CHUNK = 64 * 1024 * 1024
 # 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
 IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
 IMPORT_BATCH_SONGS = 500
+# 저속 임포트(관리자 페이지 "천천히"): 작은 배치로 자주 커밋해 쓰기 잠금과 MySQL 쓰기 폭주를 줄이고,
+# 커밋마다 일한 시간 x IMPORT_SLOW_REST_RATIO 만큼(최대 IMPORT_SLOW_REST_MAX초) 쉬어 디스크를 서비스에 양보합니다.
+IMPORT_SLOW_BATCH_BYTES = 128 * 1024 * 1024
+IMPORT_SLOW_BATCH_SONGS = 50
+IMPORT_SLOW_REST_RATIO = 1.0
+IMPORT_SLOW_REST_MAX = 60
 # 서버 시작 시 기존 곡을 다시 처리(매니페스트·pre/play 판정 채우기)할 때 커밋하는 곡 수
 BACKFILL_BATCH_SONGS = 100
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"

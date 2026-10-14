@@ -505,22 +505,36 @@ def cancel_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 
 @router.post("/api/admin/import/uploads/{upload_id}/finish")
-def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
-    """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다."""
-    job = _upload_call(importer.finish_upload, upload_id)
+def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)], slow: bool = False):
+    """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다. slow면 천천히(서비스에 디스크를 양보하며) 진행합니다."""
+    job = _upload_call(importer.finish_upload, upload_id, slow)
     logger.info(f"import job {job.id} by {admin.id}: {job.name}")
     return job.json()
 
 
 @router.post("/api/admin/import/tmp")
-def import_tmp(admin: Annotated[User, Depends(web_admin)]):
-    """`var/tmp/` 아래 곡을 등록하는 작업을 백그라운드로 시작합니다(등록한 곡 폴더는 지움)."""
-    return importer.start_tmp_job().json()
+def import_tmp(admin: Annotated[User, Depends(web_admin)], slow: bool = False):
+    """`var/tmp/` 아래 곡을 등록하는 작업을 백그라운드로 시작합니다(등록한 곡 폴더는 지움). slow면 천천히 진행합니다."""
+    return importer.start_tmp_job(slow).json()
 
 
 @router.get("/api/admin/import/jobs")
 def list_jobs(admin: Annotated[User, Depends(web_admin)]):
     return [job.json() for job in importer.list_jobs()]
+
+
+class JobSpeed(BaseModel):
+    slow: bool
+
+
+@router.put("/api/admin/import/jobs/{job_id}/speed")
+def set_job_speed(job_id: str, body: JobSpeed, admin: Annotated[User, Depends(web_admin)]):
+    """돌고 있는 작업을 천천히/보통 속도로 바꿉니다."""
+    job = importer.set_slow(job_id, body.slow)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    logger.info(f"import job {job.id} speed by {admin.id}: {'slow' if body.slow else 'normal'}")
+    return job.json()
 
 
 @router.get("/api/admin/import/jobs/{job_id}")
