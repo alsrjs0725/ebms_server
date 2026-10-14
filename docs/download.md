@@ -11,7 +11,7 @@
 | 사전 | GET `/api/pre/charthash` | 차트 청크별 SHA-256 |
 | 사전 | GET `/api/pre/chart/{chunk_id}` | 차트 청크 zip (Range 지원) |
 | 사전 | GET `/api/pre/manifest/hash`, `/api/pre/manifest/{chunk_id}` | 매니페스트. `files`의 각 항목에 `kind`(`pre`/`play`) |
-| 사전 | GET `/api/pre/assethash`, `/api/pre/asset/{chunk_id}` | 사전 청크. 32곡 단위로 사전 파일(차트 제외)을 묶은 zip (Range 지원) |
+| 사전 | GET `/api/pre/assethash`, `/api/pre/asset/{chunk_id}` | 사전 청크. 8곡 단위로 사전 파일(차트 제외)을 묶은 zip (Range 지원) |
 | 사전 | GET `/api/pre/song/{song_id}/file?path=<zip 안 경로>` | 사전 청크가 아직 없을 때 쓰는 대체 경로. 곡의 사전 파일 하나를 압축을 풀어 보냅니다. `ETag`/`If-None-Match` 지원. `kind`가 `pre`가 아니면 `403` `not a pre-download file`, 없으면 `404`, 지운 곡(결번)이면 `410` |
 | 플레이 | GET `/api/play/song/{song_id}` | 곡 zip 전체(Range 이어받기 지원). 본문을 보낼 때 티켓 1개 |
 

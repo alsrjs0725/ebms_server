@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, proxy, retention
+from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, proxy, retention, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -69,10 +69,20 @@ def configure_access_log() -> None:
 
 
 def backfill_pre_chunks() -> None:
+    # 청크 크기(CHARTS_PER_CHUNK)가 바뀌었으면 차트 청크를 다시 묶는다. 그동안 임포트는 기다린다.
+    try:
+        Database().rechunk_charts()
+    except Exception:
+        logging.getLogger(__name__).exception("rechunk_charts failed")
     try:
         Database().backfill_pre_chunks()
     except Exception:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+    # 난이도표는 차트를 md5로 가리킵니다. 다 채우기 전에는 sha256을 주는 표만 맞습니다.
+    try:
+        Database().backfill_chart_md5()
+    except Exception:
+        logging.getLogger(__name__).exception("backfill_chart_md5 failed")
 
 
 def insecure_public_url(url: str) -> bool:
@@ -145,9 +155,13 @@ async def lifespan(app: FastAPI):
     importer.start_tmp_job()
     # 보유기간이 지난 개인정보(세션·다운로드 기록·월 사용량 등)를 주기적으로 지운다(docs/privacy.md)
     retention_stop = retention.start()
+    # 등록한 난이도표를 주기적으로 다시 읽는다(새로 실린 곡)
+    tables_stop = tables.start()
     yield
     if retention_stop is not None:
         retention_stop.set()
+    if tables_stop is not None:
+        tables_stop.set()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -162,6 +176,7 @@ app.include_router(downloads.router)
 app.include_router(proxy.router)
 app.include_router(admin.router)
 app.include_router(notices.router)
+app.include_router(tables.router)
 app.include_router(policies.router)
 app.include_router(home.router)
 app.middleware("http")(auth.refresh_session_cookie)
