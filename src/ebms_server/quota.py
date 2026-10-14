@@ -180,6 +180,9 @@ class TicketState:
     refill_seconds: int
     # 다음 티켓 1개가 차는 시각(unix 초). 가득 찼으면 None.
     next_refill_at: int | None
+    # 다음 티켓 1개가 찰 때까지 남은 초. 가득 찼으면 None.
+    # 클라이언트 시계가 서버와 어긋나도 남은 시간을 맞게 보여 주도록 함께 내려줍니다.
+    next_refill_in: int | None = None
 
     @property
     def available(self) -> int:
@@ -200,10 +203,11 @@ def _current_tickets(row, limits: Limits, now: float) -> float:
 
 
 def _state(tickets: float, limits: Limits, now: float) -> TicketState:
-    next_refill_at = None
+    next_refill_at = next_refill_in = None
     if tickets < limits.max_tickets:
         next_refill_at = math.ceil(now + (1 - (tickets % 1)) * limits.refill_seconds)
-    return TicketState(tickets, limits.max_tickets, limits.refill_seconds, next_refill_at)
+        next_refill_in = max(0, next_refill_at - math.floor(now))
+    return TicketState(tickets, limits.max_tickets, limits.refill_seconds, next_refill_at, next_refill_in)
 
 
 def ticket_state(user_id: str, limits: Limits | None = None) -> TicketState:
@@ -446,4 +450,5 @@ def ticket_json(state: TicketState) -> dict:
         "max": state.max_tickets,
         "refill_seconds": state.refill_seconds,
         "next_refill_at": state.next_refill_at,
+        "next_refill_in": state.next_refill_in,
     }

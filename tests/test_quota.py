@@ -305,7 +305,7 @@ def test_play_tickets(tmp_path, client, monkeypatch):
     h = bearer(key)
 
     me = client.get("/api/me", headers=h).json()
-    assert me["tickets"] == {"available": 5, "max": 5, "refill_seconds": 60, "next_refill_at": None}
+    assert me["tickets"] == {"available": 5, "max": 5, "refill_seconds": 60, "next_refill_at": None, "next_refill_in": None}
 
     first = client.get("/api/play/song/1", headers=h)
     assert first.status_code == 200
@@ -321,6 +321,7 @@ def test_play_tickets(tmp_path, client, monkeypatch):
     me = client.get("/api/me", headers=h).json()
     assert me["tickets"]["available"] == 0
     assert me["tickets"]["next_refill_at"] is not None
+    assert 1 <= me["tickets"]["next_refill_in"] <= 60
 
     r = client.get("/api/play/song/6", headers=h)
     assert r.status_code == 429
