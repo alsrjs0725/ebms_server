@@ -652,15 +652,18 @@ class BlobReader:
                     chunk_start = seq * step
                     yield row[0][max(0, start - chunk_start) : end + 1 - chunk_start]
         elif self.table == "chart_chunk":
-            for pos in range(start + 1, end + 2, step):
-                with connect() as con, con.cursor() as cur:
-                    cur.execute(
-                        "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
-                        (pos, min(step, end + 2 - pos), self.row_id),
-                    )
-                    row = cur.fetchone()
-                if row is not None:
-                    yield row[0]
+            # SUBSTRING도 InnoDB가 BLOB 전체를 읽은 뒤 자르므로 step마다 나눠 읽으면 64MB 청크 하나에 4GB를 읽습니다.
+            # 차트 청크는 BYTE_PER_CHUNK 이하라 한 번에 읽고 나눠 보냅니다.
+            with connect() as con, con.cursor() as cur:
+                cur.execute(
+                    "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
+                    (start + 1, end - start + 1, self.row_id),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                data = row[0]
+                for pos in range(0, len(data), step):
+                    yield data[pos : pos + step]
         else:
             raise ValueError(self.table)
 
@@ -1973,7 +1976,8 @@ class Database:
             if table == "song":
                 cur.execute("SELECT size, sha256 FROM song WHERE id = %s", (row_id,))
             elif table == "chart_chunk":
-                cur.execute("SELECT LENGTH(data), sha256 FROM chart_chunk WHERE id = %s", (row_id,))
+                # LENGTH(data)는 InnoDB가 BLOB 전체를 읽어야 하므로 저장해 둔 size를 씁니다.
+                cur.execute("SELECT size, sha256 FROM chart_chunk WHERE id = %s", (row_id,))
             elif table == "pre_chunk":
                 cur.execute("SELECT size, sha256 FROM pre_chunk WHERE id = %s", (row_id,))
             row = cur.fetchone()
