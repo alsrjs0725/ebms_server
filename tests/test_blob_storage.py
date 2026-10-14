@@ -366,6 +366,30 @@ def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):
     assert len(b"".join(chunks)) == blob.size
 
 
+
+def test_chart_chunk_range_reads_blob_once(tmp_path, client, database, monkeypatch):
+    """차트 청크는 범위를 한 번에 읽어 BLOB_READ_SIZE 조각으로 나눠 보냅니다."""
+    monkeypatch.setattr(constant, "BLOB_READ_SIZE", 7)
+    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE " + os.urandom(100)}))
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT data FROM chart_chunk WHERE id = 0")
+        data = cur.fetchone()[0]
+    blob = Database().open_blob("chart_chunk", 0)
+    assert blob.size == len(data)
+
+    queries = []
+    real_connect = db_module.connect
+
+    def counting_connect(*args, **kwargs):
+        queries.append(1)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(db_module, "connect", counting_connect)
+    parts = list(blob.iter_range(3, 60))
+    assert b"".join(parts) == data[3:61]
+    assert [len(p) for p in parts] == [7] * 8 + [2]
+    assert len(queries) == 1
+
 def test_pre_chunk(tmp_path, client, database, monkeypatch):
     monkeypatch.setattr(constant, "SONGS_PER_PRE_CHUNK", 2)
     chart = b"#TITLE\n#BANNER banner.png\n#PREVIEW pv.wav\n"
