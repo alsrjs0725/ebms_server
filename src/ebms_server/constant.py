@@ -48,6 +48,9 @@ API_VERSION = 3
 DOWNLOAD_THREADS = int(os.environ.get("EBMS_DOWNLOAD_THREADS", "16"))
 # BLOB 다운로드 시 한 번에 읽어오는 크기
 BLOB_READ_SIZE = 1024 * 1024
+# 다운로드 하나가 보내기 전에 미리 읽어 메모리에 쌓아 두는 BLOB 조각 수 상한(조각당 BLOB_READ_SIZE).
+# 디스크 읽기가 전송을 기다리지 않고 연달아 이어지게 합니다. 메모리는 동시 다운로드 수 × 이 값 × 1MB까지 씁니다.
+READ_AHEAD_CHUNKS = int(os.environ.get("EBMS_READ_AHEAD_CHUNKS", "64"))
 # INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트
 PACKET_OVERHEAD = 1024 * 1024
 # 연결 풀에 남겨 둘 유휴 MySQL 연결 수 상한

@@ -456,3 +456,63 @@ def test_pre_chunk_is_metered(tmp_path, client, database):
     before = client.get("/api/me").json()["pre"]["used_bytes"]
     body = client.get("/api/pre/asset/0").content
     assert client.get("/api/me").json()["pre"]["used_bytes"] == before + len(body)
+
+
+def test_read_ahead_reads_before_consumer_asks():
+    """ReadAhead는 소비자가 꺼내기 전에 상한까지 미리 읽고, 순서대로 내려 줍니다."""
+    import threading
+    import time
+
+    from ebms_server.downloads import ReadAhead
+
+    read = []
+    third = threading.Event()
+
+    def source():
+        for i in range(5):
+            read.append(i)
+            if i == 2:
+                third.set()
+            yield bytes([i])
+
+    ahead = ReadAhead(source(), max_chunks=3)
+    assert third.wait(2)
+    time.sleep(0.05)
+    # 큐 3개 + 넣으려고 기다리는 1개까지만 읽습니다.
+    assert len(read) == 4
+    assert list(ahead) == [bytes([i]) for i in range(5)]
+
+
+def test_read_ahead_raises_source_error():
+    from ebms_server.downloads import ReadAhead
+
+    def source():
+        yield b"a"
+        raise RuntimeError("db down")
+
+    ahead = ReadAhead(source())
+    assert next(ahead) == b"a"
+    with pytest.raises(RuntimeError):
+        next(ahead)
+
+
+def test_read_ahead_close_stops_reading_and_closes_source():
+    import threading
+
+    from ebms_server.downloads import ReadAhead
+
+    closed = threading.Event()
+
+    def source():
+        try:
+            for i in range(1000):
+                yield bytes([i % 256])
+        finally:
+            closed.set()
+
+    ahead = ReadAhead(source(), max_chunks=2)
+    assert next(ahead) == b"\x00"
+    ahead.close()
+    assert closed.wait(2)
+    with pytest.raises(StopIteration):
+        next(ahead)
