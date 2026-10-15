@@ -17,6 +17,7 @@ API 버전 3에서 사전 청크(`/api/pre/assethash`, `/api/pre/asset/{chunk_id
 | GET | `/api/pre/chart/{chunk_id}` | 차트 청크 zip 다운로드 |
 | GET | `/api/pre/assethash` | 사전 청크별 SHA-256 목록 |
 | GET | `/api/pre/asset/{chunk_id}` | 사전 청크 zip 다운로드 |
+| GET | `/api/pre/sizes` | 차트·사전 청크별 SHA-256과 바이트 크기. `{"chart": {id: {"sha256", "size"}}, "asset": {…}}` |
 | GET | `/api/pre/tables` | 난이도표 목록과 사전 청크별 난이도표 태그 |
 | GET | `/api/pre/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |
 | GET | `/api/pre/manifest/{chunk_id}` | 곡 매니페스트 (JSON) |
