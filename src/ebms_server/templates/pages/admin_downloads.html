@@ -1,0 +1,44 @@
+{% extends "auth_base.html" %}
+
+{% block title %}다운로드 기록 - EBMS{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+        <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
+        <li class="breadcrumb-item active" aria-current="page">다운로드 기록</li>
+    </ol>
+</nav>
+<h1 class="h3 mb-4">다운로드 기록</h1>
+
+<form id="filter" class="row g-2 mb-2">
+    <div class="col-sm-5 col-md-4">
+        <input class="form-control form-control-sm" type="search" name="user" placeholder="닉네임, 계정 ID" aria-label="사용자">
+    </div>
+    <div class="col-sm-3 col-md-2">
+        <input class="form-control form-control-sm" type="number" min="0" step="1" name="song" placeholder="곡 번호" aria-label="곡 번호">
+    </div>
+    <div class="col-sm-4 col-md-3">
+        <select class="form-select form-select-sm" name="result" aria-label="결과">
+            <option value="">모든 결과</option>
+            {% for key, label in results.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="col-md-3 d-flex gap-2">
+        <button class="btn btn-sm btn-outline-secondary" type="button" id="refresh">새로 고침</button>
+    </div>
+</form>
+<p class="text-muted small" id="info">곡 플레이 다운로드(곡 zip) 요청을 최신순으로 보여줍니다.{% if retention_days > 0 %} {{ retention_days }}일이 지난 기록은 지워집니다.{% endif %}</p>
+
+<div class="table-responsive">
+    <table class="table table-sm small align-top">
+        <thead><tr><th class="w-11em">시각</th><th>사용자</th><th>곡</th><th class="w-11em">결과</th></tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+</div>
+<nav id="pager" aria-label="쪽"></nav>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='/js/pages/admin_downloads.js') }}"></script>
+{% endblock %}

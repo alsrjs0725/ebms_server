@@ -5,6 +5,7 @@
 - 곡 관리: 곡 검색·삭제(사용 중지)·복원, 곡 zip의 파일 구조 보기·파일 받기
 - 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 - 서버 로그 조회: 수준·로거·검색어 필터
+- 곡 다운로드 기록 조회: 사용자·곡·결과 필터
 
 사용자 정보를 보거나 바꾸면 audit.record로 관리자 접속기록을 남깁니다.
 """
@@ -20,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import audit, auth, constant, db, downloads, importer, logs, quota
+from . import audit, auth, constant, db, download_log, downloads, importer, logs, quota
 from .accounts import User
 from .templating import templates
 
@@ -272,6 +273,26 @@ def logs_page(
     )
 
 
+@router.get("/admin/downloads", response_class=HTMLResponse)
+def downloads_page(
+    request: Request,
+    session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
+):
+    if session is None:
+        return auth._login_redirect(request)
+    if not session[0].is_admin:
+        return _forbidden(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="pages/admin_downloads.html",
+        context={
+            "user": session[0],
+            "results": download_log.RESULTS,
+            "retention_days": constant.RETENTION_DOWNLOAD_LOG_DAYS,
+        },
+    )
+
+
 def _forbidden(request: Request):
     return auth._message(request, "권한 없음", "관리자만 볼 수 있는 페이지입니다.", 403, back="/account")
 
@@ -372,6 +393,25 @@ def refill(user_id: str, request: Request, admin: Annotated[User, Depends(web_ad
     quota.refill_tickets(user_id)
     audit.record(request, admin.id, "user.refill", user_id)
     return get_user_detail(user_id)
+
+
+@router.get("/api/admin/downloads")
+def list_downloads(
+    request: Request,
+    admin: Annotated[User, Depends(web_admin)],
+    user: str = "",
+    song: Annotated[int | None, Query(ge=0)] = None,
+    result: str = "",
+    page: Annotated[int, Query(ge=1)] = 1,
+):
+    if result and result not in download_log.RESULTS:
+        raise HTTPException(status_code=422, detail="unknown result")
+    data = download_log.search(user, song, result, page)
+    audit.record(
+        request, admin.id, "download.search", sorted({item["user_id"] for item in data["items"]}),
+        user=user, song=song if song is not None else "", result=result, page=page,
+    )
+    return data
 
 
 @router.get("/api/admin/songs")
