@@ -107,7 +107,7 @@ OAuth 앱의 리다이렉트 주소도 새 도메인(`https://ebms.example.com/a
 3단계의 `setup.sh` 대신 Nginx Proxy Manager(NPM) 컨테이너를 쓸 수 있습니다. 설정 내용은 같고 넣는 위치만 다릅니다(`deploy/proxy/npm/`). 1·2단계(Tailscale, 홈서버 env)와 도메인·Security List는 그대로 합니다.
 
 1. VM에 Docker를 설치하고 `deploy/proxy/npm/docker-compose.yml`을 VM의 폴더(예: `~/npm`)에 둡니다. 기존 NPM을 옮겨 온다면 기존 `data`, `letsencrypt` 폴더를 같은 폴더에 복사합니다.
-2. `deploy/proxy/npm/http_top.conf`를 `~/npm/data/nginx/custom/http_top.conf`로 복사합니다(캐시 크기는 `max_size`). 그다음 `docker compose up -d`로 띄웁니다.
+2. `deploy/proxy/npm/http_top.conf`를 `~/npm/data/nginx/custom/http_top.conf`로 복사하고 `<EBMS_ORIGIN_HOST>`를 홈서버 Tailscale IP로 바꿉니다(캐시 크기는 `max_size`). 홈서버 포트가 8000·8001이 아니면 `upstream`·`map`의 포트도 맞춥니다. 그다음 `docker compose up -d`로 띄웁니다.
 3. 컨테이너에서 홈서버에 닿는지 확인합니다: `docker compose exec npm curl -s http://100.64.0.10:8000/api/version`
 4. 관리 화면(`ssh -L 8181:127.0.0.1:81 ubuntu@<VM_IP>` 후 `http://localhost:8181`)에서 프록시 호스트를 만들거나 기존 것을 고칩니다.
    - **Details**: Domain `ebms.example.com`, Scheme `http`, Forward Hostname `100.64.0.10`, Port `8000`(stage는 `8001`). Block Common Exploits는 켜고, Cache Assets는 끕니다.
