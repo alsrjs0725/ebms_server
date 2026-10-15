@@ -79,12 +79,16 @@ def test_admin_search(tmp_path, client, monkeypatch):
     assert client.get("/api/admin/downloads", params={"result": "bogus"}).status_code == 422
 
 
+def test_retention_default_is_90_days():
+    assert constant.RETENTION_DOWNLOAD_LOG_DAYS == 90
+
+
 def test_retention_purges_old_rows(client, monkeypatch):
-    monkeypatch.setattr(constant, "RETENTION_DOWNLOAD_LOG_DAYS", 30)
+    monkeypatch.setattr(constant, "RETENTION_DOWNLOAD_LOG_DAYS", 90)
     key, user_id = client_login(client, monkeypatch)
     now = 1_800_000_000
     with db_module.connect() as con, con.cursor() as cur:
-        for song_id, at in ((1, now - 31 * retention.DAY), (2, now - 29 * retention.DAY)):
+        for song_id, at in ((1, now - 91 * retention.DAY), (2, now - 89 * retention.DAY)):
             cur.execute(
                 "INSERT INTO download_log (user_id, song_id, at, result) VALUES (%s, %s, %s, 'charged')",
                 (user_id, song_id, at),

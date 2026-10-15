@@ -3,7 +3,7 @@
 
 로그인한 사용자의 요청만 남깁니다(프록시의 캐시 채우기 요청 제외). 프록시 뒤에서는 /api/proxy/authz가,
 직접 받을 때는 /api/play/song이 남깁니다. 304(바뀐 것 없음)와 416(범위 오류)은 남기지 않습니다.
-보유기간은 constant.RETENTION_DOWNLOAD_LOG_DAYS(기본 30일)이고 정리 작업(retention)이 지웁니다.
+보유기간은 constant.RETENTION_DOWNLOAD_LOG_DAYS(기본 90일)이고 정리 작업(retention)이 지웁니다.
 """
 import logging
 import time

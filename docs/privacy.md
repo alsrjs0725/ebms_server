@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | 만료·해지된 로그인 세션(종류, 사용 시각) | `session` | 만료 또는 해지 후 **30일** | `EBMS_RETENTION_SESSION_DAYS` |
 | 곡별 다운로드 기록(마지막 차감 시각) | `download_grant` | 재차감 면제 기간(`grant_seconds`, 기본 30분)이 끝나면 **바로** | `EBMS_RETENTION_GRANT_DAYS` (0: 바로, -1: 지우지 않음) |
-| 곡 플레이 다운로드 기록(곡, 시각, 결과) | `download_log` | **30일** | `EBMS_RETENTION_DOWNLOAD_LOG_DAYS` (0: 지우지 않음) |
+| 곡 플레이 다운로드 기록(곡, 시각, 결과) | `download_log` | **90일** | `EBMS_RETENTION_DOWNLOAD_LOG_DAYS` (0: 지우지 않음) |
 | 월별 사전 다운로드 사용량 | `pre_usage` | 이번 달 포함 **12개월** | `EBMS_RETENTION_PRE_USAGE_MONTHS` |
 | 오래 쓰지 않은 계정 | `user`와 연결된 모든 행 | **지우지 않음**(기본 0) | `EBMS_RETENTION_INACTIVE_USER_DAYS` |
 | 클라이언트 로그인용 1회용 코드 | `auth_code` | 만료 후 1시간(새 코드를 만들 때 지움) | — |
