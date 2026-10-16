@@ -578,9 +578,11 @@ def get_stage(
     page: Annotated[int, Query(ge=1)] = 1,
     show: str = "",
     q: str = "",
+    sort: str = "",
 ):
-    """대기 묶음의 곡 한 쪽. show로 판정(new/add/ambiguous/unused)이나 changed·failed만 봅니다."""
-    return _stage_call(staging.get_stage, stage_id, page, show, q)
+    """대기 묶음의 곡 한 쪽. show로 판정(new/add/ambiguous/unused)이나 changed·failed만 보고,
+    sort=files_desc/files_asc면 파일 수로 정렬합니다."""
+    return _stage_call(staging.get_stage, stage_id, page, show, q, sort)
 
 
 class UnitTarget(BaseModel):

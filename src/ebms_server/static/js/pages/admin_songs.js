@@ -673,6 +673,7 @@ let stagePage = 1;
 const stageCard = document.getElementById("stage");
 const stageShow = document.getElementById("stage-show");
 const stageQ = document.getElementById("stage-q");
+const stageSort = document.getElementById("stage-sort");
 const SUGGESTION = {
     new: ["새 곡", "text-bg-success"],
     add: ["기존 곡에 추가", "text-bg-secondary"],
@@ -723,6 +724,7 @@ async function loadStages() {
 function openStage(id) {
     currentStage = { id };
     stageShow.value = "";
+    stageSort.value = "";
     stageQ.value = "";
     loadStage(1).then(() => stageCard.scrollIntoView({ behavior: "smooth", block: "nearest" }));
     loadStages();
@@ -730,7 +732,7 @@ function openStage(id) {
 
 async function loadStage(page = 1) {
     if (!currentStage) return;
-    const params = new URLSearchParams({ page, show: stageShow.value, q: stageQ.value.trim() });
+    const params = new URLSearchParams({ page, show: stageShow.value, q: stageQ.value.trim(), sort: stageSort.value });
     const res = await fetch(`/api/admin/import/stages/${currentStage.id}?${params}`);
     if (res.status === 404) { currentStage = null; stageCard.classList.add("d-none"); loadStages(); return; }
     if (!res.ok) { alert(await detail(res)); return; }
@@ -756,8 +758,61 @@ function songName(stage, id) {
     return folder === undefined ? `#${id}` : `#${id} ${folder}`;
 }
 
-// 대상 고르기: auto/new/skip, 곡 번호. inherit면 "곡 설정 따름"(null)도 있습니다.
-function targetControl(stage, value, onChange, { inherit = false, locked = false } = {}) {
+// 기존 곡 고르기: 폴더명·채보 파일명·번호로 검색하는 작은 목록. 검색어가 없으면 판정에 나온 곡(suggested)을 먼저 보여줍니다.
+function songPicker(stage, suggested, onPick) {
+    const box = document.createElement("div");
+    box.className = "w-100";
+    const input = document.createElement("input");
+    input.type = "search";
+    input.className = "form-control form-control-sm";
+    input.placeholder = "곡 검색(폴더명, 채보 파일명, 번호)";
+    input.setAttribute("aria-label", "넣을 곡 검색");
+    const list = document.createElement("div");
+    list.className = "list-group list-group-flush border rounded mt-1 overflow-auto";
+    list.style.maxHeight = "12rem";
+    const fill = (songs, empty) => {
+        list.replaceChildren();
+        for (const song of songs) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "list-group-item list-group-item-action py-1 small text-break";
+            btn.textContent = `#${song.id} ${song.folder || "(이름 없음)"}` + (song.charts !== undefined ? ` · 차트 ${song.charts}개` : "");
+            btn.addEventListener("click", () => onPick(song.id));
+            list.append(btn);
+        }
+        if (!songs.length) list.append(Object.assign(document.createElement("div"), { className: "list-group-item py-1 small text-muted", textContent: empty }));
+    };
+    const showSuggested = () => fill(
+        suggested.map((id) => ({ id, folder: stage.songs[String(id)] })),
+        "검색어를 입력하세요.",
+    );
+    let timer = null;
+    let seq = 0;
+    input.addEventListener("input", () => {
+        clearTimeout(timer);
+        const q = input.value.trim();
+        if (!q) { showSuggested(); return; }
+        timer = setTimeout(async () => {
+            const mine = ++seq;
+            const res = await fetch(`/api/admin/songs?${new URLSearchParams({ q, page: 1 })}`);
+            if (mine !== seq) return;  // 더 새 검색이 있으면 버립니다.
+            if (!res.ok) { fill([], "검색하지 못했습니다."); return; }
+            const data = await res.json();
+            fill(data.items, "찾는 곡이 없습니다.");
+        }, 250);
+    });
+    input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); list.querySelector("button")?.click(); }
+        if (e.key === "Escape") box.remove();
+    });
+    showSuggested();
+    box.append(input, list);
+    setTimeout(() => input.focus(), 0);
+    return box;
+}
+
+// 대상 고르기: auto/new/skip, 곡 번호. inherit면 "곡 설정 따름"(null)도 있습니다. suggested는 고를 때 먼저 보일 곡 번호.
+function targetControl(stage, value, onChange, { inherit = false, locked = false, suggested = [] } = {}) {
     const wrap = document.createElement("div");
     wrap.className = "d-flex gap-1 align-items-center flex-wrap";
     const select = document.createElement("select");
@@ -767,24 +822,27 @@ function targetControl(stage, value, onChange, { inherit = false, locked = false
     for (const [v, text] of options) select.append(new Option(text, v));
     const kind = value === null ? "inherit" : typeof value === "number" ? "song" : value;
     select.value = kind;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.min = "1";
-    input.placeholder = "곡 번호";
-    input.className = "form-control form-control-sm" + (kind === "song" ? "" : " d-none");
-    input.style.width = "7em";
-    input.disabled = locked;
-    if (typeof value === "number") input.value = value;
     const name = document.createElement("span");
     name.className = "text-muted text-break";
-    if (typeof value === "number") name.textContent = songName(stage, value).replace(/^#\d+ ?/, "");
+    if (typeof value === "number") name.textContent = songName(stage, value);
+    const change = document.createElement("button");
+    change.type = "button";
+    change.className = "btn btn-link btn-sm p-0" + (kind === "song" ? "" : " d-none");
+    change.textContent = "다른 곡 고르기";
+    change.disabled = locked;
+    let picker = null;
+    const openPicker = () => {
+        if (picker?.isConnected) { picker.querySelector("input").focus(); return; }
+        picker = songPicker(stage, suggested, (id) => { picker.remove(); onChange(id); });
+        wrap.append(picker);
+    };
+    change.addEventListener("click", openPicker);
     select.addEventListener("change", () => {
-        input.classList.toggle("d-none", select.value !== "song");
-        if (select.value === "song") { input.focus(); return; }
+        if (select.value === "song") { openPicker(); return; }
+        picker?.remove();
         onChange(select.value === "inherit" ? null : select.value);
     });
-    input.addEventListener("change", () => { if (Number(input.value) > 0) onChange(Number(input.value)); });
-    wrap.append(select, input, name);
+    wrap.append(select, name, change);
     return wrap;
 }
 
@@ -846,7 +904,8 @@ function unitRows(stage, unit, locked) {
         folder.append(warn);
     }
     const target = document.createElement("td");
-    target.append(targetControl(stage, unit.target, (v) => saveUnit(unit, v, null), { locked }));
+    const suggested = unit.suggestion?.songs || [];
+    target.append(targetControl(stage, unit.target, (v) => saveUnit(unit, v, null), { locked, suggested }));
     const sz = document.createElement("td");
     sz.className = "text-end text-nowrap";
     sz.textContent = `${size(unit.size)} · 파일 ${unit.files}개`;
@@ -866,7 +925,7 @@ function unitRows(stage, unit, locked) {
         const st = document.createElement("span");
         st.className = "text-muted";
         st.textContent = chartStatus(stage, chart);
-        li.append(name, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked }));
+        li.append(name, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked, suggested: chart.song_id ? [chart.song_id] : suggested }));
         ul.append(li);
     }
     td.append(ul);
@@ -876,6 +935,7 @@ function unitRows(stage, unit, locked) {
 }
 
 stageShow.addEventListener("change", () => loadStage(1));
+stageSort.addEventListener("change", () => loadStage(1));
 let stageQTimer = null;
 stageQ.addEventListener("input", () => { clearTimeout(stageQTimer); stageQTimer = setTimeout(() => loadStage(1), 300); });
 

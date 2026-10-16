@@ -15,7 +15,7 @@
   - 브라우저가 zip을 조각(처음 32MB, 프록시가 `413`을 주거나 연결을 끊으면 절반씩 줄여 최소 256KB)으로 나눠 `var/import/`에 이어 붙이므로, 앞단 프록시의 요청 크기 제한과 상관없이 수십 GB도 올릴 수 있습니다. 끊기면 받은 곳부터 다시 보냅니다.
   - 다 받으면 서버가 백그라운드에서 곡을 하나씩 검토 대기 묶음에 풀고 zip을 지웁니다. 디스크는 zip 크기 + 2GB가 필요하고(모자라면 시작할 때 `507`), 푼 곡은 commit하거나 폐기할 때까지 `var/staged/`에 남습니다. 진행 상황은 페이지의 **작업**에 보이며, 다 올린 뒤에는 페이지를 닫아도 됩니다. 작업 목록은 메모리에만 있어 재시작하면 비워지고, 재시작 시 `var/import/`의 남은 파일은 지웁니다.
   - **var/tmp 가져오기**는 곡 폴더를 묶음으로 옮기고(`var/tmp/`에서 사라짐), zip은 풀고 다 풀었으면 지웁니다.
-  - 검토 대기: 묶음(zip 하나, 또는 var/tmp 가져오기 한 번)마다 곡의 판정을 보여줍니다. 새 곡, 기존 곡에 추가(차트가 겹치는 곡), 여러 곡과 겹침, 사용 중지 곡과 겹침. 곡마다 넣을 곳을 **자동**(판정대로), **새 곡**, **기존 곡에 추가**(곡 번호), **제외** 중에서 고르고, 채보를 펼쳐 채보마다 따로 고를 수도 있습니다(기본은 곡 설정 따름).
+  - 검토 대기: 묶음(zip 하나, 또는 var/tmp 가져오기 한 번)마다 곡의 판정을 보여줍니다. 새 곡, 기존 곡에 추가(차트가 겹치는 곡), 여러 곡과 겹침, 사용 중지 곡과 겹침. 곡마다 넣을 곳을 **자동**(판정대로), **새 곡**, **기존 곡에 추가**(검색 목록에서 곡을 고름. 검색어가 없으면 판정에 나온 곡을 먼저 보여줌), **제외** 중에서 고르고, 채보를 펼쳐 채보마다 따로 고를 수도 있습니다(기본은 곡 설정 따름). 판정·폴더명으로 거르고, 넣은 순서나 파일 수 순으로 정렬해 볼 수 있습니다.
     - 새 곡으로 지정해도 이미 다른 곡에 있는 채보는 원래 곡에 둡니다. 채보가 모두 이미 등록돼 있으면 새 곡을 만들지 않고 실패로 남습니다.
     - 채보를 여러 곳으로 나누면 곳마다 그 채보, 그 채보가 가리키는(`#WAVxx`·`#BMPxx`·`#BANNER` 등) 파일, 어느 채보도 가리키지 않는 파일을 묶어 넣습니다.
     - 판정은 묶음을 만들 때와 commit 뒤에 다시 하고, **다시 판정**으로 지금 DB 기준으로 다시 할 수 있습니다. 묶음은 디스크(`var/staged/{묶음}/stage.json`)에 있어 재시작해도 남고, 풀거나 commit하던 중에 꺼졌으면 다시 시작할 때 검토할 수 있게 되돌립니다.
@@ -41,7 +41,7 @@
 | POST | `/api/admin/import/uploads/{id}/finish` | 다 받은 zip을 검토 대기 묶음에 푸는 작업을 시작 → 작업(`stage_id`). 덜 받았으면 `409` |
 | POST | `/api/admin/import/tmp` | `var/tmp/`의 곡 폴더와 zip을 검토 대기 묶음으로 옮기는 작업 시작(곡 폴더는 옮기고, 실패 없이 다 푼 zip은 지움). 이미 돌고 있으면 그 작업을 반환 → 작업(`stage_id`, 곡이 없으면 null) |
 | GET | `/api/admin/import/stages` | 검토 대기 묶음(최근 순). 각 항목 `{id, kind, name, status(staging/ready/committing), created_at, analyzed_at, error, units, charts, size, counts}`. `counts`는 판정별(`new`, `add`, `ambiguous`, `unused`)과 `changed`(대상을 바꾼 곡), `skip`, `failed` 곡 수 |
-| GET | `/api/admin/import/stages/{id}?page=&show=&q=` | 묶음 요약과 곡 한 쪽(50곡) `{..., items, total, page, pages, songs}`. `show`는 판정이나 `changed`·`failed`, `q`는 폴더명·채보 파일명. 곡마다 `{id, folder, files, size, target, charts, suggestion: {kind, songs, deleted}, result}`, 채보마다 `{path, size, sha256, target, song_id, deleted}`. `songs`는 화면에 나온 곡 번호의 폴더명 |
+| GET | `/api/admin/import/stages/{id}?page=&show=&q=&sort=` | 묶음 요약과 곡 한 쪽(50곡) `{..., items, total, page, pages, songs}`. `show`는 판정이나 `changed`·`failed`, `q`는 폴더명·채보 파일명, `sort`는 `files_desc`·`files_asc`(파일 수 많은/적은 순, 없으면 넣은 순서). 곡마다 `{id, folder, files, size, target, charts, suggestion: {kind, songs, deleted}, result}`, 채보마다 `{path, size, sha256, target, song_id, deleted}`. `songs`는 화면에 나온 곡 번호의 폴더명 |
 | PUT | `/api/admin/import/stages/{id}/units/{unit}` | 넣을 곳 지정. 본문 `{target, charts}`. `target`은 `"auto"`·`"new"`·`"skip"`·곡 번호, `charts`는 `{채보 경로: 같은 값 또는 null(곡 설정 따름)}`(빠진 채보는 그대로). 없는 곡 번호나 채보면 `400`, 작업 중이면 `409` |
 | POST | `/api/admin/import/stages/{id}/analyze` | 지금 DB 기준으로 판정을 다시 함 → 묶음 요약 |
 | POST | `/api/admin/import/stages/{id}/commit?slow=` | 지정한 대로 등록하는 작업 시작 → 작업(`kind: "commit"`). `slow`면 천천히. 작업 중이면 `409` |
