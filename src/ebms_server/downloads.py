@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from . import constant, proxy, quota
+from . import constant, download_log, proxy, quota
 from .accounts import User
 from .auth import current_user, optional_api_session
 from .db import BlobReader, Database
@@ -451,12 +451,24 @@ def play_song(song_id: int, request: Request, user: Annotated[User | None, Depen
             expect_sha256=request.headers.get(proxy.EXPECT_SHA256_HEADER),
         )
 
+    resumed = download_log.is_resume(request)
+
     def charge() -> None:
         try:
-            quota.charge_play(user.id, song_id)
+            charged = quota.charge_play(user.id, song_id)
         except quota.NoTicket as e:
+            download_log.record(user.id, song_id, "no_ticket", resumed)
             raise HTTPException(
                 status_code=429, detail="no download ticket", headers={"Retry-After": str(e.retry_after)}
             )
+        download_log.record(user.id, song_id, "charged" if charged else "free", resumed)
 
-    return blob_response(request, "song", song_id, f"{song_id}.zip", "song not found", user_id=user.id, before_send=charge)
+    try:
+        return blob_response(
+            request, "song", song_id, f"{song_id}.zip", "song not found", user_id=user.id, before_send=charge
+        )
+    except HTTPException as e:
+        result = download_log.failure_result(e.status_code, e.detail)
+        if result:
+            download_log.record(user.id, song_id, result, resumed)
+        raise

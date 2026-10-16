@@ -202,6 +202,24 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 곡 플레이 다운로드 기록(관리자 조회용, download_log.py). result는 download_log.RESULTS 중 하나,
+    # resumed는 이어받기(Range 시작이 0보다 큼) 요청입니다. 보유기간이 지나면 정리 작업(retention)이 지웁니다.
+    """
+        CREATE TABLE IF NOT EXISTS download_log(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id CHAR(36) NOT NULL,
+            song_id INT UNSIGNED NOT NULL,
+            at BIGINT UNSIGNED NOT NULL,
+            result VARCHAR(16) NOT NULL,
+            resumed TINYINT NOT NULL DEFAULT 0,
+
+            PRIMARY KEY (id),
+            INDEX download_log_user (user_id, at),
+            INDEX download_log_song (song_id, at),
+            INDEX download_log_at (at),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 월별 사전 다운로드 사용량(실제 전송한 바이트). month는 KST 기준 YYYY-MM입니다.
     """
         CREATE TABLE IF NOT EXISTS pre_usage(
