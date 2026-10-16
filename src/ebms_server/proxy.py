@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
-from . import auth, constant, quota
+from . import auth, constant, download_log, quota
 from .db import Database
 
 router = APIRouter()
@@ -108,7 +108,9 @@ def authorize(request: Request) -> Response:
     blob = Database().open_blob(table, row_id)
     if blob is None:
         if table == "song":
-            return _deny(*missing_song(row_id))
+            status, detail = missing_song(row_id)
+            download_log.record(user.id, row_id, download_log.failure_result(status, detail))
+            return _deny(status, detail)
         return _deny(404, "File not found")
     etag = f'"{blob.sha256}"'
     headers = {"X-Ebms-Sha256": blob.sha256, "X-Ebms-Limit-Rate": "0", "X-Ebms-User": user.id}
@@ -120,10 +122,13 @@ def authorize(request: Request) -> Response:
 
     if kind == "play":
         if nbytes:
+            resumed = download_log.is_resume(request)
             try:
-                quota.charge_play(user.id, row_id)
+                charged = quota.charge_play(user.id, row_id)
             except quota.NoTicket as e:
+                download_log.record(user.id, row_id, "no_ticket", resumed)
                 return _deny(429, "no download ticket", e.retry_after)
+            download_log.record(user.id, row_id, "charged" if charged else "free", resumed)
     else:
         # 프록시는 보낸 바이트를 알려주지 않으므로 요청한 만큼을 미리 더합니다.
         limits = quota.limits_for(user.id)

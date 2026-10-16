@@ -102,6 +102,8 @@ RETENTION_SESSION_DAYS = int(os.environ.get("EBMS_RETENTION_SESSION_DAYS", "30")
 RETENTION_GRANT_DAYS = int(os.environ.get("EBMS_RETENTION_GRANT_DAYS", "0"))
 # 월별 사전 다운로드 사용량(pre_usage)을 이번 달 포함 몇 달 남길지
 RETENTION_PRE_USAGE_MONTHS = int(os.environ.get("EBMS_RETENTION_PRE_USAGE_MONTHS", "12"))
+# 곡 플레이 다운로드 기록(download_log)을 남겨 두는 일수. 0이면 지우지 않습니다.
+RETENTION_DOWNLOAD_LOG_DAYS = int(os.environ.get("EBMS_RETENTION_DOWNLOAD_LOG_DAYS", "90"))
 # 마지막 로그인·세션 사용 뒤 이 일수가 지난 계정을 연결된 데이터와 함께 지웁니다(관리자 제외). 기본 0(지우지 않음).
 RETENTION_INACTIVE_USER_DAYS = int(os.environ.get("EBMS_RETENTION_INACTIVE_USER_DAYS", "0"))
 # 정리 작업 주기(시간). 서버가 시작할 때 한 번 돌고 이후 이 간격으로 돕니다. 0이면 정리 작업을 끕니다.

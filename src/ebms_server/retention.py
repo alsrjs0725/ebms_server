@@ -62,6 +62,17 @@ def purge_grants(cur, con, now: int, days: int) -> int:
     )
 
 
+def purge_download_log(cur, con, now: int, days: int) -> int:
+    """days일보다 오래된 곡 다운로드 기록을 지웁니다."""
+    cutoff = now - days * DAY
+    return _delete_rows(
+        cur, con,
+        "SELECT id FROM download_log WHERE at < %s",
+        (cutoff,),
+        "DELETE FROM download_log WHERE id = %s",
+    )
+
+
 def purge_pre_usage(cur, con, now: int, months: int) -> int:
     """이번 달을 포함한 최근 months달보다 오래된 월별 사용량을 지웁니다."""
     oldest_kept = _months_before(quota.current_month(now), months - 1)
@@ -122,6 +133,7 @@ def purge(now: int | None = None) -> dict[str, int]:
         ("sessions", purge_sessions, constant.RETENTION_SESSION_DAYS),
         ("download_grants", purge_grants, constant.RETENTION_GRANT_DAYS),
         ("pre_usage", purge_pre_usage, constant.RETENTION_PRE_USAGE_MONTHS),
+        ("download_log", purge_download_log, constant.RETENTION_DOWNLOAD_LOG_DAYS),
     ]
     result = {}
     with db.connect() as con, con.cursor() as cur:
