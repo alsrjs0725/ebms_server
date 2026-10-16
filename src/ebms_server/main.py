@@ -83,7 +83,7 @@ def backfill_pre_chunks() -> None:
         Database().backfill_chart_md5()
     except Exception:
         logging.getLogger(__name__).exception("backfill_chart_md5 failed")
-    # 검토 대기 곡의 비슷한 곡 후보는 차트의 이름·작곡가 키로 찾습니다. 다 채우기 전에는 새로 넣은 곡만 후보가 됩니다.
+    # 검토 대기 곡의 비슷한 곡 후보는 차트의 이름·작곡가·BPM·장르 키로 찾습니다. 다 채우기 전에는 새로 넣은 곡만 후보가 됩니다.
     try:
         Database().backfill_chart_meta()
     except Exception:

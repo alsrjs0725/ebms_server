@@ -674,6 +674,7 @@ const stageCard = document.getElementById("stage");
 const stageShow = document.getElementById("stage-show");
 const stageQ = document.getElementById("stage-q");
 const stageSort = document.getElementById("stage-sort");
+const FIELD = { title: "이름", artist: "작곡가", bpm: "BPM", genre: "장르" };
 const SUGGESTION = {
     new: ["새 곡", "text-bg-success"],
     add: ["기존 곡에 추가", "text-bg-secondary"],
@@ -860,16 +861,16 @@ function suggestionCell(stage, unit) {
     if (ids.length) {
         const div = document.createElement("div");
         div.className = "text-muted text-break";
-        div.textContent = s.kind === "unused" ? `사용 중지 #${s.deleted}` : ids.map((id) => songName(stage, id)).join(", ");
+        div.textContent = s.kind === "unused" ? `사용 중지 #${s.deleted}`
+            : s.kind === "similar" ? ids.map((id) => `${songName(stage, id)} (${s.matches[String(id)].map((f) => FIELD[f]).join("·")})`).join(", ")
+            : ids.map((id) => songName(stage, id)).join(", ");
         td.append(div);
     }
     if (s.kind === "similar") {
-        // 겹치는 채보는 없고 이름(·작곡가)이 같은 곡만 있을 때 "자동"이 하는 일
+        // 겹치는 채보는 없고 이름·작곡가·BPM·장르 중 2개 이상 같은 곡만 있을 때 "자동"이 하는 일
         const div = document.createElement("div");
         div.className = "small";
-        if (s.merge) div.textContent = `자동: ${songName(stage, s.merge)}에 추가 (이름·작곡가 일치)`;
-        else if (unit.files > stage.merge_max_files) div.textContent = `자동: 새 곡 (파일 ${stage.merge_max_files}개 초과)`;
-        else div.textContent = "자동: 새 곡 (이름·작곡가가 다 같은 곡이 하나가 아님)";
+        div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 많이 겹침)` : "자동: 새 곡 (가장 많이 겹치는 곡이 여럿)";
         td.append(div);
     }
     return td;
@@ -938,7 +939,7 @@ function unitRows(stage, unit, locked) {
         st.textContent = chartStatus(stage, chart);
         const meta = document.createElement("span");
         meta.className = "small text-break";
-        meta.textContent = [chart.title, chart.artist].filter(Boolean).join(" / ");
+        meta.textContent = [chart.title, chart.artist, chart.bpm && `BPM ${chart.bpm}`, chart.genre].filter(Boolean).join(" / ");
         li.append(name, meta, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked, suggested: chart.song_id ? [chart.song_id] : suggested }));
         ul.append(li);
     }

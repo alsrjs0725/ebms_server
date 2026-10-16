@@ -6,8 +6,9 @@
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
-- 겹치는 차트가 없으면 차트의 #TITLE·#ARTIST로 이름(과 작곡가)이 같은 기존 곡을 찾아 비슷한 곡(similar)으로 판정합니다.
-  이름·작곡가가 모두 같은 곡이 하나이고 파일이 STAGE_MERGE_MAX_FILES개 이하면 auto는 그 곡에 추가하고, 아니면 새 곡입니다.
+- 파일이 SIMILAR_FILES개 미만인 곡(차분·추가 채보로 보이는 곡)은 겹치는 차트가 없으면 #TITLE·#ARTIST·#BPM·#GENRE 중
+  2개 이상 같은 기존 곡을 비슷한 곡(similar) 후보로 찾고, 가장 많이 겹치는 곡이 하나면 auto는 그 곡에 추가합니다.
+  파일이 그보다 많은 곡은 겹치는 차트로만 판정합니다.
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 """
 import hashlib
@@ -23,7 +24,7 @@ import uuid
 import zipfile
 
 from . import constant, db, importer
-from .db import Database, _chart_refs, chart_files, chart_meta, title_key, artist_key
+from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,12 @@ SAVE_INTERVAL = 2.0
 # 검토 화면 한 쪽의 곡 수
 UNITS_PER_PAGE = 50
 # 판정(suggestion.kind): new 새 곡, add 기존 곡에 추가, ambiguous 기존 곡 여러 개와 겹침, unused 사용 중지한 곡과 겹침,
-# similar 겹치는 차트는 없지만 이름이 같은 기존 곡이 있음
+# similar 겹치는 차트는 없지만 이름·작곡가·BPM·장르 중 2개 이상 같은 기존 곡이 있음
 SUGGESTIONS = ("new", "add", "ambiguous", "unused", "similar")
-# 비슷한 곡(이름·작곡가가 같은 곡이 하나)에 auto로 추가하는 곡의 최대 파일 수. 이보다 많으면 따로 낸 곡일 가능성이 커 새 곡으로 둡니다.
-STAGE_MERGE_MAX_FILES = 50
+# 파일이 이 수 미만인 곡만 비슷한 곡을 찾습니다. 키음·BGA까지 다 든 곡은 보통 이보다 많고, 적으면 기존 곡의 추가 채보입니다.
+SIMILAR_FILES = 50
+# 비슷한 곡이 되려면 같아야 하는 항목(META_HEADERS) 수
+SIMILAR_MIN_FIELDS = 2
 # 비슷한 곡 후보 최대 수
 SIMILAR_LIMIT = 10
 
@@ -126,8 +129,9 @@ def recover() -> None:
 # ---- 곡 분석 ----
 
 def _set_meta(chart: dict, content: bytes) -> None:
-    chart["title"], chart["artist"] = chart_meta(content)
-    chart["title_key"], chart["artist_key"] = title_key(chart["title"]), artist_key(chart["artist"])
+    meta = chart_meta(content)
+    chart.update(meta)
+    chart["keys"] = meta_keys(meta)
 
 
 def _chart_info(path: pathlib.Path, root: pathlib.Path) -> dict:
@@ -157,36 +161,58 @@ def _make_unit(unit_id: str, song_dir: pathlib.Path, folder: str) -> dict:
     }
 
 
-def _similar(cur, unit: dict) -> tuple[list[int], int | None]:
-    """겹치는 차트가 없는 곡과 이름이 같은 기존 곡 (후보 곡 번호(이름·작곡가가 다 같은 곡 먼저), auto로 추가할 곡 번호)."""
-    titles = sorted({chart["title_key"] for chart in unit["charts"] if chart.get("title_key")})
-    if not titles:
-        return [], None
-    artists = {chart["artist_key"] for chart in unit["charts"] if chart.get("artist_key")}
-    marks = ", ".join(["%s"] * len(titles))
+def _similar(cur, unit: dict) -> tuple[list[int], dict[str, list[str]], int | None]:
+    """파일이 적고 겹치는 차트가 없는 곡과 META_HEADERS 중 SIMILAR_MIN_FIELDS개 이상 같은 기존 곡.
+    (후보 곡 번호(많이 겹치는 순), {곡 번호: 같은 항목}, auto로 추가할 곡 번호(가장 많이 겹치는 곡이 하나일 때))."""
+    if unit["files"] >= SIMILAR_FILES:
+        return [], {}, None
+    mine = {field: {chart["keys"][field] for chart in unit["charts"] if chart["keys"].get(field)} for field in META_HEADERS}
+    # 후보: 이름이나 작곡가가 같거나, BPM과 장르가 같은 차트의 곡. 두 항목이 같으려면 이 중 하나는 맞아야 합니다.
+    where, args = [], []
+    for field in ("title", "artist"):
+        if mine[field]:
+            where.append(f"{field}_key IN ({', '.join(['%s'] * len(mine[field]))})")
+            args.extend(sorted(mine[field]))
+    for bpm in sorted(mine["bpm"]):
+        for genre in sorted(mine["genre"]):
+            where.append("(bpm_key = %s AND genre_key = %s)")
+            args.extend((bpm, genre))
+    if not where:
+        return [], {}, None
+    cur.execute(f"SELECT DISTINCT song_id FROM chart WHERE song_id IS NOT NULL AND ({' OR '.join(where)})", tuple(args))
+    ids = sorted(row[0] for row in cur.fetchall())
+    if not ids:
+        return [], {}, None
     cur.execute(
-        f"SELECT DISTINCT song_id, artist_key FROM chart WHERE title_key IN ({marks}) AND song_id IS NOT NULL",
-        tuple(titles),
+        f"SELECT song_id, title_key, artist_key, bpm_key, genre_key FROM chart WHERE song_id IN ({', '.join(['%s'] * len(ids))})",
+        tuple(ids),
     )
-    strong: set[int] = set()
-    weak: set[int] = set()
-    for song_id, artist in cur.fetchall():
-        (strong if artist and artist in artists else weak).add(song_id)
-    weak -= strong
-    songs = (sorted(strong) + sorted(weak))[:SIMILAR_LIMIT]
-    merge = next(iter(strong)) if len(strong) == 1 and unit["files"] <= STAGE_MERGE_MAX_FILES else None
-    return songs, merge
+    theirs: dict[int, dict[str, set[str]]] = {}
+    for song_id, *keys in cur.fetchall():
+        song = theirs.setdefault(song_id, {field: set() for field in META_HEADERS})
+        for field, key in zip(META_HEADERS, keys):
+            if key:
+                song[field].add(key)
+    matches = {}
+    for song_id, song in theirs.items():
+        same = [field for field in META_HEADERS if mine[field] & song[field]]
+        if len(same) >= SIMILAR_MIN_FIELDS:
+            matches[song_id] = same
+    songs = sorted(matches, key=lambda i: (-len(matches[i]), i))[:SIMILAR_LIMIT]
+    top = [i for i in songs if len(matches[i]) == len(matches[songs[0]])] if songs else []
+    merge = top[0] if len(top) == 1 else None
+    return songs, {str(i): matches[i] for i in songs}, merge
 
 
 def _fill_meta(stage: dict, unit: dict) -> None:
-    """이름·작곡가를 읽기 전 버전에서 넣은 곡의 차트를 읽어 채웁니다."""
+    """헤더를 읽기 전 버전에서 넣은 곡의 차트를 읽어 채웁니다."""
     for chart in unit["charts"]:
-        if "title_key" in chart:
+        if "keys" in chart:
             continue
         try:
             _set_meta(chart, (_unit_dir(stage, unit) / chart["path"]).read_bytes())
         except OSError:
-            chart.update(title="", artist="", title_key="", artist_key="")
+            chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS})
 
 
 def _analyze(stage: dict) -> None:
@@ -214,17 +240,17 @@ def _analyze(stage: dict) -> None:
                 if chart["song_id"] is not None and chart["song_id"] not in songs:
                     songs.append(chart["song_id"])
             songs.sort()
-            merge = None
+            merge, matches = None, {}
             if deleted is not None:
                 kind = "unused"
             elif not songs:
-                songs, merge = _similar(cur, unit)
+                songs, matches, merge = _similar(cur, unit)
                 kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge}
+            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches}
 
 
 def analyze(stage_id: str) -> dict:
@@ -458,7 +484,7 @@ def _matches(unit: dict, show: str, q: str) -> bool:
         return False
     if q:
         text = "\n".join(
-            [unit["folder"], *(f"{c['path']}\n{c.get('title', '')}\n{c.get('artist', '')}" for c in unit["charts"])]
+            [unit["folder"], *(f"{c['path']}\n{c.get('title', '')}\n{c.get('artist', '')}\n{c.get('genre', '')}" for c in unit["charts"])]
         ).lower()
         if q.lower() not in text:
             return False
@@ -505,7 +531,7 @@ def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: s
         total=len(units),
         items=items,
         songs={str(k): v for k, v in folders.items()},
-        merge_max_files=STAGE_MERGE_MAX_FILES,
+        similar_files=SIMILAR_FILES,
     )
     return result
 
