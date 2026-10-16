@@ -46,8 +46,29 @@ def wait(client, job):
     raise AssertionError("job did not finish")
 
 
+def commit(client, job, slow=False):
+    """대기 묶음에 넣은 작업(job)의 묶음을 그대로(자동 판정) commit하고 결과를 반환합니다. 묶음이 없으면 job 그대로."""
+    if job["status"] != "done" or not job["stage_id"]:
+        return job
+    r = client.post(f"/api/admin/import/stages/{job['stage_id']}/commit", params={"slow": slow})
+    assert r.status_code == 200, r.text
+    return wait(client, r.json())
+
+
+def import_tmp(client, slow=False):
+    """var/tmp를 대기 묶음으로 옮기고 그대로 commit한 결과."""
+    r = client.post("/api/admin/import/tmp")
+    assert r.status_code == 200, r.text
+    return commit(client, wait(client, r.json()), slow)
+
+
 def upload(client, name, data, chunk=100):
-    """조각으로 올리고 작업이 끝날 때까지 기다린 결과를 반환합니다."""
+    """조각으로 올려 대기 묶음에 넣고, 그대로 commit한 결과를 반환합니다."""
+    return commit(client, stage(client, name, data, chunk))
+
+
+def stage(client, name, data, chunk=100):
+    """조각으로 올리고 대기 묶음에 넣는 작업이 끝날 때까지 기다린 결과를 반환합니다."""
     r = client.post("/api/admin/import/uploads", json={"filename": name, "size": len(data)})
     assert r.status_code == 200, r.text
     upload_id = r.json()["id"]
@@ -118,7 +139,12 @@ def test_import_zip(client, monkeypatch):
     # 받은 zip과 임시 폴더는 남기지 않습니다.
     assert not any(constant.IMPORT_DIR.iterdir())
     # 최근 작업부터 보여줍니다.
-    assert [j["name"] for j in client.get("/api/admin/import/jobs").json()][:4] == ["empty.zip", "bad.zip", "multi.zip", "flat.zip"]
+    # commit한 묶음은 지웁니다.
+    assert client.get("/api/admin/import/stages").json() == []
+    # 최근 작업부터 보여줍니다(올린 zip을 푸는 작업과 commit 작업).
+    jobs = client.get("/api/admin/import/jobs").json()
+    assert [j["name"] for j in jobs if j["kind"] == "zip"] == ["empty.zip", "bad.zip", "multi.zip", "flat.zip"]
+    assert [j["name"] for j in jobs if j["kind"] == "commit"] == ["multi.zip", "flat.zip"]
 
 
 def test_upload_chunks(client, monkeypatch):
@@ -149,13 +175,11 @@ def test_import_tmp(client, monkeypatch):
     (song / "a.bms").write_bytes(b"#TITLE T\n")
     (constant.TMP_DIR / "loose.bms").write_bytes(b"#LOOSE\n")  # var/tmp 바로 아래 파일은 보지 않습니다.
 
-    r = client.post("/api/admin/import/tmp")
-    assert r.status_code == 200
-    job = wait(client, r.json())
+    job = import_tmp(client)
     assert job["songs"] == [{"folder": "group/s1", "song_id": 1, "new_song": True, "charts": 1, "new_charts": 1}]
     assert not song.exists()
     assert (constant.TMP_DIR / "loose.bms").exists()
-    assert wait(client, client.post("/api/admin/import/tmp").json())["songs"] == []
+    assert import_tmp(client)["songs"] == []
 
 
 def test_import_tmp_zip(client, monkeypatch):
@@ -164,11 +188,12 @@ def test_import_tmp_zip(client, monkeypatch):
     (constant.TMP_DIR / "pack.zip").write_bytes(make_zip({"p/s1/a.bms": b"#TITLE 1\n", "p/s2/b.bms": b"#TITLE 2\n"}))
     (constant.TMP_DIR / "copying.zip").write_bytes(b"PK\x03\x04partial")  # 아직 복사 중인 zip
 
-    job = wait(client, client.post("/api/admin/import/tmp").json())
-    assert job["status"] == "done" and job["total"] == 2
-    assert [s["folder"] for s in job["songs"]] == ["copying.zip", "pack/p/s1", "pack/p/s2"]
-    assert job["songs"][0]["error"]
-    assert job["songs"][1]["new_song"] and job["songs"][2]["new_song"]
+    staged = wait(client, client.post("/api/admin/import/tmp").json())
+    assert staged["status"] == "done" and staged["total"] == 2
+    assert [s["folder"] for s in staged["songs"]] == ["copying.zip", "pack/p/s1", "pack/p/s2"]
+    assert staged["songs"][0]["error"]
+    job = commit(client, staged)
+    assert [s["new_song"] for s in job["songs"]] == [True, True]
     # 다 등록한 zip은 지우고, 읽지 못한 zip은 남깁니다.
     assert not (constant.TMP_DIR / "pack.zip").exists()
     assert (constant.TMP_DIR / "copying.zip").exists()
@@ -207,7 +232,7 @@ def test_import_tmp_skips_symlinks(client, monkeypatch, tmp_path):
     os.symlink(outside / "song", constant.TMP_DIR / "linked")
     os.symlink(outside / "secret.txt", constant.TMP_DIR / "linked.zip")
 
-    job = wait(client, client.post("/api/admin/import/tmp").json())
+    job = import_tmp(client)
     assert job["songs"] == [{"folder": "group/s1", "song_id": 1, "new_song": True, "charts": 1, "new_charts": 1}]
     with zipfile.ZipFile(io.BytesIO(db_module.Database().get_song_data(1))) as zf:
         assert sorted(zf.namelist()) == ["a.bms", "real.wav"]
@@ -248,7 +273,7 @@ def test_import_tmp_slow(client, monkeypatch):
         song.mkdir(parents=True)
         (song / "a.bms").write_bytes(f"#TITLE {i}\n".encode())
 
-    job = wait(client, client.post("/api/admin/import/tmp", params={"slow": True}).json())
+    job = import_tmp(client, slow=True)
     assert job["status"] == "done" and job["slow"]
     assert [s["new_song"] for s in job["songs"]] == [True, True, True]
     # 곡마다 커밋해 쓰기 잠금을 놓은 뒤 쉽니다.

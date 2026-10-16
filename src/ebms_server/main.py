@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, proxy, retention, tables
+from . import admin, audit, auth, constant, downloads, home, notices, policies, proxy, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -150,9 +150,10 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     # 이전 실행에서 임포트 도중 꺼졌다면 남은 임시 폴더를 지운다
     shutil.rmtree(constant.IMPORT_DIR, ignore_errors=True)
-    # var/tmp 임포트는 큰 zip이 있으면 오래 걸리므로 백그라운드로 돌려 시작(헬스체크)을 막지 않는다.
-    # var를 빈 호스트 폴더로 마운트하면 tmp가 없으므로 import_tmp가 만들어 둔다
-    importer.start_tmp_job()
+    # 대기 묶음을 풀거나 commit하던 중에 꺼졌다면 다시 검토할 수 있게 되돌린다
+    staging.recover()
+    # var/tmp는 서버 시작 시 가져오지 않는다(관리자가 "var/tmp 가져오기"를 누를 때만). 폴더만 만들어 둔다
+    constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
     # 보유기간이 지난 개인정보(세션·다운로드 기록·월 사용량 등)를 주기적으로 지운다(docs/privacy.md)
     retention_stop = retention.start()
     # 등록한 난이도표를 주기적으로 다시 읽는다(새로 실린 곡)

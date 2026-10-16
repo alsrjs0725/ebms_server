@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import audit, auth, constant, db, download_log, downloads, importer, logs, quota
+from . import audit, auth, constant, db, download_log, downloads, importer, logs, quota, staging
 from .accounts import User
 from .templating import templates
 
@@ -545,17 +545,75 @@ def cancel_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 
 @router.post("/api/admin/import/uploads/{upload_id}/finish")
-def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)], slow: bool = False):
-    """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다. slow면 천천히(서비스에 디스크를 양보하며) 진행합니다."""
-    job = _upload_call(importer.finish_upload, upload_id, slow)
+def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """다 받은 zip을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 등록은 검토 뒤 commit할 때 합니다."""
+    job = _upload_call(importer.finish_upload, upload_id)
     logger.info(f"import job {job.id} by {admin.id}: {job.name}")
     return job.json()
 
 
 @router.post("/api/admin/import/tmp")
-def import_tmp(admin: Annotated[User, Depends(web_admin)], slow: bool = False):
-    """`var/tmp/` 아래 곡을 등록하는 작업을 백그라운드로 시작합니다(등록한 곡 폴더는 지움). slow면 천천히 진행합니다."""
-    return importer.start_tmp_job(slow).json()
+def import_tmp(admin: Annotated[User, Depends(web_admin)]):
+    """`var/tmp/` 아래 곡을 대기 묶음으로 옮기는 작업을 백그라운드로 시작합니다."""
+    return importer.start_tmp_job().json()
+
+
+def _stage_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except staging.StageError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+@router.get("/api/admin/import/stages")
+def list_stages(admin: Annotated[User, Depends(web_admin)]):
+    """대기 묶음 목록(최근 순)."""
+    return staging.list_stages()
+
+
+@router.get("/api/admin/import/stages/{stage_id}")
+def get_stage(
+    stage_id: str,
+    admin: Annotated[User, Depends(web_admin)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    show: str = "",
+    q: str = "",
+):
+    """대기 묶음의 곡 한 쪽. show로 판정(new/add/ambiguous/unused)이나 changed·failed만 봅니다."""
+    return _stage_call(staging.get_stage, stage_id, page, show, q)
+
+
+class UnitTarget(BaseModel):
+    target: str | int
+    charts: dict[str, str | int | None] | None = None
+
+
+@router.put("/api/admin/import/stages/{stage_id}/units/{unit_id}")
+def set_unit_target(stage_id: str, unit_id: str, body: UnitTarget, admin: Annotated[User, Depends(web_admin)]):
+    """곡의 대상(auto/new/skip/곡 번호)과 차트별 대상(null이면 곡의 대상)을 바꿉니다."""
+    return _stage_call(staging.set_target, stage_id, unit_id, body.target, body.charts)
+
+
+@router.post("/api/admin/import/stages/{stage_id}/analyze")
+def analyze_stage(stage_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """지금 DB 기준으로 판정을 다시 합니다."""
+    return _stage_call(staging.analyze, stage_id)
+
+
+@router.post("/api/admin/import/stages/{stage_id}/commit")
+def commit_stage(stage_id: str, admin: Annotated[User, Depends(web_admin)], slow: bool = False):
+    """대기 묶음을 지정한 대상대로 등록하는 작업을 시작합니다. slow면 천천히(서비스에 디스크를 양보하며) 진행합니다."""
+    job = _stage_call(staging.start_commit, stage_id, slow)
+    logger.info(f"import commit {job.id} by {admin.id}: stage {stage_id} {job.name}")
+    return job.json()
+
+
+@router.delete("/api/admin/import/stages/{stage_id}")
+def discard_stage(stage_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """대기 묶음을 버립니다(풀어 둔 파일 삭제)."""
+    _stage_call(staging.discard, stage_id)
+    logger.info(f"import stage {stage_id} discarded by {admin.id}")
+    return {"ok": True}
 
 
 @router.get("/api/admin/import/jobs")

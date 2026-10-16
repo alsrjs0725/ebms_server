@@ -152,6 +152,7 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     monkeypatch.setattr(constant, "TMP_DIR", tmp_path / "var_tmp")
     constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(constant, "UNUSED_DIR", tmp_path / "var_unused")
+    monkeypatch.setattr(constant, "STAGED_DIR", tmp_path / "var_staged")
     original_connect = db_module.connect
     try:
         con = original_connect(database=None)

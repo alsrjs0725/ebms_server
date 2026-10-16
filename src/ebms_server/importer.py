@@ -1,8 +1,10 @@
 """곡 임포트. 폴더 트리에서 차트 파일이 있는 폴더를 곡 하나로 보고 DB에 등록합니다.
 
-- 서버 시작 시와 관리자 페이지의 "var/tmp 가져오기"는 `var/tmp/`의 곡 폴더와 zip을 등록하고, 등록한 것은 지웁니다.
+- 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip을 대기 묶음(staging.py)으로 옮깁니다.
 - 관리자 페이지는 zip을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
-  다 받으면 백그라운드 작업으로 곡을 하나씩 풀어 등록합니다. 작업 상태는 메모리에만 둡니다.
+  다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
+  작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음).
+- import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
 - 작업을 "천천히"(Job.slow)로 돌리면 작은 배치로 커밋하고 커밋마다 쉬어 서비스(다운로드·DB 응답)에 디스크를 양보합니다.
   돌고 있는 작업도 바꿀 수 있습니다.
 """
@@ -52,6 +54,8 @@ class Job:
         self.kind = kind
         self.name = name
         self.status = "running"  # running / done / failed
+        # 대기 묶음(staging)을 만들거나 commit하는 작업이면 그 묶음
+        self.stage_id: str | None = None
         self.total: int | None = None
         self.songs: list[dict] = []
         self.error: str | None = None
@@ -104,6 +108,7 @@ class Job:
             "started_at": self.started_at,
             "slow": self._slow,
             "resting": self.resting_until is not None,
+            "stage_id": self.stage_id,
         }
 
 
@@ -113,11 +118,11 @@ def _add(batch, job: Job, song_dir: pathlib.Path, folder: str, remove: bool) -> 
     job.rest(batch)
 
 
-def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool) -> dict:
-    """곡 하나를 배치에 넣고 결과를 반환합니다. 실패해도 예외를 내지 않습니다.
+def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool, target: str | int | None = None) -> dict:
+    """곡 하나를 배치에 넣고 결과를 반환합니다. 실패해도 예외를 내지 않습니다. target은 SongBatch.add와 같습니다.
     반환한 결과는 나중에 배치 커밋이 실패하면 "error"가 채워집니다."""
     try:
-        info = batch.add(song_dir, remove=remove)
+        info = batch.add(song_dir, remove=remove, target=target)
     except AmbiguousSongError as e:
         logger.warning(f"import skipped[{song_dir}]: {e}")
         return {"folder": folder, "error": str(e)}
@@ -312,19 +317,20 @@ def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
     return {"id": upload_id, "received": received + len(data), "size": upload["size"]}
 
 
-def finish_upload(upload_id: str, slow: bool = False) -> Job:
-    """다 받은 zip의 임포트 작업을 백그라운드로 시작합니다. 작업이 끝나면 zip을 지웁니다."""
+def finish_upload(upload_id: str) -> Job:
+    """다 받은 zip을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 zip을 지웁니다."""
     upload = _upload(upload_id)
     received = upload["path"].stat().st_size
     if received != upload["size"]:
         raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
     with _lock:
         _uploads.pop(upload_id, None)
-    job = Job("zip", upload["filename"], slow)
+    job = Job("zip", upload["filename"])
 
     def run():
+        from . import staging
         try:
-            import_zip(upload["path"], upload["filename"], job)
+            staging.stage_zip(upload["path"], upload["filename"], job)
         finally:
             upload["path"].unlink(missing_ok=True)
 
@@ -338,14 +344,15 @@ def cancel_upload(upload_id: str) -> None:
         upload["path"].unlink(missing_ok=True)
 
 
-def start_tmp_job(slow: bool = False) -> Job:
-    """var/tmp 임포트를 시작합니다. 이미 돌고 있으면 그 작업을 반환합니다(같은 파일을 두 번 처리하지 않도록)."""
+def start_tmp_job() -> Job:
+    """var/tmp를 대기 묶음으로 옮기는 작업을 시작합니다. 이미 돌고 있으면 그 작업을 반환합니다(같은 파일을 두 번 처리하지 않도록)."""
+    from . import staging
     with _lock:
         running = next((j for j in _jobs.values() if j.kind == "tmp" and j.status == "running"), None)
     if running is not None:
         return running
-    job = Job("tmp", "var/tmp", slow)
-    return _start(job, lambda: import_tmp(job))
+    job = Job("tmp", "var/tmp")
+    return _start(job, lambda: staging.stage_tmp(job))
 
 
 def _start(job: Job, run) -> Job:
