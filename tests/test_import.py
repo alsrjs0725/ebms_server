@@ -307,3 +307,16 @@ def test_set_job_speed(client, monkeypatch):
     assert r.status_code == 200 and r.json()["slow"]
     assert job.slow
     assert client.put("/api/admin/import/jobs/nope/speed", json={"slow": True}).status_code == 404
+
+
+def test_static_urls_are_versioned(client, monkeypatch):
+    """스크립트 주소에 내용 해시가 붙어, 서버를 업데이트하면 브라우저가 예전 스크립트를 캐시에서 쓰지 않습니다."""
+    import hashlib
+    import re
+    from ebms_server.templating import STATIC_DIR
+
+    admin_login(client, monkeypatch)
+    html = client.get("/admin/import").text
+    version = hashlib.sha256((STATIC_DIR / "js/pages/admin_songs.js").read_bytes()).hexdigest()[:12]
+    assert f"/static/js/pages/admin_songs.js?v={version}" in html
+    assert not re.search(r'src="[^"]*/static/[^"?]*"', html)

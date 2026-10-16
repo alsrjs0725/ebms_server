@@ -6,16 +6,16 @@
         <meta name="description" content="" />
         <meta name="author" content="" />
         <title>{% block title %}Scrolling Nav - Start Bootstrap Template{% endblock %}</title>
-        <link rel="icon" type="image/x-icon" href="{{ url_for('static', path='/assets/favicon.ico') }}" />
-        <link rel="stylesheet" href="{{ url_for('static', path='/css/styles.css') }}" />
-        <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}" />
+        <link rel="icon" type="image/x-icon" href="{{ static_url('/assets/favicon.ico') }}" />
+        <link rel="stylesheet" href="{{ static_url('/css/styles.css') }}" />
+        <link rel="stylesheet" href="{{ static_url('/css/app.css') }}" />
         {% block head %}{% endblock %}
     </head>
     <body id="page-top">
         {% block body %}{% endblock %}
         {#- CDN 대신 static에 둡니다(CDN 오염·방문자 IP 전달 방지). npm bootstrap@5.2.3 dist 그대로이고 integrity는 공식 SRI와 같습니다. -#}
-        <script src="{{ url_for('static', path='/vendor/bootstrap/bootstrap.bundle.min.js') }}" integrity="sha384-kenU1KFdBIe4zVF0s0G1M5b4hcpxyD9F7jL+jjXkk+Q2h455rYXK/7HAuoJl+0I4"></script>
-        <script src="{{ url_for('static', path='/js/scripts.js') }}"></script>
+        <script src="{{ static_url('/vendor/bootstrap/bootstrap.bundle.min.js') }}" integrity="sha384-kenU1KFdBIe4zVF0s0G1M5b4hcpxyD9F7jL+jjXkk+Q2h455rYXK/7HAuoJl+0I4"></script>
+        <script src="{{ static_url('/js/scripts.js') }}"></script>
         {% block scripts %}{% endblock %}
     </body>
 </html>
