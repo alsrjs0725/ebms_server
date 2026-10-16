@@ -580,7 +580,7 @@ def get_stage(
     q: str = "",
     sort: str = "",
 ):
-    """대기 묶음의 곡 한 쪽. show로 판정(new/add/ambiguous/unused)이나 changed·failed만 보고,
+    """대기 묶음의 곡 한 쪽. show로 판정(new/add/ambiguous/unused/similar)이나 changed·failed만 보고,
     sort=files_desc/files_asc면 파일 수로 정렬합니다."""
     return _stage_call(staging.get_stage, stage_id, page, show, q, sort)
 
@@ -594,6 +594,12 @@ class UnitTarget(BaseModel):
 def set_unit_target(stage_id: str, unit_id: str, body: UnitTarget, admin: Annotated[User, Depends(web_admin)]):
     """곡의 대상(auto/new/skip/곡 번호)과 차트별 대상(null이면 곡의 대상)을 바꿉니다."""
     return _stage_call(staging.set_target, stage_id, unit_id, body.target, body.charts)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/files")
+def unit_files(stage_id: str, unit_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """곡에서 차트가 아닌 파일 목록 [{path, size}]."""
+    return _stage_call(staging.unit_files, stage_id, unit_id)
 
 
 @router.post("/api/admin/import/stages/{stage_id}/analyze")

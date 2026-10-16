@@ -679,11 +679,12 @@ const SUGGESTION = {
     add: ["기존 곡에 추가", "text-bg-secondary"],
     ambiguous: ["여러 곡과 겹침", "text-bg-warning"],
     unused: ["사용 중지 곡과 겹침", "text-bg-danger"],
+    similar: ["비슷한 곡 있음", "text-bg-info"],
 };
 
 function stageCounts(stage) {
     const c = stage.counts;
-    return `곡 ${stage.units}개 · 채보 ${stage.charts}개 · ${size(stage.size)} · 새 곡 ${c.new} · 추가 ${c.add} · 여러 곡과 겹침 ${c.ambiguous} · 사용 중지 곡 ${c.unused} · 대상 바꿈 ${c.changed} · 제외 ${c.skip}` +
+    return `곡 ${stage.units}개 · 채보 ${stage.charts}개 · ${size(stage.size)} · 새 곡 ${c.new} · 추가 ${c.add} · 여러 곡과 겹침 ${c.ambiguous} · 사용 중지 곡 ${c.unused} · 비슷한 곡 ${c.similar} · 대상 바꿈 ${c.changed} · 제외 ${c.skip}` +
         (c.failed ? ` · 지난 commit 실패 ${c.failed}` : "");
 }
 
@@ -862,6 +863,15 @@ function suggestionCell(stage, unit) {
         div.textContent = s.kind === "unused" ? `사용 중지 #${s.deleted}` : ids.map((id) => songName(stage, id)).join(", ");
         td.append(div);
     }
+    if (s.kind === "similar") {
+        // 겹치는 채보는 없고 이름(·작곡가)이 같은 곡만 있을 때 "자동"이 하는 일
+        const div = document.createElement("div");
+        div.className = "small";
+        if (s.merge) div.textContent = `자동: ${songName(stage, s.merge)}에 추가 (이름·작곡가 일치)`;
+        else if (unit.files > stage.merge_max_files) div.textContent = `자동: 새 곡 (파일 ${stage.merge_max_files}개 초과)`;
+        else div.textContent = "자동: 새 곡 (이름·작곡가가 다 같은 곡이 하나가 아님)";
+        td.append(div);
+    }
     return td;
 }
 
@@ -892,7 +902,7 @@ function unitRows(stage, unit, locked) {
     toggle.type = "button";
     toggle.className = "btn btn-link btn-sm p-0 ms-1 align-baseline";
     const chartChanged = unit.charts.some((c) => c.target !== null);
-    toggle.textContent = `채보 ${unit.charts.length}개${chartChanged ? " · 채보별 지정" : ""} ▾`;
+    toggle.textContent = `채보 ${unit.charts.length}개${chartChanged ? " · 채보별 지정" : ""} · 파일 보기 ▾`;
     folder.append(code, toggle);
     if (unit.result) {
         const warn = document.createElement("div");
@@ -905,6 +915,7 @@ function unitRows(stage, unit, locked) {
     }
     const target = document.createElement("td");
     const suggested = unit.suggestion?.songs || [];
+    if (unit.suggestion?.merge && !suggested.includes(unit.suggestion.merge)) suggested.unshift(unit.suggestion.merge);
     target.append(targetControl(stage, unit.target, (v) => saveUnit(unit, v, null), { locked, suggested }));
     const sz = document.createElement("td");
     sz.className = "text-end text-nowrap";
@@ -925,10 +936,40 @@ function unitRows(stage, unit, locked) {
         const st = document.createElement("span");
         st.className = "text-muted";
         st.textContent = chartStatus(stage, chart);
-        li.append(name, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked, suggested: chart.song_id ? [chart.song_id] : suggested }));
+        const meta = document.createElement("span");
+        meta.className = "small text-break";
+        meta.textContent = [chart.title, chart.artist].filter(Boolean).join(" / ");
+        li.append(name, meta, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked, suggested: chart.song_id ? [chart.song_id] : suggested }));
         ul.append(li);
     }
     td.append(ul);
+    // 채보 외 파일(키음·BGA·이미지 등). 펼칠 때 한 번 읽습니다.
+    const others = unit.files - unit.charts.length;
+    const files = document.createElement("details");
+    files.className = "ms-3 mt-1 small";
+    const fsum = document.createElement("summary");
+    fsum.textContent = `채보 외 파일 ${others}개`;
+    const flist = document.createElement("ul");
+    flist.className = "list-unstyled ms-3 mb-0 overflow-auto";
+    flist.style.maxHeight = "16rem";
+    files.append(fsum, flist);
+    files.addEventListener("toggle", async () => {
+        if (!files.open || files.dataset.loaded) return;
+        files.dataset.loaded = "1";
+        flist.textContent = "읽는 중…";
+        const res = await fetch(`/api/admin/import/stages/${stage.id}/units/${unit.id}/files`);
+        if (!res.ok) { flist.textContent = await detail(res); delete files.dataset.loaded; return; }
+        const items = await res.json();
+        if (!items.length) { flist.textContent = "없음"; return; }
+        flist.replaceChildren(...items.map((f) => {
+            const li = document.createElement("li");
+            const code = document.createElement("code");
+            code.textContent = f.path;
+            li.append(code, ` ${size(f.size)}`);
+            return li;
+        }));
+    });
+    if (others > 0) td.append(files);
     sub.append(td);
     toggle.addEventListener("click", () => sub.classList.toggle("d-none"));
     return [tr, sub];

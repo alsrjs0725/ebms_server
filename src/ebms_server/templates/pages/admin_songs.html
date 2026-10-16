@@ -132,7 +132,7 @@
             </div>
         </div>
         <p class="text-muted small mb-2">
-            <strong>자동</strong>은 판정대로 넣습니다(새 곡이거나 겹치는 차트가 있는 곡에 추가). <strong>새 곡</strong>으로 바꾸면 이미 다른 곡에 있는 채보는 원래 곡에 두고 나머지만 새 곡이 됩니다.
+            <strong>자동</strong>은 판정대로 넣습니다(새 곡이거나 겹치는 차트가 있는 곡에 추가. 겹치는 차트가 없어도 이름·작곡가가 같은 곡이 하나이고 파일이 50개 이하면 그 곡에 추가). <strong>새 곡</strong>으로 바꾸면 이미 다른 곡에 있는 채보는 원래 곡에 두고 나머지만 새 곡이 됩니다.
             <strong>채보</strong>를 펼쳐 채보마다 넣을 곳을 따로 정할 수 있고, 그때는 채보가 가리키는 키음·BGA·배너와 어느 채보도 가리키지 않는 파일이 함께 갑니다.
             commit하면 잘 들어간 곡은 목록에서 빠지고, 실패하거나 충돌(같은 경로에 내용이 다른 파일)이 난 곡은 남습니다.
             "천천히"는 작은 단위로 나눠 등록하고 사이사이 쉬어서 등록하는 동안에도 서비스가 느려지지 않게 합니다.
@@ -145,6 +145,7 @@
                     <option value="add">기존 곡에 추가</option>
                     <option value="ambiguous">여러 곡과 겹침</option>
                     <option value="unused">사용 중지 곡과 겹침</option>
+                    <option value="similar">비슷한 곡 있음(이름·작곡가)</option>
                     <option value="changed">대상을 바꾼 곡</option>
                     <option value="failed">지난 commit 실패·충돌</option>
                 </select>
@@ -157,7 +158,7 @@
                 </select>
             </div>
             <div class="col-sm-4 col-md-6">
-                <input class="form-control form-control-sm" type="search" id="stage-q" placeholder="폴더명, 채보 파일명" aria-label="곡 검색">
+                <input class="form-control form-control-sm" type="search" id="stage-q" placeholder="폴더명, 채보 파일명, 곡 이름·작곡가" aria-label="곡 검색">
             </div>
         </div>
         <div class="table-responsive">

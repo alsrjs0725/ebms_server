@@ -68,7 +68,7 @@ def test_upload_is_staged_until_commit(client, monkeypatch):
     assert len(stages) == 1 and stages[0]["status"] == "ready" and stages[0]["units"] == 2
     assert stages[0]["counts"]["new"] == 1 and stages[0]["counts"]["add"] == 1
     got = units(client, job["stage_id"])
-    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None}
+    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None, "merge": None}
     assert got["pack/p/add"]["suggestion"]["kind"] == "add" and got["pack/p/add"]["suggestion"]["songs"] == [1]
     assert {c["path"]: c["song_id"] for c in got["pack/p/add"]["charts"]} == {"a.bms": 1, "extra.bms": None}
     assert detail(client, job["stage_id"])["songs"] == {"1": "base"}
@@ -233,3 +233,58 @@ def test_sort_by_file_count(client, monkeypatch):
     assert order("files_desc") == ["pack/p/b", "pack/p/c", "pack/p/a"]
     assert order("files_asc") == ["pack/p/a", "pack/p/c", "pack/p/b"]
     assert sorted(order("")) == sorted(order("nope")) == ["pack/p/a", "pack/p/b", "pack/p/c"]
+
+
+def test_similar_by_title_and_artist(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"b/a.bms": b"#TITLE Song [NORMAL]\n#ARTIST Comp / obj:x\n", "b/k.wav": b"k"}))
+    upload(client, "other.zip", make_zip({"o/o.bms": b"#TITLE Song\n#ARTIST Someone\n"}))
+    many = {f"big/{i}.wav": b"w" for i in range(staging.STAGE_MERGE_MAX_FILES)}
+    job = stage(client, "pack.zip", make_zip({
+        "small/x.bms": b"#TITLE SONG [ANOTHER]\n#ARTIST comp\n", "small/k2.wav": b"k2",
+        "big/x.bms": b"#TITLE Song (HYPER)\n#ARTIST Comp\n", **many,
+        "weak/x.bms": b"#TITLE Song\n#ARTIST Nobody\n",
+        "none/x.bms": b"#TITLE Other\n#ARTIST Comp\n",
+    }))
+    sid = job["stage_id"]
+    got = units(client, sid)
+    # 이름·작곡가가 같은 곡(1) 먼저, 이름만 같은 곡(2) 뒤. 파일이 적으면 auto는 그 곡에 추가합니다.
+    assert got["pack/small"]["suggestion"] == {"kind": "similar", "songs": [1, 2], "deleted": None, "merge": 1}
+    assert got["pack/big"]["suggestion"]["merge"] is None  # 파일이 많으면 새 곡
+    assert got["pack/weak"]["suggestion"] == {"kind": "similar", "songs": [1, 2], "deleted": None, "merge": None}
+    assert got["pack/none"]["suggestion"]["kind"] == "new"
+    assert got["pack/small"]["charts"][0]["title"] == "SONG [ANOTHER]"
+    assert sorted(u["folder"] for u in detail(client, sid, show="similar")["items"]) == ["pack/big", "pack/small", "pack/weak"]
+    assert [u["folder"] for u in detail(client, sid, q="nobody")["items"]] == ["pack/weak"]
+
+    # 차트 외 파일 목록
+    r = client.get(f"/api/admin/import/stages/{sid}/units/{got['pack/small']['id']}/files")
+    assert r.status_code == 200 and r.json() == [{"path": "k2.wav", "size": 2}]
+    assert client.get(f"/api/admin/import/stages/{sid}/units/nope/files").status_code == 404
+
+    commit_stage(client, sid)
+    assert song_files(1) == ["a.bms", "k.wav", "k2.wav", "x.bms"]
+    assert [r[0] for r in song_rows()] == [1, 2, 3, 4, 5]
+
+
+def test_analyze_fills_meta_of_old_units_and_backfill(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"b/a.bms": b"#TITLE Song\n#ARTIST Comp\n"}))
+    # 이전 버전에서 넣은 차트: 키가 없음
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE chart SET title_key = NULL, artist_key = NULL")
+    assert db_module.Database().backfill_chart_meta() == 1
+    assert db_module.Database().backfill_chart_meta() == 0
+    job = stage(client, "pack.zip", make_zip({"s/x.bms": b"#TITLE Song [HARD]\n#ARTIST Comp\n"}))
+    sid = job["stage_id"]
+    # 이전 버전에서 만든 묶음: 차트에 이름·작곡가가 없음
+    path = constant.STAGED_DIR / sid / staging.STAGE_FILE
+    data = json.loads(path.read_text("utf-8"))
+    for unit in data["units"]:
+        for chart in unit["charts"]:
+            for key in ("title", "artist", "title_key", "artist_key"):
+                chart.pop(key)
+        unit["suggestion"] = None
+    path.write_text(json.dumps(data), "utf-8")
+    assert client.post(f"/api/admin/import/stages/{sid}/analyze").status_code == 200
+    assert units(client, sid)["pack/s"]["suggestion"]["merge"] == 1
