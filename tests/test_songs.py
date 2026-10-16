@@ -10,7 +10,7 @@ from ebms_server import admin, constant, db as db_module
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_client_auth import client_login
-from test_import import import_dir, make_zip, upload, wait  # noqa: F401
+from test_import import import_dir, import_tmp, make_zip, upload, wait  # noqa: F401
 from test_quota import admin_login
 
 
@@ -245,7 +245,7 @@ def test_unused_song_not_reimported(client, monkeypatch):
     song = constant.TMP_DIR / "group" / "a"
     song.mkdir(parents=True)
     (song / "a.bms").write_bytes(b"#TITLE A\n")
-    assert wait(client, client.post("/api/admin/import/tmp").json())["songs"][0]["skipped"] == "unused"
+    assert import_tmp(client)["songs"][0]["skipped"] == "unused"
     assert not song.exists()
 
     # 복원한 뒤에는 기존 곡으로 합쳐집니다.

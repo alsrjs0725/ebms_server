@@ -78,11 +78,15 @@
 </div>
 
 <div id="tab-import" role="tabpanel"{% if tab != 'import' %} class="d-none"{% endif %}>
+<p class="text-muted small">
+    올리거나 가져온 곡은 바로 등록하지 않고 <strong>검토 대기</strong>에 둡니다. 곡마다 새 곡인지, 어느 기존 곡에 붙는지 확인하고
+    필요하면 곡 단위나 채보 단위로 넣을 곳을 바꾼 뒤 <strong>commit</strong>하면 그때 등록합니다.
+</p>
 <h2 class="h5">zip 업로드</h2>
 <p class="text-muted small">
-    차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 등록합니다. zip 하나에 곡 여러 개가 있어도 되고,
-    zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다. 같은 차트가 이미 있으면 기존 곡에 연결됩니다.
-    큰 파일도 조각으로 나눠 올리고, 등록은 서버에서 이어서 진행되므로 다 올린 뒤에는 페이지를 닫아도 됩니다.
+    차트 파일({{ formats | join(", ") }})이 있는 폴더를 곡 하나로 봅니다. zip 하나에 곡 여러 개가 있어도 되고,
+    zip 최상위에 차트가 있으면 zip 이름을 곡 폴더명으로 씁니다.
+    큰 파일도 조각으로 나눠 올리고, 검토 대기에 푸는 일은 서버에서 이어서 하므로 다 올린 뒤에는 페이지를 닫아도 됩니다.
 </p>
 <form id="upload" class="mb-5">
     <div class="mb-3">
@@ -95,36 +99,84 @@
             <div class="progress-bar w-0"></div>
         </div>
     </div>
-    <div class="form-check mb-3">
-        <input class="form-check-input" type="checkbox" id="slow-upload">
-        <label class="form-check-label" for="slow-upload">천천히 등록(서비스 영향 최소화)</label>
-    </div>
-    <button class="btn btn-primary" type="submit">업로드하고 등록</button>
+    <button class="btn btn-primary" type="submit">업로드</button>
     <button class="btn btn-outline-secondary d-none" type="button" id="cancel">업로드 취소</button>
 </form>
 
 <h2 class="h5">var/tmp 가져오기</h2>
-<p class="text-muted small">서버의 <code>var/tmp/</code>에 있는 곡 폴더와 zip을 지금 등록합니다(서버 시작 시와 같음). 등록한 폴더와 zip은 지웁니다.
+<p class="text-muted small">서버의 <code>var/tmp/</code>에 있는 곡 폴더와 zip을 검토 대기로 옮깁니다(서버를 시작할 때는 가져오지 않습니다). 옮긴 폴더와 다 푼 zip은 <code>var/tmp/</code>에서 사라집니다.
     수 GB 이상이면 웹 업로드보다 zip을 내부망으로 서버의 <code>var/tmp/</code>에 복사(SMB, scp 등)한 뒤 누르는 편이 훨씬 빠릅니다. 복사 중에 누르지 않도록, 다른 이름으로 복사한 뒤 <code>.zip</code>으로 바꾸세요.</p>
-<p class="text-muted small">"천천히"는 작은 단위로 나눠 등록하고 사이사이 쉬어서, 등록하는 동안에도 다운로드와 사이트 응답이 느려지지 않게 합니다(대신 두 배 이상 오래 걸림).
-    등록 중인 작업도 아래 목록에서 속도를 바꿀 수 있습니다.</p>
 <div class="mb-5">
     <button class="btn btn-outline-primary" type="button" id="scan">var/tmp 가져오기</button>
-    <button class="btn btn-outline-secondary" type="button" id="scan-slow">var/tmp 천천히 가져오기</button>
 </div>
 
-<h2 class="h5">등록 작업</h2>
-<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다. 지난 기록과 자세한 오류는 <a href="/admin/logs?logger=ebms_server.importer">서버 로그</a>에서 볼 수 있습니다.</p>
+<h2 class="h5">검토 대기</h2>
+<div id="stages" class="mb-3"><p class="text-muted small">검토할 묶음이 없습니다.</p></div>
+
+<div class="card d-none mb-5" id="stage">
+    <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start gap-2 flex-wrap mb-2">
+            <div>
+                <h3 class="h6 mb-1" id="stage-title"></h3>
+                <div class="text-muted small" id="stage-meta"></div>
+                <div class="text-warning-emphasis small" id="stage-error"></div>
+            </div>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+                <button class="btn btn-sm btn-outline-secondary" type="button" id="stage-analyze" title="지금 DB 기준으로 판정을 다시 합니다">다시 판정</button>
+                <div class="form-check m-0 small">
+                    <input class="form-check-input" type="checkbox" id="slow-commit">
+                    <label class="form-check-label" for="slow-commit">천천히</label>
+                </div>
+                <button class="btn btn-sm btn-primary" type="button" id="stage-commit">commit</button>
+                <button class="btn btn-sm btn-outline-danger" type="button" id="stage-discard">폐기</button>
+            </div>
+        </div>
+        <p class="text-muted small mb-2">
+            <strong>자동</strong>은 판정대로 넣습니다(새 곡이거나 겹치는 차트가 있는 곡에 추가). <strong>새 곡</strong>으로 바꾸면 이미 다른 곡에 있는 채보는 원래 곡에 두고 나머지만 새 곡이 됩니다.
+            <strong>채보</strong>를 펼쳐 채보마다 넣을 곳을 따로 정할 수 있고, 그때는 채보가 가리키는 키음·BGA·배너와 어느 채보도 가리키지 않는 파일이 함께 갑니다.
+            commit하면 잘 들어간 곡은 목록에서 빠지고, 실패하거나 충돌(같은 경로에 내용이 다른 파일)이 난 곡은 남습니다.
+            "천천히"는 작은 단위로 나눠 등록하고 사이사이 쉬어서 등록하는 동안에도 서비스가 느려지지 않게 합니다.
+        </p>
+        <div class="row g-2 mb-2">
+            <div class="col-sm-4 col-md-3">
+                <select class="form-select form-select-sm" id="stage-show" aria-label="판정으로 거르기">
+                    <option value="">모든 곡</option>
+                    <option value="new">새 곡</option>
+                    <option value="add">기존 곡에 추가</option>
+                    <option value="ambiguous">여러 곡과 겹침</option>
+                    <option value="unused">사용 중지 곡과 겹침</option>
+                    <option value="changed">대상을 바꾼 곡</option>
+                    <option value="failed">지난 commit 실패·충돌</option>
+                </select>
+            </div>
+            <div class="col-sm-8 col-md-6">
+                <input class="form-control form-control-sm" type="search" id="stage-q" placeholder="폴더명, 채보 파일명" aria-label="곡 검색">
+            </div>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle small">
+                <thead><tr><th scope="col">폴더</th><th scope="col">판정</th><th scope="col">넣을 곳</th><th scope="col" class="text-end">크기</th></tr></thead>
+                <tbody id="unit-rows"></tbody>
+            </table>
+        </div>
+        <p class="text-muted small d-none" id="unit-empty">보일 곡이 없습니다.</p>
+        <nav id="unit-pager" aria-label="검토 대기 곡 쪽"></nav>
+    </div>
+</div>
+
+<h2 class="h5">작업</h2>
+<p class="text-muted small">서버를 다시 시작하면 목록은 비워집니다(검토 대기는 남음). 지난 기록과 자세한 오류는 <a href="/admin/logs?logger=ebms_server.importer">서버 로그</a>에서 볼 수 있습니다.</p>
 <div class="row g-2 mb-2" id="filter">
     <div class="col-sm-4 col-md-3">
         <select class="form-select form-select-sm" id="filter-level" aria-label="결과 수준">
             <option value="">모든 결과</option>
             <option value="failed">실패</option>
-            <option value="skipped">사용 중지로 건너뜀</option>
+            <option value="skipped">건너뜀(사용 중지·제외)</option>
             <option value="conflict">충돌(넣지 않은 파일 있음)</option>
             <option value="new">새 곡</option>
             <option value="added">기존 곡에 추가</option>
             <option value="same">변경 없음(이미 있음)</option>
+            <option value="staged">검토 대기에 넣음</option>
         </select>
     </div>
     <div class="col-sm-8 col-md-6">

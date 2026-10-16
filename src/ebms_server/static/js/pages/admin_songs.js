@@ -331,8 +331,6 @@ let currentUpload = null;
 
 const form = document.getElementById("upload");
 const scan = document.getElementById("scan");
-const scanSlow = document.getElementById("scan-slow");
-const slowUpload = document.getElementById("slow-upload");
 const cancel = document.getElementById("cancel");
 const state = document.getElementById("upload-state");
 const label = document.getElementById("upload-label");
@@ -407,14 +405,14 @@ async function uploadFile(file, index, count) {
         offset = (await res.json()).received;
         progress(file, offset, index, count);
     }
-    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish?slow=${slowUpload.checked}`);
+    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish`);
     currentUpload = null;
     return job;
 }
 
 function busy(on) {
     form.querySelectorAll("input, button[type=submit]").forEach((el) => (el.disabled = on));
-    scan.disabled = scanSlow.disabled = on;
+    scan.disabled = on;
     cancel.classList.toggle("d-none", !on);
     state.classList.toggle("d-none", !on);
 }
@@ -446,20 +444,17 @@ form.addEventListener("submit", async (e) => {
 
 cancel.addEventListener("click", () => { cancelled = true; });
 
-async function scanTmp(slow) {
-    scan.disabled = scanSlow.disabled = true;
+scan.addEventListener("click", async () => {
+    scan.disabled = true;
     try {
-        await postJson(`/api/admin/import/tmp?slow=${slow}`);
+        await postJson("/api/admin/import/tmp");
     } catch (err) {
         alert(err.message);
     } finally {
-        scan.disabled = scanSlow.disabled = false;
+        scan.disabled = false;
         refreshJobs();
     }
-}
-
-scan.addEventListener("click", () => scanTmp(false));
-scanSlow.addEventListener("click", () => scanTmp(true));
+});
 
 async function setSpeed(job, slow, button) {
     button.disabled = true;
@@ -487,6 +482,14 @@ function songLine(song) {
         badge.className = "badge text-bg-danger";
         badge.textContent = "실패";
         li.append(badge, " " + song.error);
+    } else if (song.staged) {
+        badge.className = "badge text-bg-info";
+        badge.textContent = "검토 대기";
+        li.append(badge, ` 차트 ${song.charts}개`);
+    } else if (song.skipped === "admin") {
+        badge.className = "badge text-bg-secondary";
+        badge.textContent = "제외";
+        li.append(badge, " 검토에서 제외해 넣지 않았습니다.");
     } else if (song.skipped === "unused") {
         badge.className = "badge text-bg-warning";
         badge.textContent = `사용 중지 곡 #${song.song_id}`;
@@ -509,6 +512,7 @@ function songLine(song) {
 // 곡 결과의 수준: failed, skipped, conflict, new, added, same
 function songLevel(song) {
     if (song.error) return "failed";
+    if (song.staged) return "staged";
     if (song.skipped) return "skipped";
     if (song.conflicts && song.conflicts.length) return "conflict";
     if (song.new_song) return "new";
@@ -549,11 +553,20 @@ function jobCard(job) {
     body.className = "card-body py-2";
     const title = document.createElement("div");
     const name = document.createElement("strong");
-    name.textContent = job.kind === "tmp" ? "var/tmp" : job.name;
+    const commitJob = job.kind === "commit";
+    name.textContent = (commitJob ? "commit · " : "") + (job.kind === "tmp" ? "var/tmp" : job.name);
     const badge = document.createElement("span");
     badge.className = "badge ms-2 " + ({ running: "text-bg-primary", done: "text-bg-success", failed: "text-bg-danger" })[job.status];
-    badge.textContent = ({ running: "등록 중", done: "완료", failed: "실패" })[job.status];
+    badge.textContent = ({ running: commitJob ? "등록 중" : "푸는 중", done: "완료", failed: "실패" })[job.status];
     title.append(name, badge);
+    if (!commitJob && job.stage_id && stageIds.has(job.stage_id)) {
+        const review = document.createElement("button");
+        review.type = "button";
+        review.className = "btn btn-sm btn-outline-primary ms-2 py-0";
+        review.textContent = "검토하기";
+        review.addEventListener("click", () => openStage(job.stage_id));
+        title.append(review);
+    }
     if (job.slow) {
         const slow = document.createElement("span");
         slow.className = "badge ms-1 text-bg-secondary";
@@ -576,7 +589,9 @@ function jobCard(job) {
     const conflicts = job.songs.filter((s) => songLevel(s) === "conflict").length;
     const line = document.createElement("div");
     line.className = "small";
-    line.textContent = job.total === null ? "곡을 찾는 중…" : `${job.done} / ${job.total}곡 처리 · 성공 ${ok} · 충돌 ${conflicts} · 사용 중지로 건너뜀 ${skipped.length} · 실패 ${failed.length}`;
+    if (job.total === null) line.textContent = "곡을 찾는 중…";
+    else if (commitJob) line.textContent = `${job.done}건 처리(곡 ${job.total}개) · 성공 ${ok} · 충돌 ${conflicts} · 건너뜀 ${skipped.length} · 실패 ${failed.length}`;
+    else line.textContent = `${job.done} / ${job.total}곡 · 검토 대기에 넣음 ${ok} · 실패 ${failed.length}`;
     body.append(line);
     if (job.status === "running" && job.total) {
         const p = document.createElement("div");
@@ -601,7 +616,7 @@ function jobCard(job) {
     } else {
         if (failed.length) body.append(songList(failed, `실패 ${failed.length}곡`, true));
         if (skipped.length) body.append(songList(skipped, `사용 중지로 건너뜀 ${skipped.length}곡`, false));
-        if (ok) body.append(songList(job.songs.filter((s) => !s.error && !s.skipped), `성공 ${ok}곡`, false));
+        if (ok) body.append(songList(job.songs.filter((s) => !s.error && !s.skipped), `${commitJob ? "성공" : "검토 대기에 넣은"} ${ok}곡`, false));
     }
     card.append(body);
     return card;
@@ -620,8 +635,14 @@ async function refreshJobs() {
         timer = setTimeout(refreshJobs, 5000);
         return;
     }
+    // 작업이 끝나면 검토 대기 목록과 열어 둔 묶음을 새로 읽습니다.
+    const finished = jobs.some((j) => j.status !== "running" && lastJobs.some((o) => o.id === j.id && o.status === "running"));
     lastJobs = jobs;
     renderJobs();
+    if (finished || !stagesLoaded) {
+        loadStages();
+        if (currentStage && finished) loadStage(stagePage);
+    }
     if (jobs.some((j) => j.status === "running")) timer = setTimeout(refreshJobs, 2000);
 }
 
@@ -643,4 +664,256 @@ function renderJobs() {
 // 필터는 받은 목록을 다시 그리기만 합니다(서버에 다시 묻지 않음).
 filterLevel.addEventListener("change", renderJobs);
 filterText.addEventListener("input", renderJobs);
+
+// ---- 검토 대기(staged) ----
+let stagesLoaded = false;
+let stageIds = new Set();  // 남아 있는 묶음(작업의 "검토하기" 버튼)
+let currentStage = null;  // 열어 둔 묶음(한 쪽 곡 포함)
+let stagePage = 1;
+const stageCard = document.getElementById("stage");
+const stageShow = document.getElementById("stage-show");
+const stageQ = document.getElementById("stage-q");
+const SUGGESTION = {
+    new: ["새 곡", "text-bg-success"],
+    add: ["기존 곡에 추가", "text-bg-secondary"],
+    ambiguous: ["여러 곡과 겹침", "text-bg-warning"],
+    unused: ["사용 중지 곡과 겹침", "text-bg-danger"],
+};
+
+function stageCounts(stage) {
+    const c = stage.counts;
+    return `곡 ${stage.units}개 · 채보 ${stage.charts}개 · ${size(stage.size)} · 새 곡 ${c.new} · 추가 ${c.add} · 여러 곡과 겹침 ${c.ambiguous} · 사용 중지 곡 ${c.unused} · 대상 바꿈 ${c.changed} · 제외 ${c.skip}` +
+        (c.failed ? ` · 지난 commit 실패 ${c.failed}` : "");
+}
+
+async function loadStages() {
+    stagesLoaded = true;
+    const res = await fetch("/api/admin/import/stages");
+    if (!res.ok) return;
+    const stages = await res.json();
+    stageIds = new Set(stages.map((s) => s.id));
+    renderJobs();
+    const box = document.getElementById("stages");
+    if (!stages.length) {
+        box.innerHTML = '<p class="text-muted small">검토할 묶음이 없습니다.</p>';
+    } else {
+        box.replaceChildren(...stages.map((stage) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "list-group-item list-group-item-action small" + (currentStage?.id === stage.id ? " active" : "");
+            const title = document.createElement("strong");
+            title.textContent = stage.name;
+            const status = document.createElement("span");
+            status.className = "badge ms-2 " + (stage.status === "ready" ? "text-bg-info" : "text-bg-primary");
+            status.textContent = ({ ready: "검토 대기", staging: "푸는 중", committing: "등록 중" })[stage.status];
+            const meta = document.createElement("div");
+            meta.textContent = `${new Date(stage.created_at * 1000).toLocaleString()} · ${stageCounts(stage)}`;
+            btn.append(title, status, meta);
+            btn.addEventListener("click", () => openStage(stage.id));
+            return btn;
+        }));
+        box.classList.add("list-group");
+    }
+    if (currentStage && !stages.some((s) => s.id === currentStage.id)) {
+        currentStage = null;
+        stageCard.classList.add("d-none");
+    }
+}
+
+function openStage(id) {
+    currentStage = { id };
+    stageShow.value = "";
+    stageQ.value = "";
+    loadStage(1).then(() => stageCard.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+    loadStages();
+}
+
+async function loadStage(page = 1) {
+    if (!currentStage) return;
+    const params = new URLSearchParams({ page, show: stageShow.value, q: stageQ.value.trim() });
+    const res = await fetch(`/api/admin/import/stages/${currentStage.id}?${params}`);
+    if (res.status === 404) { currentStage = null; stageCard.classList.add("d-none"); loadStages(); return; }
+    if (!res.ok) { alert(await detail(res)); return; }
+    const stage = await res.json();
+    currentStage = stage;
+    stagePage = stage.page;
+    document.getElementById("stage-title").textContent = stage.name;
+    const analyzed = stage.analyzed_at ? ` · 판정 ${new Date(stage.analyzed_at * 1000).toLocaleString()}` : "";
+    document.getElementById("stage-meta").textContent = stageCounts(stage) + analyzed;
+    document.getElementById("stage-error").textContent = stage.error || (stage.status !== "ready" ? "작업 중이라 바꿀 수 없습니다. 끝나면 새로 읽습니다." : "");
+    const locked = stage.status !== "ready";
+    for (const id of ["stage-analyze", "stage-commit", "stage-discard"]) document.getElementById(id).disabled = locked;
+    const rows = document.getElementById("unit-rows");
+    rows.replaceChildren(...stage.items.flatMap((unit) => unitRows(stage, unit, locked)));
+    document.getElementById("unit-empty").classList.toggle("d-none", stage.items.length > 0);
+    renderPager(document.getElementById("unit-pager"), stage, loadStage);
+    stageCard.classList.remove("d-none");
+    if (locked) { clearTimeout(timer); timer = setTimeout(refreshJobs, 2000); }
+}
+
+function songName(stage, id) {
+    const folder = stage.songs[String(id)];
+    return folder === undefined ? `#${id}` : `#${id} ${folder}`;
+}
+
+// 대상 고르기: auto/new/skip, 곡 번호. inherit면 "곡 설정 따름"(null)도 있습니다.
+function targetControl(stage, value, onChange, { inherit = false, locked = false } = {}) {
+    const wrap = document.createElement("div");
+    wrap.className = "d-flex gap-1 align-items-center flex-wrap";
+    const select = document.createElement("select");
+    select.className = "form-select form-select-sm w-auto";
+    select.disabled = locked;
+    const options = [...(inherit ? [["inherit", "곡 설정 따름"]] : []), ["auto", "자동(판정대로)"], ["new", "새 곡"], ["song", "기존 곡에 추가…"], ["skip", "제외"]];
+    for (const [v, text] of options) select.append(new Option(text, v));
+    const kind = value === null ? "inherit" : typeof value === "number" ? "song" : value;
+    select.value = kind;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = "1";
+    input.placeholder = "곡 번호";
+    input.className = "form-control form-control-sm" + (kind === "song" ? "" : " d-none");
+    input.style.width = "7em";
+    input.disabled = locked;
+    if (typeof value === "number") input.value = value;
+    const name = document.createElement("span");
+    name.className = "text-muted text-break";
+    if (typeof value === "number") name.textContent = songName(stage, value).replace(/^#\d+ ?/, "");
+    select.addEventListener("change", () => {
+        input.classList.toggle("d-none", select.value !== "song");
+        if (select.value === "song") { input.focus(); return; }
+        onChange(select.value === "inherit" ? null : select.value);
+    });
+    input.addEventListener("change", () => { if (Number(input.value) > 0) onChange(Number(input.value)); });
+    wrap.append(select, input, name);
+    return wrap;
+}
+
+function suggestionCell(stage, unit) {
+    const td = document.createElement("td");
+    const s = unit.suggestion;
+    if (!s) { td.textContent = "-"; return td; }
+    const [text, cls] = SUGGESTION[s.kind];
+    const badge = document.createElement("span");
+    badge.className = "badge " + cls;
+    badge.textContent = text;
+    td.append(badge);
+    const ids = s.kind === "unused" ? [s.deleted] : s.songs;
+    if (ids.length) {
+        const div = document.createElement("div");
+        div.className = "text-muted text-break";
+        div.textContent = s.kind === "unused" ? `사용 중지 #${s.deleted}` : ids.map((id) => songName(stage, id)).join(", ");
+        td.append(div);
+    }
+    return td;
+}
+
+function chartStatus(stage, chart) {
+    if (chart.deleted) return `사용 중지 #${chart.deleted}의 채보`;
+    if (chart.song_id) return `${songName(stage, chart.song_id)}에 있음`;
+    return "새 채보";
+}
+
+async function saveUnit(unit, target, charts) {
+    const res = await fetch(`/api/admin/import/stages/${currentStage.id}/units/${unit.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target, charts }),
+    });
+    if (!res.ok) alert(await detail(res));
+    await loadStage(stagePage);
+    loadStages();
+}
+
+function unitRows(stage, unit, locked) {
+    const tr = document.createElement("tr");
+    const folder = document.createElement("td");
+    folder.className = "text-break";
+    const code = document.createElement("code");
+    code.textContent = unit.folder;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn btn-link btn-sm p-0 ms-1 align-baseline";
+    const chartChanged = unit.charts.some((c) => c.target !== null);
+    toggle.textContent = `채보 ${unit.charts.length}개${chartChanged ? " · 채보별 지정" : ""} ▾`;
+    folder.append(code, toggle);
+    if (unit.result) {
+        const warn = document.createElement("div");
+        warn.className = unit.result.error ? "text-danger" : "text-warning-emphasis";
+        const parts = [];
+        if (unit.result.error) parts.push(`지난 commit 실패: ${unit.result.error}`);
+        if (unit.result.conflicts.length) parts.push(`내용이 달라 넣지 않은 파일(기존 유지): ${unit.result.conflicts.join(", ")}`);
+        warn.textContent = parts.join(" · ");
+        folder.append(warn);
+    }
+    const target = document.createElement("td");
+    target.append(targetControl(stage, unit.target, (v) => saveUnit(unit, v, null), { locked }));
+    const sz = document.createElement("td");
+    sz.className = "text-end text-nowrap";
+    sz.textContent = `${size(unit.size)} · 파일 ${unit.files}개`;
+    tr.append(folder, suggestionCell(stage, unit), target, sz);
+
+    const sub = document.createElement("tr");
+    sub.className = chartChanged ? "" : "d-none";
+    const td = document.createElement("td");
+    td.colSpan = 4;
+    const ul = document.createElement("ul");
+    ul.className = "list-unstyled ms-3 mb-0";
+    for (const chart of unit.charts) {
+        const li = document.createElement("li");
+        li.className = "d-flex gap-2 align-items-center flex-wrap py-1";
+        const name = document.createElement("code");
+        name.textContent = chart.path;
+        const st = document.createElement("span");
+        st.className = "text-muted";
+        st.textContent = chartStatus(stage, chart);
+        li.append(name, st, targetControl(stage, chart.target, (v) => saveUnit(unit, unit.target, { [chart.path]: v }), { inherit: true, locked }));
+        ul.append(li);
+    }
+    td.append(ul);
+    sub.append(td);
+    toggle.addEventListener("click", () => sub.classList.toggle("d-none"));
+    return [tr, sub];
+}
+
+stageShow.addEventListener("change", () => loadStage(1));
+let stageQTimer = null;
+stageQ.addEventListener("input", () => { clearTimeout(stageQTimer); stageQTimer = setTimeout(() => loadStage(1), 300); });
+
+document.getElementById("stage-analyze").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+        await postJson(`/api/admin/import/stages/${currentStage.id}/analyze`);
+    } catch (err) {
+        alert(err.message);
+    }
+    await loadStage(stagePage);
+    loadStages();
+});
+
+document.getElementById("stage-commit").addEventListener("click", async () => {
+    const stage = currentStage;
+    const c = stage.counts;
+    let msg = `${stage.name}의 곡 ${stage.units}개를 지정한 대로 등록합니다(제외 ${c.skip}개).`;
+    if (c.ambiguous) msg += `\n여러 곡과 겹치는 곡 ${c.ambiguous}개 중 자동으로 둔 곡은 실패로 남습니다.`;
+    if (!confirm(msg)) return;
+    try {
+        await postJson(`/api/admin/import/stages/${stage.id}/commit?slow=${document.getElementById("slow-commit").checked}`);
+    } catch (err) {
+        alert(err.message);
+    }
+    await loadStage(stagePage);
+    loadStages();
+    refreshJobs();
+});
+
+document.getElementById("stage-discard").addEventListener("click", async () => {
+    const stage = currentStage;
+    if (!confirm(`${stage.name}의 곡 ${stage.units}개를 등록하지 않고 버립니다. 풀어 둔 파일은 지워집니다.`)) return;
+    const res = await fetch(`/api/admin/import/stages/${stage.id}`, { method: "DELETE" });
+    if (!res.ok) { alert(await detail(res)); return; }
+    currentStage = null;
+    stageCard.classList.add("d-none");
+    loadStages();
+});
+
 refreshJobs();

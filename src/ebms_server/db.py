@@ -1530,6 +1530,16 @@ class Database:
             bms_files.append((file_path, size, sha256))
         return bms_files, sorted(song_ids)
 
+    def _registered_charts(self, bms_files: list, cur) -> dict[str, int]:
+        """폴더의 차트 중 이미 곡에 붙어 있는 것. {sha256: 곡 번호}"""
+        found = {}
+        for _, size, sha256 in bms_files:
+            cur.execute("SELECT song_id FROM chart WHERE id = %s AND size = %s", (sha256, size))
+            row = cur.fetchone()
+            if row is not None and row[0] is not None:
+                found[sha256] = row[0]
+        return found
+
     def _deleted_song_for_charts(self, bms_files: list, cur) -> int | None:
         """폴더의 차트 중 사용 중지한 곡의 차트(song_id가 비어 남은 차트 행)가 있으면 그 곡 번호, 없으면 None.
         사용 중지 기록(deleted_song)에 없는 차트는 보지 않습니다."""
@@ -2067,9 +2077,13 @@ class SongBatch:
         finally:
             self._close()
 
-    def add(self, song_path: os.PathLike, remove: bool = False) -> dict | None:
+    def add(self, song_path: os.PathLike, remove: bool = False, target: str | int | None = None) -> dict | None:
         """곡 하나를 배치에 넣습니다. 등록 정보를 반환하고, 넣지 못하면 None.
-        반환한 dict는 배치 커밋이 실패하면 "error" 키가 채워집니다."""
+        반환한 dict는 배치 커밋이 실패하면 "error" 키가 채워집니다.
+
+        target은 넣을 곳입니다. None이면 겹치는 차트로 정하고(없으면 새 곡, 하나면 그 곡에 더함, 여럿이면 AmbiguousSongError),
+        "new"면 겹치는 차트가 있어도 새 곡으로, 곡 번호면 그 곡에 더합니다. 이미 다른 곡에 있는 차트는 어느 경우든 원래 곡에 둡니다.
+        새 곡으로 지정했는데 차트가 모두 이미 등록돼 있거나, 지정한 곡이 없으면 ValueError."""
         root = pathlib.Path(song_path)
         if not root.is_dir():
             self.logger.warning(f"insert_song failed: Path isn't directory[{root}]")
@@ -2091,6 +2105,16 @@ class SongBatch:
                 if remove:
                     self._remove.append(root)
                 return {"song_id": deleted, "new_song": False, "skipped": "unused", "charts": len(bms_files), "new_charts": 0}
+            if target == "new":
+                registered = self.db._registered_charts(bms_files, cur)
+                if len(registered) == len(bms_files):
+                    raise ValueError("차트가 모두 이미 다른 곡에 등록돼 있어 새 곡을 만들지 않았습니다.")
+                existing = []
+            elif target is not None:
+                cur.execute("SELECT 1 FROM song WHERE id = %s", (int(target),))
+                if cur.fetchone() is None:
+                    raise ValueError(f"곡 #{target}이 없습니다(사용 중지했거나 번호가 틀림).")
+                existing = [int(target)]
             if len(existing) > 1:
                 raise AmbiguousSongError(
                     f"차트가 기존 곡 여러 개({', '.join(map(str, existing))})와 겹쳐 어느 곡에 넣을지 정할 수 없어 "

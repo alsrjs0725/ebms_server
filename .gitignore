@@ -17,5 +17,6 @@ var/tmp/*
 !var/tmp/.gitkeep
 
 var/import/
+var/staged/
 
 var/ebms.db
