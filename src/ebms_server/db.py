@@ -14,6 +14,7 @@ import zipfile
 import threading
 import time
 import zlib
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterator
 
@@ -339,6 +340,11 @@ MISSING_COLUMNS = [
     ("chart", "filename", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''"),
     # 난이도표는 차트를 md5로 가리킵니다. 이전 버전에서 넣은 차트는 backfill_chart_md5가 채웁니다.
     ("chart", "md5", "CHAR(32)"),
+    # 검토 대기 곡과 비슷한 곡(이름·작곡가·BPM·장르)을 찾는 키(chart_meta_keys). 이전 버전에서 넣은 차트는 backfill_chart_meta가 채웁니다.
+    ("chart", "title_key", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("chart", "artist_key", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("chart", "bpm_key", "VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("chart", "genre_key", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("user", "max_tickets", "INT UNSIGNED"),
     ("user", "refill_seconds", "INT UNSIGNED"),
     ("user", "pre_monthly_bytes", "BIGINT UNSIGNED"),
@@ -351,6 +357,9 @@ MISSING_COLUMNS = [
 # 이전 버전에서 만든 테이블에 없는 인덱스 (테이블, 인덱스 이름, 컬럼)
 MISSING_INDEXES = [
     ("chart", "chart_md5", "md5"),
+    ("chart", "chart_title_key", "title_key"),
+    ("chart", "chart_artist_key", "artist_key"),
+    ("chart", "chart_bpm_genre_key", "bpm_key, genre_key"),
 ]
 # 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
 DROPPED_COLUMNS = [
@@ -385,6 +394,84 @@ PRE_CHUNK_SETTING = "pre_chunk_songs"
 # 차트 청크를 다시 묶는 중일 때 옛 청크의 마지막 번호와 단계(copy: 새 청크를 만드는 중, delete: 옛 청크를 지우는 중)
 CHART_RECHUNK_SETTING = "chart_rechunk_old_max"
 CHART_RECHUNK_PHASE_SETTING = "chart_rechunk_phase"
+
+
+# 곡 이름 끝의 난이도·모드 표기([ANOTHER], (7KEYS), -HYPER-, 【SP】 등). 같은 곡의 차트마다 붙는 것이라 이름 비교에서 뺍니다.
+_TITLE_SUFFIX = re.compile(r"\s*(\[[^\[\]]*\]|\([^()]*\)|【[^【】]*】|<[^<>]*>|-[^-]+-|~[^~]+~)\s*$")
+META_KEY_LENGTH = 255
+
+
+# 비교에 쓰는 차트 헤더. 순서가 chart_meta_keys와 chart의 *_key 컬럼 순서입니다.
+META_HEADERS = {"title": b"#TITLE", "artist": b"#ARTIST", "bpm": b"#BPM", "genre": b"#GENRE"}
+
+
+def _decode_header(value: bytes) -> str:
+    for encoding in CHART_ENCODINGS:
+        try:
+            return value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return value.decode("utf-8", "replace")
+
+
+def chart_meta(chart: bytes) -> dict[str, str]:
+    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''."""
+    meta = {}
+    for line in chart.splitlines():
+        line = line.strip()
+        if not line.startswith(b"#"):
+            continue
+        for field, header in META_HEADERS.items():
+            if field not in meta and line[:len(header)].upper() == header and line[len(header):len(header) + 1] in (b" ", b"\t"):
+                meta[field] = _decode_header(line[len(header):].strip())
+        if len(meta) == len(META_HEADERS):
+            break
+    return {field: meta.get(field, "") for field in META_HEADERS}
+
+
+def _meta_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).lower().split())
+
+
+def title_key(title: str) -> str:
+    """곡 이름 비교 키. 대소문자·전각·공백을 맞추고 끝의 난이도 표기를 뺍니다. 다 빠지면 원래 이름."""
+    key = _meta_text(title)
+    while True:
+        stripped = _TITLE_SUFFIX.sub("", key)
+        if stripped == key or not stripped:
+            break
+        key = stripped
+    return key[:META_KEY_LENGTH]
+
+
+def artist_key(artist: str) -> str:
+    """작곡가 비교 키. 'obj:' 같은 채보 제작자 표기는 보통 '/' 뒤나 괄호에 붙으므로 그 앞만 씁니다."""
+    key = _meta_text(artist).split("/")[0].strip()
+    return title_key(key) if key else ""
+
+
+def bpm_key(bpm: str) -> str:
+    """BPM 비교 키. 숫자로 읽어 소수 둘째 자리까지(150.00 → '150'). 숫자가 아니거나 0 이하면 ''."""
+    try:
+        value = float(bpm.strip())
+    except ValueError:
+        return ""
+    return f"{round(value, 2):g}" if 0 < value < 1e9 else ""
+
+
+def meta_keys(meta: dict[str, str]) -> dict[str, str]:
+    """chart_meta 값의 비교 키 {title, artist, bpm, genre}."""
+    return {
+        "title": title_key(meta["title"]),
+        "artist": artist_key(meta["artist"]),
+        "bpm": bpm_key(meta["bpm"]),
+        "genre": _meta_text(meta["genre"])[:META_KEY_LENGTH],
+    }
+
+
+def chart_meta_keys(chart: bytes) -> tuple[str, ...]:
+    """(title_key, artist_key, bpm_key, genre_key)."""
+    return tuple(meta_keys(chart_meta(chart)).values())
 
 
 def _header_paths(value: bytes, base: str) -> list[str]:
@@ -1280,6 +1367,65 @@ class Database:
                 con.commit()
         return filled
 
+    def backfill_chart_meta(self) -> int:
+        """비교 키(title_key, artist_key, bpm_key, genre_key)가 없는 차트(이전 버전에서 넣은 차트)를 차트 청크에서 채웁니다.
+        채운 차트 수를 반환합니다. 청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 이어서 채웁니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT id FROM chart WHERE title_key IS NULL")
+            missing = {row[0] for row in cur.fetchall()}
+            if not missing:
+                return 0
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id")
+            chunk_ids = [row[0] for row in cur.fetchall()]
+        self.logger.info(f"backfill_chart_meta: Filling meta keys of {len(missing)} charts.")
+        filled = 0
+        broken = False
+        for chunk_no in chunk_ids:
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
+                row = cur.fetchone()
+            if row is None:
+                continue
+            found = []
+            try:
+                with zipfile.ZipFile(io.BytesIO(row[0])) as zf:
+                    for info in zf.infolist():
+                        sha256 = info.filename.rsplit(".", 1)[0]
+                        if sha256 in missing:
+                            found.append((*chart_meta_keys(zf.read(info)), sha256))
+            except (zipfile.BadZipFile, zlib.error):
+                self.logger.exception(f"backfill_chart_meta: Skipped broken chart chunk {chunk_no}")
+                broken = True
+                continue
+            if not found:
+                continue
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    for *keys, sha256 in found:
+                        cur.execute(
+                            "UPDATE chart SET title_key = %s, artist_key = %s, bpm_key = %s, genre_key = %s"
+                            " WHERE id = %s AND title_key IS NULL",
+                            (*keys, sha256),
+                        )
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            missing.difference_update(sha256 for *_, sha256 in found)
+            filled += len(found)
+        self.logger.info(f"backfill_chart_meta: Filled meta keys of {filled} charts.")
+        if missing and not broken:
+            # 어느 청크에도 없는 차트는 ''로 두어 시작할 때마다 청크를 다시 읽지 않게 합니다.
+            self.logger.warning(f"backfill_chart_meta: {len(missing)} charts are not in any chart chunk.")
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                for sha256 in missing:
+                    cur.execute(
+                        "UPDATE chart SET title_key = '', artist_key = '', bpm_key = '', genre_key = ''"
+                        " WHERE id = %s AND title_key IS NULL", (sha256,)
+                    )
+                con.commit()
+        return filled
+
     def get_song_data(self, song_id: int) -> bytes | None:
         """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
         with connect() as con, con.cursor() as cur:
@@ -1683,8 +1829,9 @@ class Database:
             filename = chart_file_path.relative_to(root).as_posix()
             content = chart_file_path.read_bytes()
             cur.execute(
-                "INSERT IGNORE INTO chart (id, song_id, size, filename, md5) VALUES (%s, %s, %s, %s, %s)",
-                (str(sha256), song_id, size, filename, hashlib.md5(content).hexdigest()),
+                "INSERT IGNORE INTO chart (id, song_id, size, filename, md5, title_key, artist_key, bpm_key, genre_key)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (str(sha256), song_id, size, filename, hashlib.md5(content).hexdigest(), *chart_meta_keys(content)),
             )
             if cur.rowcount == 1:
                 new_charts.append((chart_arcname(sha256, chart_file_path), content))
@@ -1975,8 +2122,9 @@ class Database:
                         )
                     for chart_id, chart_size, filename, _, content in readd:
                         cur.execute(
-                            "INSERT INTO chart (id, song_id, size, filename, md5) VALUES (%s, %s, %s, %s, %s)",
-                            (chart_id, song_id, chart_size, filename, hashlib.md5(content).hexdigest()),
+                            "INSERT INTO chart (id, song_id, size, filename, md5, title_key, artist_key, bpm_key, genre_key)"
+                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            (chart_id, song_id, chart_size, filename, hashlib.md5(content).hexdigest(), *chart_meta_keys(content)),
                         )
                     if readd:
                         self._append_charts_to_chunk(cur, [(arcname, content) for *_, arcname, content in readd])

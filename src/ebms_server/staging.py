@@ -6,6 +6,9 @@
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
+- 파일이 SIMILAR_FILES개 미만인 곡(차분·추가 채보로 보이는 곡)은 겹치는 차트가 없으면 #TITLE·#ARTIST·#BPM·#GENRE 중
+  2개 이상 같은 기존 곡을 비슷한 곡(similar) 후보로 찾고, 가장 많이 겹치는 곡이 하나면 auto는 그 곡에 추가합니다.
+  파일이 그보다 많은 곡은 겹치는 차트로만 판정합니다.
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 """
 import hashlib
@@ -21,7 +24,7 @@ import uuid
 import zipfile
 
 from . import constant, db, importer
-from .db import Database, _chart_refs, chart_files
+from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +33,15 @@ STAGE_FILE = "stage.json"
 SAVE_INTERVAL = 2.0
 # 검토 화면 한 쪽의 곡 수
 UNITS_PER_PAGE = 50
-# 판정(suggestion.kind): new 새 곡, add 기존 곡에 추가, ambiguous 기존 곡 여러 개와 겹침, unused 사용 중지한 곡과 겹침
-SUGGESTIONS = ("new", "add", "ambiguous", "unused")
+# 판정(suggestion.kind): new 새 곡, add 기존 곡에 추가, ambiguous 기존 곡 여러 개와 겹침, unused 사용 중지한 곡과 겹침,
+# similar 겹치는 차트는 없지만 이름·작곡가·BPM·장르 중 2개 이상 같은 기존 곡이 있음
+SUGGESTIONS = ("new", "add", "ambiguous", "unused", "similar")
+# 파일이 이 수 미만인 곡만 비슷한 곡을 찾습니다. 키음·BGA까지 다 든 곡은 보통 이보다 많고, 적으면 기존 곡의 추가 채보입니다.
+SIMILAR_FILES = 50
+# 비슷한 곡이 되려면 같아야 하는 항목(META_HEADERS) 수
+SIMILAR_MIN_FIELDS = 2
+# 비슷한 곡 후보 최대 수
+SIMILAR_LIMIT = 10
 
 _lock = threading.RLock()
 
@@ -118,14 +128,22 @@ def recover() -> None:
 
 # ---- 곡 분석 ----
 
+def _set_meta(chart: dict, content: bytes) -> None:
+    meta = chart_meta(content)
+    chart.update(meta)
+    chart["keys"] = meta_keys(meta)
+
+
 def _chart_info(path: pathlib.Path, root: pathlib.Path) -> dict:
     content = path.read_bytes()
-    return {
+    chart = {
         "path": path.relative_to(root).as_posix(),
         "size": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
         "target": None,
     }
+    _set_meta(chart, content)
+    return chart
 
 
 def _make_unit(unit_id: str, song_dir: pathlib.Path, folder: str) -> dict:
@@ -143,11 +161,66 @@ def _make_unit(unit_id: str, song_dir: pathlib.Path, folder: str) -> dict:
     }
 
 
-def _analyze(units: list[dict]) -> None:
-    """곡마다 겹치는 기존 곡을 찾아 판정(suggestion)과 차트별 상태(songs, deleted)를 채웁니다. 읽기만 합니다."""
+def _similar(cur, unit: dict) -> tuple[list[int], dict[str, list[str]], int | None]:
+    """파일이 적고 겹치는 차트가 없는 곡과 META_HEADERS 중 SIMILAR_MIN_FIELDS개 이상 같은 기존 곡.
+    (후보 곡 번호(많이 겹치는 순), {곡 번호: 같은 항목}, auto로 추가할 곡 번호(가장 많이 겹치는 곡이 하나일 때))."""
+    if unit["files"] >= SIMILAR_FILES:
+        return [], {}, None
+    mine = {field: {chart["keys"][field] for chart in unit["charts"] if chart["keys"].get(field)} for field in META_HEADERS}
+    # 후보: 이름이나 작곡가가 같거나, BPM과 장르가 같은 차트의 곡. 두 항목이 같으려면 이 중 하나는 맞아야 합니다.
+    where, args = [], []
+    for field in ("title", "artist"):
+        if mine[field]:
+            where.append(f"{field}_key IN ({', '.join(['%s'] * len(mine[field]))})")
+            args.extend(sorted(mine[field]))
+    for bpm in sorted(mine["bpm"]):
+        for genre in sorted(mine["genre"]):
+            where.append("(bpm_key = %s AND genre_key = %s)")
+            args.extend((bpm, genre))
+    if not where:
+        return [], {}, None
+    cur.execute(f"SELECT DISTINCT song_id FROM chart WHERE song_id IS NOT NULL AND ({' OR '.join(where)})", tuple(args))
+    ids = sorted(row[0] for row in cur.fetchall())
+    if not ids:
+        return [], {}, None
+    cur.execute(
+        f"SELECT song_id, title_key, artist_key, bpm_key, genre_key FROM chart WHERE song_id IN ({', '.join(['%s'] * len(ids))})",
+        tuple(ids),
+    )
+    theirs: dict[int, dict[str, set[str]]] = {}
+    for song_id, *keys in cur.fetchall():
+        song = theirs.setdefault(song_id, {field: set() for field in META_HEADERS})
+        for field, key in zip(META_HEADERS, keys):
+            if key:
+                song[field].add(key)
+    matches = {}
+    for song_id, song in theirs.items():
+        same = [field for field in META_HEADERS if mine[field] & song[field]]
+        if len(same) >= SIMILAR_MIN_FIELDS:
+            matches[song_id] = same
+    songs = sorted(matches, key=lambda i: (-len(matches[i]), i))[:SIMILAR_LIMIT]
+    top = [i for i in songs if len(matches[i]) == len(matches[songs[0]])] if songs else []
+    merge = top[0] if len(top) == 1 else None
+    return songs, {str(i): matches[i] for i in songs}, merge
+
+
+def _fill_meta(stage: dict, unit: dict) -> None:
+    """헤더를 읽기 전 버전에서 넣은 곡의 차트를 읽어 채웁니다."""
+    for chart in unit["charts"]:
+        if "keys" in chart:
+            continue
+        try:
+            _set_meta(chart, (_unit_dir(stage, unit) / chart["path"]).read_bytes())
+        except OSError:
+            chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS})
+
+
+def _analyze(stage: dict) -> None:
+    """곡마다 겹치는 기존 곡을 찾아 판정(suggestion)과 차트별 상태(songs, deleted)를 채웁니다. DB는 읽기만 합니다."""
     Database()  # 테이블 준비
     with db.connect() as con, con.cursor() as cur:
-        for unit in units:
+        for unit in stage["units"]:
+            _fill_meta(stage, unit)
             songs: list[int] = []
             deleted = None
             for chart in unit["charts"]:
@@ -167,15 +240,17 @@ def _analyze(units: list[dict]) -> None:
                 if chart["song_id"] is not None and chart["song_id"] not in songs:
                     songs.append(chart["song_id"])
             songs.sort()
+            merge, matches = None, {}
             if deleted is not None:
                 kind = "unused"
             elif not songs:
-                kind = "new"
+                songs, matches, merge = _similar(cur, unit)
+                kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted}
+            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches}
 
 
 def analyze(stage_id: str) -> dict:
@@ -183,7 +258,7 @@ def analyze(stage_id: str) -> dict:
     with _lock:
         stage = _load(stage_id)
         _require_ready(stage)
-        _analyze(stage["units"])
+        _analyze(stage)
         stage["analyzed_at"] = int(time.time())
         _save(stage)
     return summary(stage)
@@ -236,7 +311,7 @@ class _Writer:
             self.job.stage_id = None
             return
         try:
-            _analyze(stage["units"])
+            _analyze(stage)
             stage["analyzed_at"] = int(time.time())
         except Exception:
             logger.exception(f"staging analyze failed[{stage['id']}]")
@@ -408,7 +483,9 @@ def _matches(unit: dict, show: str, q: str) -> bool:
     if show == "failed" and not (unit.get("result") and unit["result"].get("error")):
         return False
     if q:
-        text = "\n".join([unit["folder"], *(chart["path"] for chart in unit["charts"])]).lower()
+        text = "\n".join(
+            [unit["folder"], *(f"{c['path']}\n{c.get('title', '')}\n{c.get('artist', '')}\n{c.get('genre', '')}" for c in unit["charts"])]
+        ).lower()
         if q.lower() not in text:
             return False
     return True
@@ -431,7 +508,7 @@ SORTS = {
 
 
 def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: str = "") -> dict:
-    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused)이나 changed(대상을 바꾼 곡), failed(지난 commit에서 실패).
+    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused/similar)이나 changed(대상을 바꾼 곡), failed(지난 commit에서 실패).
     sort는 SORTS의 이름(파일 수 많은/적은 순)이고, 없거나 모르는 값이면 넣은 순서입니다."""
     with _lock:
         stage = _load(stage_id)
@@ -454,8 +531,28 @@ def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: s
         total=len(units),
         items=items,
         songs={str(k): v for k, v in folders.items()},
+        similar_files=SIMILAR_FILES,
     )
     return result
+
+
+def unit_files(stage_id: str, unit_id: str) -> list[dict]:
+    """곡에서 차트가 아닌 파일 [{path, size}] (경로 순)."""
+    with _lock:
+        stage = _load(stage_id)
+    unit = next((u for u in stage["units"] if u["id"] == unit_id), None)
+    if unit is None:
+        raise StageError(404, "unit not found")
+    root = _unit_dir(stage, unit)
+    charts = {chart["path"] for chart in unit["charts"]}
+    files = []
+    for path in root.rglob("*") if root.is_dir() else []:
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel not in charts:
+            files.append({"path": rel, "size": path.stat().st_size})
+    return sorted(files, key=lambda f: f["path"].lower())
 
 
 def _check_target(value, allow_none: bool) -> str | int | None:
@@ -559,6 +656,13 @@ def _groups(unit: dict) -> list[tuple[str | int, list[str]]]:
     return list(groups.items())
 
 
+def _auto(unit: dict, target: str | int) -> str | int | None:
+    """SongBatch.add의 target. auto는 비슷한 곡 판정의 추가할 곡이 있으면 그 곡, 없으면 None(겹치는 차트로 판정)."""
+    if target != "auto":
+        return target
+    return (unit.get("suggestion") or {}).get("merge")
+
+
 def _label(unit: dict, charts: list[str], split: bool) -> str:
     return f"{unit['folder']} [{', '.join(charts)}]" if split else unit["folder"]
 
@@ -614,7 +718,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     try:
                         song_dir = _subset(unit_dir, charts, all_charts, work) if split else unit_dir
                         job.apply_limits(batch)
-                        info = importer._insert(batch, song_dir, label, remove=False, target=None if target == "auto" else target)
+                        info = importer._insert(batch, song_dir, label, remove=False, target=_auto(unit, target))
                     except Exception as e:
                         logger.exception(f"commit failed[{label}]")
                         info = {"folder": label, "error": str(e) or type(e).__name__}
@@ -634,7 +738,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
             stage["error"] = None
             if stage["units"]:
                 try:
-                    _analyze(stage["units"])
+                    _analyze(stage)
                     stage["analyzed_at"] = int(time.time())
                 except Exception:
                     logger.exception(f"staging analyze failed[{stage_id}]")
