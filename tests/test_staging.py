@@ -219,3 +219,17 @@ def test_bad_stage_id(client, monkeypatch):
     assert client.get("/api/admin/import/stages/..").status_code == 404
     assert client.get("/api/admin/import/stages/abc").status_code == 404
     assert client.delete("/api/admin/import/stages/abc").status_code == 404
+
+
+def test_sort_by_file_count(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    job = stage(client, "pack.zip", make_zip({
+        "p/b/b.bms": b"#B\n", "p/b/1.wav": b"1", "p/b/2.wav": b"2",
+        "p/a/a.bms": b"#A\n",
+        "p/c/c.bms": b"#C\n", "p/c/1.wav": b"1",
+    }))
+    sid = job["stage_id"]
+    order = lambda sort: [u["folder"] for u in detail(client, sid, sort=sort)["items"]]
+    assert order("files_desc") == ["pack/p/b", "pack/p/c", "pack/p/a"]
+    assert order("files_asc") == ["pack/p/a", "pack/p/c", "pack/p/b"]
+    assert sorted(order("")) == sorted(order("nope")) == ["pack/p/a", "pack/p/b", "pack/p/c"]

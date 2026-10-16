@@ -423,11 +423,21 @@ def _song_folders(song_ids: set[int]) -> dict[int, str]:
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "") -> dict:
-    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused)이나 changed(대상을 바꾼 곡), failed(지난 commit에서 실패)."""
+# 검토 화면의 곡 정렬. 기본("")은 묶음에 넣은 순서입니다.
+SORTS = {
+    "files_desc": lambda unit: (-unit["files"], unit["folder"]),
+    "files_asc": lambda unit: (unit["files"], unit["folder"]),
+}
+
+
+def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: str = "") -> dict:
+    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused)이나 changed(대상을 바꾼 곡), failed(지난 commit에서 실패).
+    sort는 SORTS의 이름(파일 수 많은/적은 순)이고, 없거나 모르는 값이면 넣은 순서입니다."""
     with _lock:
         stage = _load(stage_id)
     units = [unit for unit in stage["units"] if _matches(unit, show, q.strip())]
+    if sort in SORTS:
+        units.sort(key=SORTS[sort])
     pages = max(1, -(-len(units) // UNITS_PER_PAGE))
     page = min(max(1, page), pages)
     items = units[(page - 1) * UNITS_PER_PAGE : page * UNITS_PER_PAGE]

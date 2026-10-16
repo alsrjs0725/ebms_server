@@ -149,7 +149,14 @@
                     <option value="failed">지난 commit 실패·충돌</option>
                 </select>
             </div>
-            <div class="col-sm-8 col-md-6">
+            <div class="col-sm-4 col-md-3">
+                <select class="form-select form-select-sm" id="stage-sort" aria-label="정렬">
+                    <option value="">넣은 순서</option>
+                    <option value="files_desc">파일 많은 순</option>
+                    <option value="files_asc">파일 적은 순</option>
+                </select>
+            </div>
+            <div class="col-sm-4 col-md-6">
                 <input class="form-control form-control-sm" type="search" id="stage-q" placeholder="폴더명, 채보 파일명" aria-label="곡 검색">
             </div>
         </div>
