@@ -1797,6 +1797,15 @@ class Database:
             cur.execute("SELECT id, sha256 FROM pre_chunk ORDER BY id")
             return {row[0]: row[1] for row in cur.fetchall()}
 
+    def get_chunk_sizes(self) -> dict[str, dict[int, dict]]:
+        """차트·사전 청크별 SHA-256과 바이트 크기. 클라이언트가 동기화 전에 받을 용량을 셉니다."""
+        out: dict[str, dict[int, dict]] = {}
+        with connect() as con, con.cursor() as cur:
+            for key, table in (("chart", "chart_chunk"), ("asset", "pre_chunk")):
+                cur.execute(f"SELECT id, sha256, size FROM {table} ORDER BY id")
+                out[key] = {row[0]: {"sha256": row[1], "size": row[2]} for row in cur.fetchall()}
+        return out
+
     def get_manifest_hash(self) -> dict[int, str]:
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT id, sha256 FROM manifest_chunk ORDER BY id")

@@ -332,6 +332,12 @@ def pre_asset_hash(user: Annotated[User, Depends(current_user)]):
     return Database().get_pre_chunk_hash()
 
 
+@router.get("/api/pre/sizes")
+def pre_chunk_sizes(user: Annotated[User, Depends(current_user)]):
+    """차트·사전 청크별 SHA-256과 크기. 클라이언트가 동기화 전에 받을 용량을 보여 줄 때 씁니다."""
+    return Database().get_chunk_sizes()
+
+
 @router.get("/api/pre/asset/{chunk_id}")
 def pre_asset_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
     return _pre_blob(request, "pre_chunk", chunk_id, constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)

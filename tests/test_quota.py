@@ -204,6 +204,7 @@ def test_download_api_requires_login(tmp_path, client):
     add_songs(tmp_path, 1)
     for path in (
         "/api/pre/charthash",
+        "/api/pre/sizes",
         "/api/pre/chart/0",
         "/api/pre/manifest/hash",
         "/api/pre/manifest/0",
@@ -227,6 +228,11 @@ def test_pre_endpoints_and_usage(tmp_path, client, monkeypatch):
     }
     chunk = client.get("/api/pre/chart/0", headers=h)
     assert chunk.status_code == 200
+    sizes = client.get("/api/pre/sizes", headers=h).json()
+    assert sizes["chart"]["0"] == {"sha256": Database().get_chart_chunk_hash()[0], "size": len(chunk.content)}
+    assert {k: v["sha256"] for k, v in sizes["asset"].items()} == {
+        str(k): v for k, v in Database().get_pre_chunk_hash().items()
+    }
     assert client.get("/api/pre/chart/0", headers={**h, "Range": "bytes=0-9"}).content == chunk.content[:10]
     assert client.get("/api/pre/manifest/hash", headers=h).json() == {
         str(k): v for k, v in Database().get_manifest_hash().items()
