@@ -3,7 +3,8 @@ import pathlib
 
 BASE_DIR = pathlib.Path(__file__).resolve().parents[2]
 
-BMS_FORMAT = (".bms", ".bme", ".bml", ".pms")
+# 차트 파일 확장자. .bmson은 JSON 형식 차트입니다(db.chart_meta·_chart_refs가 내용으로 구분).
+BMS_FORMAT = (".bms", ".bme", ".bml", ".pms", ".bmson")
 # 차트 헤더가 가리키는 파일의 확장자가 실제와 달라도 같은 종류면 같은 파일로 봅니다.
 IMAGE_FORMAT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
 AUDIO_FORMAT = (".wav", ".ogg", ".mp3", ".flac")
