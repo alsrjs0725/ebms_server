@@ -4,6 +4,7 @@
 
 - 테이블에 없는 컬럼 추가, 곡 매니페스트 채우기 (서버 시작 시에도 자동 실행)
 - chart chunk 안의 항목 이름을 {sha256}{ext}로 변경. chunk 해시가 바뀌므로 클라이언트는 다시 받습니다.
+- 차트 확장자에 새로 더한 파일(.bmson)을 기존 곡에서 차트로 등록 (서버 시작 시에도 자동 실행)
 """
 import logging
 
@@ -12,7 +13,9 @@ from .db import Database
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    Database().migrate_chart_chunk_names()
+    db = Database()
+    db.migrate_chart_chunk_names()
+    db.backfill_chart_formats()
 
 
 if __name__ == "__main__":

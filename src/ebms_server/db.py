@@ -384,7 +384,7 @@ PLAY_HEADER = re.compile(rb"#(?:WAV|BMP)[0-9A-Z]{2}[ \t]", re.IGNORECASE)
 # 차트 헤더 값(파일명)의 인코딩 후보
 CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
 # pre/play 판정 규칙 버전. 규칙을 바꾸면 올리고, 서버 시작 시 이전 규칙으로 판정한 곡을 다시 판정합니다.
-FILE_KINDS_VERSION = 2
+FILE_KINDS_VERSION = 3
 # FILE_KINDS_VERSION을 적용한 버전을 저장하는 setting 이름
 FILE_KINDS_SETTING = "file_kinds_version"
 # 지금 차트 청크·사전 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK)를 저장하는 setting 이름.
@@ -394,6 +394,18 @@ PRE_CHUNK_SETTING = "pre_chunk_songs"
 # 차트 청크를 다시 묶는 중일 때 옛 청크의 마지막 번호와 단계(copy: 새 청크를 만드는 중, delete: 옛 청크를 지우는 중)
 CHART_RECHUNK_SETTING = "chart_rechunk_old_max"
 CHART_RECHUNK_PHASE_SETTING = "chart_rechunk_phase"
+# 기존 곡의 차트를 찾을 때 쓴 차트 확장자(BMS_FORMAT, 쉼표로 이음). 없으면 .bmson을 넣기 전 확장자로 봅니다.
+# BMS_FORMAT에 확장자를 더하면 서버 시작 뒤 backfill_chart_formats가 기존 곡에서 그 확장자 파일을 차트로 등록합니다.
+CHART_FORMATS_SETTING = "chart_formats"
+LEGACY_CHART_FORMATS = (".bms", ".bme", ".bml", ".pms")
+# bmson 차트 info의 이미지·오디오 항목. PRE_HEADERS와 같은 사전 파일입니다.
+BMSON_PRE_FIELDS = {
+    "banner_image": constant.IMAGE_FORMAT,
+    "eyecatch_image": constant.IMAGE_FORMAT,
+    "back_image": constant.IMAGE_FORMAT,
+    "title_image": constant.IMAGE_FORMAT,
+    "preview_music": constant.AUDIO_FORMAT,
+}
 
 
 # 곡 이름 끝의 난이도·모드 표기([ANOTHER], (7KEYS), -HYPER-, 【SP】 등). 같은 곡의 차트마다 붙는 것이라 이름 비교에서 뺍니다.
@@ -414,8 +426,44 @@ def _decode_header(value: bytes) -> str:
     return value.decode("utf-8", "replace")
 
 
+def _bmson(chart: bytes) -> dict | None:
+    """bmson(JSON) 차트면 최상위 객체, 아니면 None. BMS 차트는 '{'로 시작하지 않습니다."""
+    if not chart.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"{"):
+        return None
+    for encoding in ("utf-8-sig", *CHART_ENCODINGS[1:]):
+        try:
+            data = json.loads(chart.decode(encoding))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _bmson_info(data: dict) -> dict:
+    info = data.get("info")
+    return info if isinstance(info, dict) else {}
+
+
+def _bmson_text(value) -> str:
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return f"{value:g}" if isinstance(value, float) else str(value)
+    return value.strip() if isinstance(value, str) else ""
+
+
 def chart_meta(chart: bytes) -> dict[str, str]:
-    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''."""
+    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''.
+    bmson은 info의 title·artist·init_bpm·genre입니다(subtitle은 BMS #TITLE의 난이도 표기와 같아 뺍니다)."""
+    data = _bmson(chart)
+    if data is not None:
+        info = _bmson_info(data)
+        return {
+            "title": _bmson_text(info.get("title")),
+            "artist": _bmson_text(info.get("artist")),
+            "bpm": _bmson_text(info.get("init_bpm")),
+            "genre": _bmson_text(info.get("genre")),
+        }
     meta = {}
     for line in chart.splitlines():
         line = line.strip()
@@ -486,9 +534,38 @@ def _header_paths(value: bytes, base: str) -> list[str]:
     return paths
 
 
+def _bmson_refs(data: dict, base: str) -> tuple[list[tuple[str, tuple[str, ...]]], set[str]]:
+    """bmson 차트가 가리키는 파일(_chart_refs와 같은 형식). info의 이미지·프리뷰가 사전, sound_channels·bga_header가 키음·BGA입니다."""
+    def path(name) -> str | None:
+        if not isinstance(name, str) or not name.strip():
+            return None
+        return posixpath.normpath(posixpath.join(base, name.strip().replace("\\", "/"))).lower()
+
+    pre_targets = []
+    info = _bmson_info(data)
+    for field, formats in BMSON_PRE_FIELDS.items():
+        target = path(info.get(field))
+        if target is not None and posixpath.splitext(target)[1] in formats:
+            pre_targets.append((target, formats))
+    play_stems = set()
+    bga = data.get("bga")
+    items = [
+        *(data.get("sound_channels") or []),
+        *((bga.get("bga_header") or []) if isinstance(bga, dict) else []),
+    ]
+    for item in items:
+        target = path(item.get("name")) if isinstance(item, dict) else None
+        if target is not None:
+            play_stems.add(posixpath.splitext(target)[0])
+    return pre_targets, play_stems
+
+
 def _chart_refs(chart: bytes, base: str) -> tuple[list[tuple[str, tuple[str, ...]]], set[str]]:
     """차트가 가리키는 파일. (사전 헤더의 (소문자 경로, 대체 가능한 확장자) 목록, 키음·BGA의 소문자 확장자 뺀 경로)를
     반환합니다. 사전 헤더 값의 확장자가 그 헤더의 형식이 아니면(확장자 없음 포함) 무시합니다. base는 차트가 있는 폴더입니다."""
+    data = _bmson(chart)
+    if data is not None:
+        return _bmson_refs(data, base)
     pre_targets = []
     play_stems = set()
     for line in chart.splitlines():
@@ -1425,6 +1502,93 @@ class Database:
                     )
                 con.commit()
         return filled
+
+    def backfill_chart_formats(self) -> int:
+        """BMS_FORMAT에 새로 더한 확장자(.bmson 등)의 기존 곡 파일을 차트로 등록합니다. 등록한 차트 수를 반환합니다.
+
+        이전에는 차트가 아니어서 곡 zip에만 있던 파일입니다. 곡 매니페스트에서 그 확장자 항목을 찾아 곡 zip에서 읽고,
+        chart 테이블과 차트 청크에 넣습니다(insert_song과 같음). 같은 차트가 이미 있으면(다른 곡에 있거나 지운 곡에 남은 차트)
+        지운 곡의 것만 이 곡에 다시 붙입니다. BACKFILL_BATCH_SONGS곡마다 커밋하고, 모두 끝나면 CHART_FORMATS_SETTING을
+        현재 BMS_FORMAT으로 바꿉니다. 실패한 곡이 있으면 바꾸지 않아 다음 시작 때 다시 시도합니다(이미 넣은 차트는 건너뜀).
+        pre/play kind는 FILE_KINDS_VERSION을 올려 backfill_file_kinds가 다시 판정합니다."""
+        with connect() as con, con.cursor() as cur:
+            saved = self._setting(cur, CHART_FORMATS_SETTING)
+        old = tuple(saved.split(",")) if saved is not None else LEGACY_CHART_FORMATS
+        added = [ext for ext in constant.BMS_FORMAT if ext not in old]
+        if not added:
+            if saved != ",".join(constant.BMS_FORMAT):
+                with self._write_lock, connect() as con, con.cursor() as cur:
+                    self._set_setting(cur, CHART_FORMATS_SETTING, ",".join(constant.BMS_FORMAT))
+                    con.commit()
+            return 0
+
+        with connect() as con, con.cursor() as cur:
+            # 매니페스트는 JSON이라 경로 뒤에 '"'가 붙습니다. 대소문자는 파이썬에서 다시 확인합니다.
+            where = " OR ".join("LOWER(files) LIKE %s" for _ in added)
+            cur.execute(f"SELECT id FROM song WHERE files IS NOT NULL AND ({where}) ORDER BY id", [f'%{ext}"%' for ext in added])
+            song_ids = [row[0] for row in cur.fetchall()]
+        if song_ids:
+            self.logger.info(f"backfill_chart_formats: Checking {len(song_ids)} songs for {', '.join(added)} charts.")
+
+        inserted = failed = 0
+        step = constant.BACKFILL_BATCH_SONGS
+        for i in range(0, len(song_ids), step):
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    new_charts = []
+                    for song_id in song_ids[i : i + step]:
+                        cur.execute("SAVEPOINT song")
+                        try:
+                            new_charts += self._register_song_charts(cur, song_id, added)
+                            cur.execute("RELEASE SAVEPOINT song")
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT song")
+                            failed += 1
+                            self.logger.exception(f"backfill_chart_formats: Skipped song[{song_id}]")
+                    if new_charts:
+                        self._append_charts_to_chunk(cur, new_charts)
+                    con.commit()
+                    inserted += len(new_charts)
+                except Exception:
+                    con.rollback()
+                    failed += 1
+                    self.logger.exception(f"backfill_chart_formats: Skipped songs from song[{song_ids[i]}]")
+
+        if failed:
+            self.logger.warning(f"backfill_chart_formats: {failed} songs failed. Retrying on next start.")
+        else:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                self._set_setting(cur, CHART_FORMATS_SETTING, ",".join(constant.BMS_FORMAT))
+                con.commit()
+        if inserted or song_ids:
+            self.logger.info(f"backfill_chart_formats: Registered {inserted} charts.")
+        return inserted
+
+    def _register_song_charts(self, cur, song_id: int, exts: list[str]) -> list[tuple[str, bytes]]:
+        """곡 zip에서 확장자가 exts인 파일을 차트로 등록합니다. 차트 청크에 넣을 (항목 이름, 내용) 목록을 반환합니다."""
+        cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        files = json.loads(row[0]) if row and row[0] else []
+        new_charts = []
+        for entry in files:
+            path = pathlib.PurePosixPath(entry["path"])
+            if path.suffix.lower() not in exts:
+                continue
+            content = self._read_song_member(cur, song_id, entry)
+            sha256 = hashlib.sha256(content).hexdigest()
+            cur.execute(
+                "INSERT IGNORE INTO chart (id, song_id, size, filename, md5, title_key, artist_key, bpm_key, genre_key)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (sha256, song_id, len(content), entry["path"], hashlib.md5(content).hexdigest(), *chart_meta_keys(content)),
+            )
+            if cur.rowcount == 1:
+                new_charts.append((chart_arcname(sha256, path), content))
+            else:
+                cur.execute(
+                    "UPDATE chart SET song_id = %s, filename = %s WHERE id = %s AND size = %s AND song_id IS NULL",
+                    (song_id, entry["path"], sha256, len(content)),
+                )
+        return new_charts
 
     def get_song_data(self, song_id: int) -> bytes | None:
         """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
