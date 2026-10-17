@@ -1,7 +1,7 @@
-"""곡 임포트 대기(staged). 올린 zip과 var/tmp의 곡을 바로 DB에 넣지 않고 `var/staged/`에 곡 단위로 풀어 두고,
+"""곡 임포트 대기(staged). 올린 zip·rar와 var/tmp의 곡을 바로 DB에 넣지 않고 `var/staged/`에 곡 단위로 풀어 두고,
 관리자가 곡마다(또는 차트마다) 넣을 곳을 검토·지정한 뒤 commit하면 그때 등록합니다.
 
-- 묶음(stage): zip 하나 또는 var/tmp 가져오기 한 번. `var/staged/{묶음}/stage.json`에 상태와 곡 목록을 두고,
+- 묶음(stage): zip이나 rar(분할 압축이면 볼륨 전체) 하나, 또는 var/tmp 가져오기 한 번. `var/staged/{묶음}/stage.json`에 상태와 곡 목록을 두고,
   곡은 `var/staged/{묶음}/{곡}/{폴더명}/`에 풉니다. 디스크에 있으므로 서버를 다시 시작해도 남습니다.
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
@@ -23,7 +23,7 @@ import time
 import uuid
 import zipfile
 
-from . import constant, db, importer
+from . import constant, db, importer, rar
 from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
 
 logger = logging.getLogger(__name__)
@@ -348,6 +348,51 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
     return len(groups)
 
 
+def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Path) -> None:
+    """곡 폴더들을 묶음의 곡으로 옮깁니다. 곡 이름(folder)은 root 기준 경로입니다."""
+    writer.job.total = (writer.job.total or 0) + len(song_dirs)
+    for song_dir in song_dirs:
+        folder = song_dir.relative_to(root).as_posix()
+        unit_id, work = writer.unit_dir()
+        work.mkdir()
+        try:
+            shutil.move(song_dir, work / song_dir.name)
+        except OSError as e:
+            logger.exception(f"staging failed[{song_dir}]")
+            shutil.rmtree(work, ignore_errors=True)
+            writer.error(folder, str(e) or type(e).__name__)
+            continue
+        writer.add(unit_id, work / song_dir.name, folder)
+
+
+def _stage_rar(writer: _Writer, first: pathlib.Path, filename: str | None = None) -> None:
+    """rar(첫 볼륨 first, 나머지 볼륨은 같은 폴더)를 묶음 안 임시 폴더에 통째로 푼 뒤 곡 폴더를 옮깁니다.
+    최상위에 차트가 있으면 rar 이름을 곡 폴더명으로 씁니다. 풀지 못하면 rar.RarError."""
+    name = rar.stem(pathlib.PurePath((filename or first.name).replace("\\", "/")).name)
+    if name in ("", ".", ".."):
+        name = "song"
+    work = _dir(writer.stage["id"]) / f"rar-{uuid.uuid4().hex[:12]}"
+    try:
+        rar.extract(first, work / name)
+        _move_songs(writer, importer.find_song_dirs(work / name), work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def stage_rar(first: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
+    """올린 rar(분할 압축이면 첫 볼륨, 나머지는 같은 폴더) 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    stage = _new_stage("rar", filename)
+    job.stage_id = stage["id"]
+    writer = _Writer(stage, job)
+    try:
+        _stage_rar(writer, first, filename)
+    except BaseException as e:
+        writer.finish(f"rar를 다 풀지 못했습니다: {e}")
+        raise
+    writer.finish()
+    return stage if stage["units"] else None
+
+
 def stage_zip(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
     """올린 zip 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
     stage = _new_stage("zip", filename)
@@ -363,8 +408,8 @@ def stage_zip(path: pathlib.Path, filename: str, job: importer.Job) -> dict | No
 
 
 def stage_tmp(job: importer.Job) -> dict | None:
-    """`var/tmp/`의 곡 폴더와 zip을 새 묶음으로 옮깁니다. 곡 폴더는 옮기고(원래 자리에서 사라짐),
-    zip은 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    """`var/tmp/`의 곡 폴더와 zip·rar를 새 묶음으로 옮깁니다. 곡 폴더는 옮기고(원래 자리에서 사라짐),
+    zip과 rar(분할 압축이면 볼륨 전체)는 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
     root = constant.TMP_DIR
     root.mkdir(parents=True, exist_ok=True)
     stage = _new_stage("tmp", "var/tmp")
@@ -377,19 +422,7 @@ def stage_tmp(job: importer.Job) -> dict | None:
                 logger.warning(f"import: skipped symlink[{child}]")
             elif child.is_dir():
                 song_dirs.extend(importer.find_song_dirs(child))
-        job.total = len(song_dirs)
-        for song_dir in song_dirs:
-            folder = song_dir.relative_to(root).as_posix()
-            unit_id, work = writer.unit_dir()
-            work.mkdir()
-            try:
-                shutil.move(song_dir, work / song_dir.name)
-            except OSError as e:
-                logger.exception(f"staging failed[{song_dir}]")
-                shutil.rmtree(work, ignore_errors=True)
-                writer.error(folder, str(e) or type(e).__name__)
-                continue
-            writer.add(unit_id, work / song_dir.name, folder)
+        _move_songs(writer, song_dirs, root)
         for path in sorted(p for p in root.iterdir() if p.suffix.lower() == ".zip"):
             if path.is_symlink() or not path.is_file():
                 if path.is_symlink():
@@ -398,12 +431,28 @@ def stage_tmp(job: importer.Job) -> dict | None:
             start = len(job.songs)
             try:
                 _stage_zip(writer, path, path.name)
+            except importer.ZipNameEncodingError as e:
+                logger.warning(f"stage_tmp: {e} [{path}]")
+                writer.error(path.name, str(e))
+                continue
             except (zipfile.BadZipFile, OSError) as e:
                 logger.warning(f"stage_tmp: cannot read zip[{path}]: {e}")
                 writer.error(path.name, f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}")
                 continue
             if not any("error" in song for song in job.songs[start:]):
                 path.unlink(missing_ok=True)
+        files = [p.name for p in root.iterdir() if rar.is_volume(p.name) and p.is_file() and not p.is_symlink()]
+        for names in rar.volume_sets(files).values():
+            start = len(job.songs)
+            try:
+                _stage_rar(writer, root / rar.first_volume(names))
+            except (rar.RarError, OSError) as e:
+                logger.warning(f"stage_tmp: cannot extract rar[{names[0]}]: {e}")
+                writer.error(names[0], f"{e} (아직 복사 중이거나 볼륨이 빠졌을 수 있습니다)")
+                continue
+            if not any("error" in song for song in job.songs[start:]):
+                for name in names:
+                    (root / name).unlink(missing_ok=True)
     except BaseException as e:
         writer.finish(f"var/tmp를 다 옮기지 못했습니다: {e}")
         raise

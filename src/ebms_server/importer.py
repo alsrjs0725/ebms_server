@@ -1,7 +1,7 @@
 """곡 임포트. 폴더 트리에서 차트 파일이 있는 폴더를 곡 하나로 보고 DB에 등록합니다.
 
-- 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip을 대기 묶음(staging.py)으로 옮깁니다.
-- 관리자 페이지는 zip을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
+- 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip·rar를 대기 묶음(staging.py)으로 옮깁니다.
+- 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
   작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음).
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
@@ -24,6 +24,7 @@ from .db import AmbiguousSongError, Database
 logger = logging.getLogger(__name__)
 
 # zip 항목 이름에 UTF-8 플래그가 없을 때 시도할 인코딩. 일본 BMS 패키지는 대부분 cp932입니다.
+# 점수가 같으면 앞의 인코딩을 고릅니다.
 ZIP_NAME_ENCODINGS = ("utf-8", "cp932", "cp949")
 
 
@@ -168,6 +169,10 @@ def import_tmp(job: Job | None = None) -> list[dict]:
         start = len(job.songs)
         try:
             import_zip(path, path.name, job)
+        except ZipNameEncodingError as e:
+            logger.warning(f"import_tmp: {e} [{path}]")
+            job.songs.append({"folder": path.name, "error": str(e)})
+            continue
         except (zipfile.BadZipFile, OSError) as e:
             logger.warning(f"import_tmp: cannot read zip[{path}]: {e}")
             job.songs.append({"folder": path.name, "error": f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}"})
@@ -178,20 +183,57 @@ def import_tmp(job: Job | None = None) -> list[dict]:
     return job.songs
 
 
-def _entry_name(info: zipfile.ZipInfo) -> str:
+class ZipNameEncodingError(ValueError):
+    """UTF-8 플래그가 없는 zip 항목 이름을 ZIP_NAME_ENCODINGS 중 어느 것으로도 다 풀 수 없습니다."""
+
+
+def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
+    """UTF-8 플래그가 없는 항목 이름의 원래 바이트. zipfile은 플래그가 없으면 cp437로 읽으므로 되돌립니다."""
     if info.flag_bits & 0x800:
-        return info.filename
-    # UTF-8 플래그가 없으면 zipfile은 cp437로 읽으므로 원래 바이트로 되돌려 다시 해석합니다.
-    try:
-        raw = info.filename.encode("cp437")
-    except UnicodeEncodeError:
-        return info.filename
+        return None
+    return info.filename.encode("cp437")
+
+
+def _odd_chars(text: str) -> int:
+    """잘못된 인코딩으로 풀면 늘어나는 문자 수. cp949 이름을 cp932로 풀면 반각 가타카나가,
+    cp932 이름을 cp949로 풀면 KS X 1001 밖의 확장 한글(UHC)이 잔뜩 나옵니다."""
+    count = 0
+    for ch in text:
+        if "\uff61" <= ch <= "\uff9f":
+            count += 1
+        elif "\uac00" <= ch <= "\ud7a3":
+            lead, trail = ch.encode("cp949")
+            if lead < 0xB0 or trail < 0xA1:
+                count += 1
+    return count
+
+
+def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
+    """UTF-8 플래그가 없는 항목 이름 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것.
+    zip 하나는 한 인코딩으로 만들어지므로 항목마다 따로 고르지 않습니다. 풀 이름이 없으면 None,
+    맞는 인코딩이 없으면 ZipNameEncodingError."""
+    raws = [raw for info in zf.infolist() if (raw := _raw_name(info)) is not None]
+    if not raws:
+        return None
+    best = None
+    failures = []
     for encoding in ZIP_NAME_ENCODINGS:
         try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
+            score = sum(_odd_chars(raw.decode(encoding)) for raw in raws)
+        except UnicodeDecodeError as e:
+            failures.append(f"{encoding}: {e.object!r}")
             continue
-    return info.filename
+        logger.debug(f"zip name encoding candidate[{encoding}] odd chars={score}")
+        if best is None or score < best[1]:
+            best = (encoding, score)
+    if best is None:
+        raise ZipNameEncodingError("zip 파일 이름의 인코딩을 알 수 없습니다(" + "; ".join(failures) + ")")
+    return best[0]
+
+
+def _entry_name(info: zipfile.ZipInfo, encoding: str | None) -> str:
+    raw = _raw_name(info)
+    return info.filename if raw is None else raw.decode(encoding)
 
 
 def _safe_parts(name: str) -> list[str] | None:
@@ -208,11 +250,12 @@ def _safe_parts(name: str) -> list[str] | None:
 def _song_groups(zf: zipfile.ZipFile) -> dict[tuple[str, ...], list[tuple[zipfile.ZipInfo, list[str]]]]:
     """zip 항목을 곡 폴더별로 묶습니다. 곡 폴더는 차트 파일이 바로 아래 있는 가장 바깥 폴더이고,
     그 아래 항목(bga 등)은 모두 그 곡에 속합니다. 어느 곡에도 속하지 않거나 위험한 경로의 항목은 버립니다."""
+    encoding = _zip_name_encoding(zf)
     entries = []
     for info in zf.infolist():
         if info.is_dir():
             continue
-        parts = _safe_parts(_entry_name(info))
+        parts = _safe_parts(_entry_name(info, encoding))
         if not parts:
             logger.warning(f"import_zip: skipped unsafe entry[{info.filename!r}]")
             continue
@@ -288,7 +331,7 @@ def start_upload(filename: str, size: int) -> dict:
     if size + DISK_MARGIN > free:
         raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     upload_id = uuid.uuid4().hex
-    path = constant.IMPORT_DIR / f"{upload_id}.zip"
+    path = constant.IMPORT_DIR / f"{upload_id}.upload"
     path.touch()
     with _lock:
         _uploads[upload_id] = {"filename": filename, "size": size, "path": path}
@@ -318,23 +361,70 @@ def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
 
 
 def finish_upload(upload_id: str) -> Job:
-    """다 받은 zip을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 zip을 지웁니다."""
-    upload = _upload(upload_id)
-    received = upload["path"].stat().st_size
-    if received != upload["size"]:
-        raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
-    with _lock:
-        _uploads.pop(upload_id, None)
-    job = Job("zip", upload["filename"])
+    return finish_uploads([upload_id])
 
-    def run():
-        from . import staging
+
+def finish_uploads(upload_ids: list[str]) -> Job:
+    """다 받은 파일을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 올린 파일을 지웁니다.
+    파일 하나면 zip 또는 rar, 여럿이면 한 rar 분할 압축의 볼륨들(첫 볼륨 포함)이어야 합니다."""
+    from . import rar
+    if not upload_ids or len(set(upload_ids)) != len(upload_ids):
+        raise UploadError(400, "upload ids required")
+    uploads = [_upload(i) for i in upload_ids]
+    for upload in uploads:
+        received = upload["path"].stat().st_size
+        if received != upload["size"]:
+            raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
+    names = [pathlib.PurePath(u["filename"].replace("\\", "/")).name for u in uploads]
+    volumes = rar.volume_sets(names)
+    if len(uploads) > 1 or volumes:
+        if len(volumes) != 1 or len(next(iter(volumes.values()))) != len(names):
+            raise UploadError(400, "여러 파일을 함께 올리려면 한 rar 분할 압축의 볼륨들이어야 합니다.")
+        if len({n.lower() for n in names}) != len(names):
+            raise UploadError(400, "같은 이름의 볼륨이 있습니다.")
         try:
-            staging.stage_zip(upload["path"], upload["filename"], job)
-        finally:
-            upload["path"].unlink(missing_ok=True)
+            first = rar.first_volume(names)
+        except rar.RarError as e:
+            raise UploadError(400, str(e))
+        # rar는 통째로 푸므로 rar 크기만큼 더 필요합니다.
+        need = sum(u["size"] for u in uploads) + DISK_MARGIN
+        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        if need > free:
+            raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, rar를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
+    with _lock:
+        for upload_id in upload_ids:
+            _uploads.pop(upload_id, None)
 
-    return _start(job, run)
+    if not volumes:
+        upload = uploads[0]
+        job = Job("zip", upload["filename"])
+
+        def run():
+            from . import staging
+            try:
+                staging.stage_zip(upload["path"], upload["filename"], job)
+            finally:
+                upload["path"].unlink(missing_ok=True)
+
+        return _start(job, run)
+
+    job = Job("rar", first)
+
+    def run_rar():
+        from . import staging
+        # unrar가 나머지 볼륨을 이름으로 찾으므로 원래 이름으로 한 폴더에 모읍니다.
+        folder = constant.IMPORT_DIR / uuid.uuid4().hex
+        try:
+            folder.mkdir()
+            for upload, name in zip(uploads, names):
+                upload["path"].rename(folder / name)
+            staging.stage_rar(folder / first, first, job)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+            for upload in uploads:
+                upload["path"].unlink(missing_ok=True)
+
+    return _start(job, run_rar)
 
 
 def cancel_upload(upload_id: str) -> None:
