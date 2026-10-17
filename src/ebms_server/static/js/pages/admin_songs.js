@@ -405,9 +405,45 @@ async function uploadFile(file, index, count) {
         offset = (await res.json()).received;
         progress(file, offset, index, count);
     }
-    const job = await postJson(`/api/admin/import/uploads/${upload.id}/finish`);
     currentUpload = null;
-    return job;
+    return upload.id;
+}
+
+// rar 분할 압축의 볼륨(이름.partN.rar, 또는 이름.rar·이름.rNN)은 묶음별로 모아 함께 올립니다(서버 rar.py와 같은 규칙).
+function rarKey(name) {
+    let m = /^(.*)\.part(\d+)\.rar$/i.exec(name);
+    if (m) return "part:" + m[1].toLowerCase();
+    m = /^(.*)\.(rar|r\d\d)$/i.exec(name);
+    return m ? "old:" + m[1].toLowerCase() : null;
+}
+
+function uploadGroups(files) {
+    const groups = new Map();
+    for (const file of files) {
+        const key = rarKey(file.name) ?? Symbol();
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(file);
+    }
+    return [...groups.values()];
+}
+
+async function uploadGroup(group, start, count) {
+    const ids = [];
+    try {
+        for (const [i, file] of group.entries()) {
+            progress(file, 0, start + i, count);
+            ids.push(await uploadFile(file, start + i, count));
+        }
+        return await (ids.length === 1
+            ? postJson(`/api/admin/import/uploads/${ids[0]}/finish`)
+            : postJson("/api/admin/import/uploads/finish", { ids }));
+    } catch (err) {
+        for (const id of [...ids, currentUpload].filter(Boolean)) {
+            fetch(`/api/admin/import/uploads/${id}`, { method: "DELETE" });
+        }
+        currentUpload = null;
+        throw err;
+    }
 }
 
 function busy(on) {
@@ -424,17 +460,16 @@ form.addEventListener("submit", async (e) => {
     cancelled = false;
     busy(true);
     const errors = [];
-    for (const [i, file] of files.entries()) {
-        progress(file, 0, i, files.length);
+    let start = 0;
+    for (const group of uploadGroups(files)) {
         try {
-            await uploadFile(file, i, files.length);
+            await uploadGroup(group, start, files.length);
             refreshJobs();
         } catch (err) {
-            errors.push(`${file.name}: ${err.message}`);
-            if (currentUpload) fetch(`/api/admin/import/uploads/${currentUpload}`, { method: "DELETE" });
-            currentUpload = null;
+            errors.push(`${group.map((f) => f.name).join(", ")}: ${err.message}`);
             if (cancelled) break;
         }
+        start += group.length;
     }
     busy(false);
     form.reset();
