@@ -317,9 +317,13 @@ def test_set_job_speed(client, monkeypatch):
 
 
 def _name_zip(info_cls, names: list[str]) -> zipfile.ZipFile:
+    return _mixed_name_zip([(info_cls, name) for name in names])
+
+
+def _mixed_name_zip(entries: list[tuple[type, str]]) -> zipfile.ZipFile:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        for name in names:
+        for info_cls, name in entries:
             zf.writestr(info_cls(name), b"")
     return zipfile.ZipFile(buf)
 
@@ -334,6 +338,13 @@ def test_zip_name_encoding():
     assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["夜想曲/音.wav", "夜想曲/a.bms"])) == "cp932"
     # 반각 가타카나뿐인 일본어 이름은 cp949로 풀리지 않으므로 cp932입니다.
     assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["ｱｲｳ/ﾄﾞﾗﾑ.wav"])) == "cp932"
-    # ASCII뿐이거나 UTF-8 플래그가 있으면 고를 필요가 없습니다.
-    assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["song/a.bms"])) is None
+    # ASCII 이름은 utf-8, UTF-8 플래그가 있으면 고를 필요가 없습니다.
+    assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["song/a.bms"])) == "utf-8"
     assert importer._zip_name_encoding(_name_zip(zipfile.ZipInfo, ["곡/a.bms"])) is None
+
+
+def test_zip_name_encoding_unknown():
+    # 한 인코딩으로 다 풀리지 않으면 항목별로 대신 풀지 않고 오류를 냅니다.
+    zf = _mixed_name_zip([(Cp932ZipInfo, "曲/ドラム.wav"), (Cp949ZipInfo, "曲/노래.bms")])
+    with pytest.raises(importer.ZipNameEncodingError, match="cp932"):
+        importer._song_groups(zf)

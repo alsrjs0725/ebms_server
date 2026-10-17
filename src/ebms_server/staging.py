@@ -398,6 +398,10 @@ def stage_tmp(job: importer.Job) -> dict | None:
             start = len(job.songs)
             try:
                 _stage_zip(writer, path, path.name)
+            except importer.ZipNameEncodingError as e:
+                logger.warning(f"stage_tmp: {e} [{path}]")
+                writer.error(path.name, str(e))
+                continue
             except (zipfile.BadZipFile, OSError) as e:
                 logger.warning(f"stage_tmp: cannot read zip[{path}]: {e}")
                 writer.error(path.name, f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}")

@@ -169,6 +169,10 @@ def import_tmp(job: Job | None = None) -> list[dict]:
         start = len(job.songs)
         try:
             import_zip(path, path.name, job)
+        except ZipNameEncodingError as e:
+            logger.warning(f"import_tmp: {e} [{path}]")
+            job.songs.append({"folder": path.name, "error": str(e)})
+            continue
         except (zipfile.BadZipFile, OSError) as e:
             logger.warning(f"import_tmp: cannot read zip[{path}]: {e}")
             job.songs.append({"folder": path.name, "error": f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}"})
@@ -179,14 +183,15 @@ def import_tmp(job: Job | None = None) -> list[dict]:
     return job.songs
 
 
+class ZipNameEncodingError(ValueError):
+    """UTF-8 플래그가 없는 zip 항목 이름을 ZIP_NAME_ENCODINGS 중 어느 것으로도 다 풀 수 없습니다."""
+
+
 def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
     """UTF-8 플래그가 없는 항목 이름의 원래 바이트. zipfile은 플래그가 없으면 cp437로 읽으므로 되돌립니다."""
     if info.flag_bits & 0x800:
         return None
-    try:
-        return info.filename.encode("cp437")
-    except UnicodeEncodeError:
-        return None
+    return info.filename.encode("cp437")
 
 
 def _odd_chars(text: str) -> int:
@@ -205,36 +210,30 @@ def _odd_chars(text: str) -> int:
 
 def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
     """UTF-8 플래그가 없는 항목 이름 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것.
-    zip 하나는 한 인코딩으로 만들어지므로 항목마다 따로 고르지 않습니다. 맞는 인코딩이 없으면 None."""
+    zip 하나는 한 인코딩으로 만들어지므로 항목마다 따로 고르지 않습니다. 풀 이름이 없으면 None,
+    맞는 인코딩이 없으면 ZipNameEncodingError."""
     raws = [raw for info in zf.infolist() if (raw := _raw_name(info)) is not None]
-    if all(raw.isascii() for raw in raws):
+    if not raws:
         return None
     best = None
+    failures = []
     for encoding in ZIP_NAME_ENCODINGS:
         try:
             score = sum(_odd_chars(raw.decode(encoding)) for raw in raws)
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as e:
+            failures.append(f"{encoding}: {e.object!r}")
             continue
+        logger.debug(f"zip name encoding candidate[{encoding}] odd chars={score}")
         if best is None or score < best[1]:
             best = (encoding, score)
     if best is None:
-        logger.warning(f"zip names fit no encoding of {ZIP_NAME_ENCODINGS}; decoding each entry separately")
-        return None
+        raise ZipNameEncodingError("zip 파일 이름의 인코딩을 알 수 없습니다(" + "; ".join(failures) + ")")
     return best[0]
 
 
-def _entry_name(info: zipfile.ZipInfo, encoding: str | None = None) -> str:
+def _entry_name(info: zipfile.ZipInfo, encoding: str | None) -> str:
     raw = _raw_name(info)
-    if raw is None:
-        return info.filename
-    if encoding:
-        return raw.decode(encoding)
-    for candidate in ZIP_NAME_ENCODINGS:
-        try:
-            return raw.decode(candidate)
-        except UnicodeDecodeError:
-            continue
-    return info.filename
+    return info.filename if raw is None else raw.decode(encoding)
 
 
 def _safe_parts(name: str) -> list[str] | None:
