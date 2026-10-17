@@ -10,6 +10,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN pip install --no-cache-dir "uv>=0.8,<0.13"
 
+# rar(분할 압축 포함) 곡 임포트용 unrar. Debian non-free 저장소에 있습니다.
+RUN sed -i -E 's/^(Components: .*)$/\1 non-free/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends unrar \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # 의존성만 먼저 설치해 레이어 캐시를 활용

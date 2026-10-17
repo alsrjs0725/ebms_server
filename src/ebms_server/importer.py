@@ -1,7 +1,7 @@
 """곡 임포트. 폴더 트리에서 차트 파일이 있는 폴더를 곡 하나로 보고 DB에 등록합니다.
 
-- 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip을 대기 묶음(staging.py)으로 옮깁니다.
-- 관리자 페이지는 zip을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
+- 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip·rar를 대기 묶음(staging.py)으로 옮깁니다.
+- 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
   작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음).
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
@@ -288,7 +288,7 @@ def start_upload(filename: str, size: int) -> dict:
     if size + DISK_MARGIN > free:
         raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     upload_id = uuid.uuid4().hex
-    path = constant.IMPORT_DIR / f"{upload_id}.zip"
+    path = constant.IMPORT_DIR / f"{upload_id}.upload"
     path.touch()
     with _lock:
         _uploads[upload_id] = {"filename": filename, "size": size, "path": path}
@@ -318,23 +318,70 @@ def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
 
 
 def finish_upload(upload_id: str) -> Job:
-    """다 받은 zip을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 zip을 지웁니다."""
-    upload = _upload(upload_id)
-    received = upload["path"].stat().st_size
-    if received != upload["size"]:
-        raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
-    with _lock:
-        _uploads.pop(upload_id, None)
-    job = Job("zip", upload["filename"])
+    return finish_uploads([upload_id])
 
-    def run():
-        from . import staging
+
+def finish_uploads(upload_ids: list[str]) -> Job:
+    """다 받은 파일을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 올린 파일을 지웁니다.
+    파일 하나면 zip 또는 rar, 여럿이면 한 rar 분할 압축의 볼륨들(첫 볼륨 포함)이어야 합니다."""
+    from . import rar
+    if not upload_ids or len(set(upload_ids)) != len(upload_ids):
+        raise UploadError(400, "upload ids required")
+    uploads = [_upload(i) for i in upload_ids]
+    for upload in uploads:
+        received = upload["path"].stat().st_size
+        if received != upload["size"]:
+            raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
+    names = [pathlib.PurePath(u["filename"].replace("\\", "/")).name for u in uploads]
+    volumes = rar.volume_sets(names)
+    if len(uploads) > 1 or volumes:
+        if len(volumes) != 1 or len(next(iter(volumes.values()))) != len(names):
+            raise UploadError(400, "여러 파일을 함께 올리려면 한 rar 분할 압축의 볼륨들이어야 합니다.")
+        if len({n.lower() for n in names}) != len(names):
+            raise UploadError(400, "같은 이름의 볼륨이 있습니다.")
         try:
-            staging.stage_zip(upload["path"], upload["filename"], job)
-        finally:
-            upload["path"].unlink(missing_ok=True)
+            first = rar.first_volume(names)
+        except rar.RarError as e:
+            raise UploadError(400, str(e))
+        # rar는 통째로 푸므로 rar 크기만큼 더 필요합니다.
+        need = sum(u["size"] for u in uploads) + DISK_MARGIN
+        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        if need > free:
+            raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, rar를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
+    with _lock:
+        for upload_id in upload_ids:
+            _uploads.pop(upload_id, None)
 
-    return _start(job, run)
+    if not volumes:
+        upload = uploads[0]
+        job = Job("zip", upload["filename"])
+
+        def run():
+            from . import staging
+            try:
+                staging.stage_zip(upload["path"], upload["filename"], job)
+            finally:
+                upload["path"].unlink(missing_ok=True)
+
+        return _start(job, run)
+
+    job = Job("rar", first)
+
+    def run_rar():
+        from . import staging
+        # unrar가 나머지 볼륨을 이름으로 찾으므로 원래 이름으로 한 폴더에 모읍니다.
+        folder = constant.IMPORT_DIR / uuid.uuid4().hex
+        try:
+            folder.mkdir()
+            for upload, name in zip(uploads, names):
+                upload["path"].rename(folder / name)
+            staging.stage_rar(folder / first, first, job)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+            for upload in uploads:
+                upload["path"].unlink(missing_ok=True)
+
+    return _start(job, run_rar)
 
 
 def cancel_upload(upload_id: str) -> None:

@@ -527,7 +527,7 @@ def _upload_call(fn, *args):
 
 @router.post("/api/admin/import/uploads")
 def start_upload(body: UploadStart, admin: Annotated[User, Depends(web_admin)]):
-    """zip 조각 업로드를 시작합니다. 디스크가 모자라면 507."""
+    """zip·rar 조각 업로드를 시작합니다. 디스크가 모자라면 507."""
     return _upload_call(importer.start_upload, body.filename, body.size)
 
 
@@ -546,8 +546,20 @@ def cancel_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 @router.post("/api/admin/import/uploads/{upload_id}/finish")
 def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
-    """다 받은 zip을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 등록은 검토 뒤 commit할 때 합니다."""
+    """다 받은 zip(또는 rar)을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 등록은 검토 뒤 commit할 때 합니다."""
     job = _upload_call(importer.finish_upload, upload_id)
+    logger.info(f"import job {job.id} by {admin.id}: {job.name}")
+    return job.json()
+
+
+class UploadFinish(BaseModel):
+    ids: list[str]
+
+
+@router.post("/api/admin/import/uploads/finish")
+def finish_uploads(body: UploadFinish, admin: Annotated[User, Depends(web_admin)]):
+    """다 받은 파일 여럿(rar 분할 압축의 볼륨들)을 한 묶음으로 푸는 작업을 시작합니다."""
+    job = _upload_call(importer.finish_uploads, body.ids)
     logger.info(f"import job {job.id} by {admin.id}: {job.name}")
     return job.json()
 
