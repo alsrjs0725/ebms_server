@@ -26,6 +26,13 @@ class Cp932ZipInfo(zipfile.ZipInfo):
         return self.filename.encode("cp932"), self.flag_bits & ~0x800
 
 
+class Cp949ZipInfo(zipfile.ZipInfo):
+    """한국어 Windows에서 만든 zip처럼 UTF-8 플래그 없이 cp949 바이트로 이름을 저장합니다."""
+
+    def _encodeFilenameFlags(self):
+        return self.filename.encode("cp949"), self.flag_bits & ~0x800
+
+
 def make_zip(entries: dict[str, bytes], cp932: bool = False) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -307,3 +314,26 @@ def test_set_job_speed(client, monkeypatch):
     assert r.status_code == 200 and r.json()["slow"]
     assert job.slow
     assert client.put("/api/admin/import/jobs/nope/speed", json={"slow": True}).status_code == 404
+
+
+def _name_zip(info_cls, names: list[str]) -> zipfile.ZipFile:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name in names:
+            zf.writestr(info_cls(name), b"")
+    return zipfile.ZipFile(buf)
+
+
+def test_zip_name_encoding():
+    # cp932로도 오류 없이 풀리는 한국어 이름(반각 가타카나로 깨짐)이 섞여 있어도 zip 전체로 보고 cp949를 고릅니다.
+    zf = _name_zip(Cp949ZipInfo, ["곡/효과음.wav", "곡/베이스.wav", "곡/노래.bms"])
+    assert importer._zip_name_encoding(zf) == "cp949"
+    assert sorted(parts for g in importer._song_groups(zf).values() for _, parts in g) == [
+        ["노래.bms"], ["베이스.wav"], ["효과음.wav"]]
+    # cp949로도 풀리는 일본어 이름(확장 한글로 깨짐)은 cp932입니다.
+    assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["夜想曲/音.wav", "夜想曲/a.bms"])) == "cp932"
+    # 반각 가타카나뿐인 일본어 이름은 cp949로 풀리지 않으므로 cp932입니다.
+    assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["ｱｲｳ/ﾄﾞﾗﾑ.wav"])) == "cp932"
+    # ASCII뿐이거나 UTF-8 플래그가 있으면 고를 필요가 없습니다.
+    assert importer._zip_name_encoding(_name_zip(Cp932ZipInfo, ["song/a.bms"])) is None
+    assert importer._zip_name_encoding(_name_zip(zipfile.ZipInfo, ["곡/a.bms"])) is None

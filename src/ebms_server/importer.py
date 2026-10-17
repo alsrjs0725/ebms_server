@@ -24,6 +24,7 @@ from .db import AmbiguousSongError, Database
 logger = logging.getLogger(__name__)
 
 # zip 항목 이름에 UTF-8 플래그가 없을 때 시도할 인코딩. 일본 BMS 패키지는 대부분 cp932입니다.
+# 점수가 같으면 앞의 인코딩을 고릅니다.
 ZIP_NAME_ENCODINGS = ("utf-8", "cp932", "cp949")
 
 
@@ -178,17 +179,59 @@ def import_tmp(job: Job | None = None) -> list[dict]:
     return job.songs
 
 
-def _entry_name(info: zipfile.ZipInfo) -> str:
+def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
+    """UTF-8 플래그가 없는 항목 이름의 원래 바이트. zipfile은 플래그가 없으면 cp437로 읽으므로 되돌립니다."""
     if info.flag_bits & 0x800:
-        return info.filename
-    # UTF-8 플래그가 없으면 zipfile은 cp437로 읽으므로 원래 바이트로 되돌려 다시 해석합니다.
+        return None
     try:
-        raw = info.filename.encode("cp437")
+        return info.filename.encode("cp437")
     except UnicodeEncodeError:
-        return info.filename
+        return None
+
+
+def _odd_chars(text: str) -> int:
+    """잘못된 인코딩으로 풀면 늘어나는 문자 수. cp949 이름을 cp932로 풀면 반각 가타카나가,
+    cp932 이름을 cp949로 풀면 KS X 1001 밖의 확장 한글(UHC)이 잔뜩 나옵니다."""
+    count = 0
+    for ch in text:
+        if "\uff61" <= ch <= "\uff9f":
+            count += 1
+        elif "\uac00" <= ch <= "\ud7a3":
+            lead, trail = ch.encode("cp949")
+            if lead < 0xB0 or trail < 0xA1:
+                count += 1
+    return count
+
+
+def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
+    """UTF-8 플래그가 없는 항목 이름 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것.
+    zip 하나는 한 인코딩으로 만들어지므로 항목마다 따로 고르지 않습니다. 맞는 인코딩이 없으면 None."""
+    raws = [raw for info in zf.infolist() if (raw := _raw_name(info)) is not None]
+    if all(raw.isascii() for raw in raws):
+        return None
+    best = None
     for encoding in ZIP_NAME_ENCODINGS:
         try:
-            return raw.decode(encoding)
+            score = sum(_odd_chars(raw.decode(encoding)) for raw in raws)
+        except UnicodeDecodeError:
+            continue
+        if best is None or score < best[1]:
+            best = (encoding, score)
+    if best is None:
+        logger.warning(f"zip names fit no encoding of {ZIP_NAME_ENCODINGS}; decoding each entry separately")
+        return None
+    return best[0]
+
+
+def _entry_name(info: zipfile.ZipInfo, encoding: str | None = None) -> str:
+    raw = _raw_name(info)
+    if raw is None:
+        return info.filename
+    if encoding:
+        return raw.decode(encoding)
+    for candidate in ZIP_NAME_ENCODINGS:
+        try:
+            return raw.decode(candidate)
         except UnicodeDecodeError:
             continue
     return info.filename
@@ -208,11 +251,12 @@ def _safe_parts(name: str) -> list[str] | None:
 def _song_groups(zf: zipfile.ZipFile) -> dict[tuple[str, ...], list[tuple[zipfile.ZipInfo, list[str]]]]:
     """zip 항목을 곡 폴더별로 묶습니다. 곡 폴더는 차트 파일이 바로 아래 있는 가장 바깥 폴더이고,
     그 아래 항목(bga 등)은 모두 그 곡에 속합니다. 어느 곡에도 속하지 않거나 위험한 경로의 항목은 버립니다."""
+    encoding = _zip_name_encoding(zf)
     entries = []
     for info in zf.infolist():
         if info.is_dir():
             continue
-        parts = _safe_parts(_entry_name(info))
+        parts = _safe_parts(_entry_name(info, encoding))
         if not parts:
             logger.warning(f"import_zip: skipped unsafe entry[{info.filename!r}]")
             continue
