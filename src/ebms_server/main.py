@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, audit, auth, constant, downloads, home, notices, policies, proxy, retention, staging, tables
+from . import admin, audit, auth, constant, downloads, home, notices, policies, preview, proxy, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -93,6 +93,8 @@ def backfill_pre_chunks() -> None:
         Database().backfill_chart_meta()
     except Exception:
         logging.getLogger(__name__).exception("backfill_chart_meta failed")
+    # 미리듣기 음원이 없는 곡의 미리듣기를 만든다. 곡마다 키음을 풀어 섞으므로 오래 걸린다.
+    preview.kick()
 
 
 def insecure_public_url(url: str) -> bool:

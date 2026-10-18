@@ -11,9 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN pip install --no-cache-dir "uv>=0.8,<0.13"
 
 # rar(분할 압축 포함) 곡 임포트용 unrar. Debian non-free 저장소에 있습니다.
+# ffmpeg는 곡 미리듣기 음원을 만드는 데 씁니다(preview.py).
 RUN sed -i -E 's/^(Components: .*)$/\1 non-free/' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends unrar \
+    && apt-get install -y --no-install-recommends unrar ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

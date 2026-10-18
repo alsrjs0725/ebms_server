@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pymysql
 
-from . import constant
+from . import constant, preview
 
 SCHEMA = [
     """
@@ -329,6 +329,22 @@ SCHEMA = [
             updated_by CHAR(36),
 
             PRIMARY KEY (name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 서버가 만든 곡 미리듣기(preview.py). 곡 zip이 바뀌면(song_sha256이 다르면) 다시 만듭니다.
+    # path가 NULL이면 만들지 않은 곡(이미 preview가 있음, 소리 없음, 실패)이고 note에 이유를 둡니다.
+    """
+        CREATE TABLE IF NOT EXISTS song_preview(
+            song_id INT UNSIGNED NOT NULL,
+            song_sha256 CHAR(64) NOT NULL,
+            version INT UNSIGNED NOT NULL,
+            path VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            size BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            crc32 CHAR(8),
+            data MEDIUMBLOB,
+            note VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
+
+            PRIMARY KEY (song_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
 ]
@@ -1231,12 +1247,14 @@ class Database:
                 }
             )
 
+        previews = self._previews(cur, lo, hi)
         cur.execute(
             "SELECT id, folder, size, sha256, files FROM song WHERE id >= %s AND id < %s ORDER BY id",
             (lo, hi),
         )
-        songs = [
-            {
+        songs = []
+        for song_id, folder, size, sha256, files in cur.fetchall():
+            song = {
                 "song_id": song_id,
                 "folder": folder,
                 "zip_size": size,
@@ -1245,8 +1263,11 @@ class Database:
                 "chart_files": chart_files[song_id],
                 "files": json.loads(files) if files else [],
             }
-            for song_id, folder, size, sha256, files in cur.fetchall()
-        ]
+            preview = previews.get(song_id)
+            if preview is not None and preview["song_sha256"] == sha256:
+                # 곡 zip에 없는 사전 파일. 사전 청크와 /api/pre/song/{id}/file로 받습니다.
+                song["preview"] = {k: preview[k] for k in ("path", "size", "crc32")}
+            songs.append(song)
         body = json.dumps(songs, ensure_ascii=False, separators=(",", ":")).encode()
         data = gzip.compress(body, mtime=0)
         cur.execute(
@@ -1256,6 +1277,117 @@ class Database:
             """,
             (chunk_no, hashlib.sha256(body).hexdigest(), data),
         )
+
+    def _previews(self, cur, lo: int, hi: int) -> dict[int, dict]:
+        """song id가 [lo, hi)인 곡 중 지금 판의 미리듣기가 있는 곡. 곡 zip이 바뀌었는지는 song_sha256으로 봅니다."""
+        cur.execute(
+            """
+            SELECT song_id, song_sha256, path, size, crc32 FROM song_preview
+            WHERE song_id >= %s AND song_id < %s AND version = %s AND path IS NOT NULL
+            """,
+            (lo, hi, preview.PREVIEW_VERSION),
+        )
+        return {
+            row[0]: {"song_sha256": row[1], "path": row[2], "size": row[3], "crc32": row[4]}
+            for row in cur.fetchall()
+        }
+
+    def get_preview(self, song_id: int, path: str) -> tuple[dict, bytes] | None:
+        """곡의 지금 미리듣기가 path면 (매니페스트 항목, 데이터). 아니면 None."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.size, p.crc32, p.data FROM song_preview p JOIN song s ON s.id = p.song_id
+                WHERE p.song_id = %s AND p.path = %s AND p.version = %s AND p.song_sha256 = s.sha256
+                """,
+                (song_id, path, preview.PREVIEW_VERSION),
+            )
+            row = cur.fetchone()
+        if row is None or row[2] is None:
+            return None
+        return {"path": path, "size": row[0], "crc32": row[1]}, bytes(row[2])
+
+    def render_previews(self) -> int:
+        """미리듣기가 없거나 판·곡 zip이 바뀐 곡의 미리듣기를 만듭니다(preview.py). 바뀐 곡 수를 반환합니다.
+        렌더링은 쓰기 잠금 밖에서 하고, 사전 청크(SONGS_PER_PRE_CHUNK곡)마다 결과를 넣고 청크를 다시 만들어 커밋합니다.
+        도중에 꺼져도 다음 시작 때 남은 곡부터 이어서 만듭니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.id, s.sha256 FROM song s LEFT JOIN song_preview p ON p.song_id = s.id
+                WHERE p.song_id IS NULL OR p.song_sha256 <> s.sha256 OR p.version <> %s
+                ORDER BY s.id
+                """,
+                (preview.PREVIEW_VERSION,),
+            )
+            pending = cur.fetchall()
+        if not pending:
+            return 0
+        self.logger.info(f"render_previews: Rendering previews of {len(pending)} songs.")
+        groups: dict[int, list[tuple[int, str]]] = defaultdict(list)
+        for song_id, sha256 in pending:
+            groups[song_id // constant.SONGS_PER_PRE_CHUNK].append((song_id, sha256))
+        done = 0
+        for chunk_no, songs in sorted(groups.items()):
+            results = []
+            for song_id, sha256 in songs:
+                files = self.get_song_files(song_id)
+                if files is None:
+                    continue
+                path = out = None
+                try:
+                    with connect() as con, con.cursor() as cur:
+                        rendered = preview.render(files, lambda entry: self._read_song_member(cur, song_id, entry))
+                    note = "" if rendered else "skipped"
+                    if rendered:
+                        path, out = rendered
+                except RuntimeError as e:
+                    if str(e) == "ffmpeg not found":
+                        self.logger.warning("render_previews: ffmpeg not found. Previews are not rendered.")
+                        return done
+                    self.logger.warning(f"render_previews: Song[{song_id}] failed: {e}")
+                    note = f"error: {e}"[:255]
+                except Exception as e:
+                    self.logger.exception(f"render_previews: Song[{song_id}] failed")
+                    note = f"error: {type(e).__name__}"[:255]
+                results.append((song_id, sha256, path, out, note))
+            if not results:
+                continue
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    changed = set()
+                    for song_id, sha256, path, out, note in results:
+                        cur.execute("SELECT sha256 FROM song WHERE id = %s", (song_id,))
+                        row = cur.fetchone()
+                        if row is None or row[0] != sha256:
+                            # 렌더링하는 동안 곡이 바뀌거나 지워졌으면 다음에 다시 만듭니다.
+                            continue
+                        cur.execute("SELECT path FROM song_preview WHERE song_id = %s", (song_id,))
+                        old = cur.fetchone()
+                        cur.execute("DELETE FROM song_preview WHERE song_id = %s", (song_id,))
+                        cur.execute(
+                            """
+                            INSERT INTO song_preview (song_id, song_sha256, version, path, size, crc32, data, note)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                song_id, sha256, preview.PREVIEW_VERSION, path, len(out) if out else 0,
+                                f"{zlib.crc32(out):08x}" if out else None, out, note,
+                            ),
+                        )
+                        if out is not None or (old is not None and old[0] is not None):
+                            changed.add(song_id)
+                    if changed:
+                        self._rebuild_pre_chunk(cur, chunk_no)
+                        for manifest_no in {i // constant.SONGS_PER_MANIFEST_CHUNK for i in changed}:
+                            self._rebuild_manifest_chunk(cur, manifest_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            done += len(changed)
+        self.logger.info(f"render_previews: Rendered {done} previews.")
+        return done
 
     def _read_song_range(self, cur, song_id: int, start: int, length: int) -> bytes:
         """곡 zip의 start부터 length 바이트. 같은 트랜잭션에서 넣은 곡도 읽도록 cur를 씁니다."""
@@ -1301,11 +1433,12 @@ class Database:
         """chunk_no에 속한 곡들의 사전 파일을 다시 묶어 저장합니다. 곡이 사전 파일이 없어도 빈 zip을 둡니다."""
         lo = chunk_no * constant.SONGS_PER_PRE_CHUNK
         hi = lo + constant.SONGS_PER_PRE_CHUNK
-        cur.execute("SELECT id, files FROM song WHERE id >= %s AND id < %s ORDER BY id", (lo, hi))
+        previews = self._previews(cur, lo, hi)
+        cur.execute("SELECT id, files, sha256 FROM song WHERE id >= %s AND id < %s ORDER BY id", (lo, hi))
         songs = cur.fetchall()
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
-            for song_id, files in songs:
+            for song_id, files, sha256 in songs:
                 entries = sorted(
                     (e for e in (json.loads(files) if files else []) if is_pre_chunk_entry(e)),
                     key=lambda e: e["path"],
@@ -1320,6 +1453,11 @@ class Database:
                     # 날짜를 고정해 같은 내용이면 같은 해시가 나오게 합니다.
                     info = zipfile.ZipInfo(pre_arcname(song_id, entry["path"]), date_time=(1980, 1, 1, 0, 0, 0))
                     zf.writestr(info, data)
+                preview_row = previews.get(song_id)
+                if preview_row is not None and preview_row["song_sha256"] == sha256:
+                    cur.execute("SELECT data FROM song_preview WHERE song_id = %s", (song_id,))
+                    info = zipfile.ZipInfo(pre_arcname(song_id, preview_row["path"]), date_time=(1980, 1, 1, 0, 0, 0))
+                    zf.writestr(info, bytes(cur.fetchone()[0]))
         data = buf.getvalue()
 
         cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
@@ -2303,6 +2441,7 @@ class Database:
             self._write_lock.release()
         shutil.rmtree(source, ignore_errors=True)
         self.logger.info(f"restore_song: Restored song[{song_id}]")
+        preview.kick()
 
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
@@ -2541,6 +2680,9 @@ class SongBatch:
             f"{self._song_bytes} song bytes."
         )
         remove = self._remove
+        new_previews = bool(self._pre_chunks)
         self._close()
         for path in remove:
             shutil.rmtree(path, ignore_errors=True)
+        if new_previews:
+            preview.kick()

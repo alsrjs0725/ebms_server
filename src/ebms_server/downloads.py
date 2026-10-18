@@ -404,7 +404,10 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
             raise HTTPException(status_code=status, detail=detail)
         entry = next((f for f in files if f["path"] == path), None)
         if entry is None:
-            raise HTTPException(status_code=404, detail="file not found")
+            rendered = Database().get_preview(song_id, path)
+            if rendered is None:
+                raise HTTPException(status_code=404, detail="file not found")
+            return _preview_response(request, user, rendered, release)
         if entry.get("kind") != "pre":
             raise HTTPException(status_code=403, detail="not a pre-download file")
 
@@ -444,6 +447,23 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
     except BaseException:
         release()
         raise
+
+
+def _preview_response(request: Request, user: User, rendered: tuple[dict, bytes], release: Callable[[], None]):
+    """서버가 만든 미리듣기(곡 zip에 없는 사전 파일). 곡의 사전 파일과 같이 사용량에 더합니다."""
+    entry, data = rendered
+    etag = f'"{entry["crc32"]}-{entry["size"]}"'
+    headers = {"ETag": etag, "Content-Length": str(entry["size"])}
+    if _not_modified(request, etag):
+        del headers["Content-Length"]
+        release()
+        return Response(status_code=304, headers=headers)
+    return ReleasingStreamingResponse(
+        quota.metered(user.id, iter([data]), close=release),
+        on_close=release,
+        media_type="audio/ogg",
+        headers=headers,
+    )
 
 
 # ---- 플레이 다운로드 ----
