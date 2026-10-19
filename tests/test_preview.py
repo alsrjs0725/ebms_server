@@ -40,7 +40,8 @@ def test_bms_timing():
     )
     # 0마디 0~2초, 1마디(2박) 2~3초, 2마디 3초 시작: 0~2박 120BPM(1초), 2~4박 240BPM(0.5초)
     # 3마디 시작 4.5초, 정지 2박(240BPM) 0.5초, 3마디 4박(240BPM) 1초. 롱노트 끝은 무시
-    assert times(preview.bms_sounds(chart)) == [
+    parsed = preview.bms_chart(chart)
+    assert times(parsed.sounds) == [
         (0.0, "kick.wav"),
         (2.5, "kick.wav"),
         (3.0, "kick.wav"),
@@ -49,6 +50,9 @@ def test_bms_timing():
         (4.5, "ln.wav"),
         (6.0, "kick.wav"),
     ]
+    # 플레이 노트는 LNOBJ 노트와 롱노트 끝(3마디 2박 = 5.5초)도 셉니다. 배경음은 세지 않습니다.
+    assert [round(t, 4) for t in parsed.notes] == [2.5, 3.0, 4.0, 4.5, 4.5, 4.5, 5.5]
+    assert parsed.length == pytest.approx(6.0)
 
 
 def test_bms_random_picks_first_branch():
@@ -57,7 +61,7 @@ def test_bms_random_picks_first_branch():
         b"#RANDOM 2\r\n#IF 1\r\n#00001:01\r\n#ELSE\r\n#00001:02\r\n#ENDIF\r\n#ENDRANDOM\r\n"
         b"#RANDOM 2\r\n#IF 2\r\n#00101:01\r\n#ELSEIF 1\r\n#00101:02\r\n#ENDIF\r\n"
     )
-    assert times(preview.bms_sounds(chart)) == [(0.0, "a.wav"), (2.0, "b.wav")]
+    assert times(preview.bms_chart(chart).sounds) == [(0.0, "a.wav"), (2.0, "b.wav")]
 
 
 def test_bmson_continue_and_cut():
@@ -67,15 +71,52 @@ def test_bmson_continue_and_cut():
         "stop_events": [],
         "sound_channels": [
             {"name": "bgm.ogg", "notes": [{"x": 0, "y": 0, "l": 0, "c": False}, {"x": 1, "y": 480, "l": 0, "c": True}]},
-            {"name": "hat.wav", "notes": [{"x": 2, "y": 1200, "l": 0, "c": False}]},
+            {"name": "hat.wav", "notes": [{"x": 2, "y": 1200, "l": 240, "c": False}]},
         ],
+        "bga": {"bga_events": [{"y": 1920, "id": 1}]},
     }
-    sounds = preview.bmson_sounds(data)
-    assert [(round(s.time, 4), s.name, round(s.offset, 4), s.end) for s in sounds] == [
+    chart = preview.bmson_chart(data)
+    assert [(round(s.time, 4), s.name, round(s.offset, 4), s.end) for s in chart.sounds] == [
         (0.0, "bgm.ogg", 0.0, 1.0),
         (1.0, "bgm.ogg", 1.0, None),
         (2.25, "hat.wav", 0.0, None),
     ]
+    # x가 0인 노트는 배경음. 롱노트 끝(y 1440 = 2.5초)도 셉니다. 곡 길이는 BGA(y 1920 = 3초)까지
+    assert [round(t, 4) for t in chart.notes] == [1.0, 2.25, 2.5]
+    assert chart.length == pytest.approx(3.0)
+
+
+def test_highlight_finds_density_jump():
+    # 100초 곡, 10초마다 노트 하나에 50초 칸에 노트가 몰림 → 그 한 칸 앞(49초)
+    notes = sorted([i * 10.0 for i in range(10)] + [50 + k * 0.1 for k in range(10)])
+    assert preview.highlight(notes, 100.0) == pytest.approx(49.0)
+    assert preview.highlight([], 100.0) == 0.0
+
+
+def test_clip_start_fits_in_song():
+    sounds = [preview.Sound(2.0, "a.wav")]
+    # 하이라이트(37초)부터 30초는 곡(40초)을 넘으므로 10초로 앞당깁니다.
+    notes = sorted([i * 0.4 for i in range(100)] + [37.6 + k * 0.01 for k in range(30)])
+    assert preview.highlight(notes, 40.0) == pytest.approx(37.2)
+    assert preview.clip_start(preview.Chart(sounds, notes, 40.0)) == pytest.approx(10.0)
+    # 첫 소리보다 앞서지 않습니다.
+    assert preview.clip_start(preview.Chart(sounds, [], 40.0)) == pytest.approx(2.0)
+
+
+def test_mix_includes_sound_started_before_start():
+    rate = preview.SAMPLE_RATE
+    samples = {"bgm": np_ramp(rate * 4), "hit": np_ramp(rate // 10)}
+    # bgm은 0초에 시작해 4초 길이, 1초부터 섞으면 bgm의 1초 지점부터 들어갑니다. hit은 1초 전에 끝납니다.
+    sounds = [preview.Sound(0.0, "bgm"), preview.Sound(0.5, "hit")]
+    buf = preview.mix(sounds, samples, 1.0)
+    assert len(buf) == rate * 3
+    assert buf[0] == pytest.approx(samples["bgm"][rate])
+
+
+def np_ramp(n):
+    import numpy as np
+
+    return np.linspace(0.1, 0.5, n, dtype=np.float32)
 
 
 def tone(seconds=0.3, freq=440.0, rate=22050) -> bytes:
@@ -117,7 +158,7 @@ def test_render(tmp_path):
     path, ogg = render(make_song(tmp_path))
     assert path == preview.PREVIEW_NAME
     assert ogg.startswith(b"OggS")
-    # 첫 소리(1마디 시작 = 2초)부터 키음 끝까지. 모노 22050Hz의 짧은 음원
+    # 첫 소리(1마디 시작 = 2초)부터 키음 끝까지(곡이 30초보다 짧음). 모노 22050Hz의 짧은 음원
     assert 1_000 < len(ogg) < 60_000
 
 
