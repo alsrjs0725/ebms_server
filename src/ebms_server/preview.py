@@ -5,8 +5,10 @@ Qwilight는 곡 고르는 화면에서 미리듣기할 때 키음·BGA를 모두
 짧은 미리듣기 음원을 만들어 사전 파일로 줍니다. 클라이언트는 이 파일을 곡 폴더에 보여 주고,
 그 직후 Qwilight가 읽는 플레이 파일은 받지 않습니다(ebms_client).
 
-- 저작권·용량 때문에 일부러 음질을 낮춥니다: 첫 소리부터 PREVIEW_SECONDS초, 모노 SAMPLE_RATE Hz,
+- 저작권·용량 때문에 일부러 음질을 낮춥니다: PREVIEW_SECONDS초, 모노 SAMPLE_RATE Hz,
   Vorbis 품질 VORBIS_QUALITY(가장 낮음).
+- Qwilight의 하이라이트 위치(highlight)부터 자릅니다. Qwilight는 preview 음원을 처음부터 재생하므로
+  "하이라이트부터 미리듣기" 설정과 상관없이 하이라이트가 들립니다.
 - 곡에 이미 preview 음원(사전 파일인 오디오)이 있으면 만들지 않습니다.
 - 차트는 곡에서 가장 큰 차트 하나를 씁니다(난이도가 달라도 배경음은 같습니다).
 - 결과는 song_preview 테이블에 두고, 매니페스트의 "preview"와 사전 청크에 넣습니다(db.py).
@@ -14,6 +16,7 @@ Qwilight는 곡 고르는 화면에서 미리듣기할 때 키음·BGA를 모두
 """
 import bisect
 import logging
+import math
 import os
 import pathlib
 import posixpath
@@ -34,7 +37,7 @@ logger = logging.getLogger(__name__)
 # 시작하는 오디오를 미리듣기로 씁니다.
 PREVIEW_NAME = "preview_ebms.ogg"
 # 렌더링 방식(길이·음질 등)을 바꾸면 올립니다. 서버 시작 뒤 다른 판의 미리듣기를 모두 다시 만듭니다.
-PREVIEW_VERSION = 1
+PREVIEW_VERSION = 2
 PREVIEW_SECONDS = 30.0
 # 끝부분을 줄여 가는 길이(초)
 FADE_SECONDS = 2.0
@@ -64,6 +67,41 @@ class Sound:
 
     def __repr__(self) -> str:
         return f"Sound({self.time:.3f}, {self.name!r}, {self.offset:.3f}, {self.end})"
+
+
+class Chart:
+    """차트에서 미리듣기에 쓰는 것. sounds는 시각 순 소리, notes는 플레이 노트 시각(롱노트는 끝도 하나),
+    length는 마지막 노트·배경음·BGA 시각(초)."""
+
+    __slots__ = ("sounds", "notes", "length")
+
+    def __init__(self, sounds: list[Sound], notes: list[float], length: float):
+        self.sounds = sounds
+        self.notes = notes
+        self.length = length
+
+
+def highlight(notes: list[float], length: float) -> float:
+    """Qwilight의 하이라이트 위치(초). 곡을 100칸으로 나눠 플레이 노트 밀도가 앞 칸보다 가장 크게 오르는 칸을 찾되
+    곡 가운데일수록 가중치를 줍니다(반원). 그 칸의 한 칸 앞이 하이라이트입니다. 노트가 없으면 0.
+    Qwilight BaseCompiler.PostCompile의 "건너뛰기와 하이라이트 계산"과 같습니다."""
+    if not notes or length <= 0:
+        return 0.0
+    width = length / 100
+    counts = [0] * 100
+    for t in notes:
+        i = int(t // width)
+        # 곡 끝(length)에 걸친 노트는 Qwilight도 세지 않습니다.
+        if 0 <= i < 100:
+            counts[i] += 1
+    best = -math.inf
+    position = 0.0
+    for i in range(99, 0, -1):
+        value = (counts[i] - counts[i - 1]) * math.sqrt(50 * 50 - (50 - i) ** 2)
+        if value >= best:
+            best = value
+            position = length * (i - 1) / 100
+    return position
 
 
 def _decode(value: bytes) -> str:
@@ -152,8 +190,9 @@ def _bms_lines(chart: bytes) -> list[bytes]:
     return out
 
 
-def bms_sounds(chart: bytes) -> list[Sound]:
-    """BMS 차트에서 소리가 나는 노트(배경음 01, 보이는 노트 1x·2x, 롱노트 시작 5x·6x)의 시각."""
+def bms_chart(chart: bytes) -> Chart:
+    """BMS 차트. 소리는 배경음 01, 보이는 노트 1x·2x, 롱노트 시작 5x·6x입니다. 플레이 노트는 1x·2x(LNOBJ 포함)와
+    5x·6x의 시작·끝, 곡 길이에는 BGA(04·06·07)도 셉니다."""
     lines = _bms_lines(chart)
     base62 = any(line.upper().startswith(b"#BASE") and line.split()[-1] == b"62" for line in lines)
 
@@ -205,6 +244,8 @@ def bms_sounds(chart: bytes) -> list[Sound]:
     stops: list[tuple[float, float]] = []
     sounds: list[tuple[float, str]] = []
     long_notes: dict[str, list[tuple[float, str]]] = {}
+    plays: list[float] = []
+    others: list[float] = []
     for measure, channel, data in notes:
         count = len(data) // 2
         if count == 0:
@@ -226,24 +267,34 @@ def bms_sounds(chart: bytes) -> list[Sound]:
                 # #STOPxx는 4/4 한 마디를 192로 나눈 단위입니다.
                 stops.append((beat, stop_values.get(key(pair), 0.0) / 48))
             elif channel == "01" or (channel[0] in "12" and channel[1] in "123456789"):
-                if channel != "01" and lnobj is not None and key(pair) == lnobj:
-                    continue
+                if channel != "01":
+                    plays.append(beat)
+                    if lnobj is not None and key(pair) == lnobj:
+                        continue
                 sounds.append((beat, key(pair)))
             elif channel[0] in "56" and channel[1] in "123456789":
                 long_notes.setdefault(channel, []).append((beat, key(pair)))
+                plays.append(beat)
+            elif channel in ("04", "06", "07"):
+                others.append(beat)
     for events in long_notes.values():
         events.sort()
         # 롱노트 채널은 시작·끝이 번갈아 나옵니다. 시작만 소리가 납니다.
         sounds.extend(events[::2])
 
     sounds.sort()
-    times = _Timeline(bpm, changes, stops).times([beat for beat, _ in sounds])
-    return [Sound(t, wavs[k]) for t, (_, k) in zip(times, sounds) if k in wavs]
+    beats = sorted({beat for beat, _ in sounds} | set(plays) | set(others))
+    at = dict(zip(beats, _Timeline(bpm, changes, stops).times(beats)))
+    return Chart(
+        [Sound(at[b], wavs[k]) for b, k in sounds if k in wavs],
+        sorted(at[b] for b in plays),
+        max(at.values(), default=0.0),
+    )
 
 
-def bmson_sounds(data: dict) -> list[Sound]:
-    """bmson 차트에서 소리가 나는 노트의 시각. 이어 재생(c) 노트는 같은 채널의 앞 노트에 이어지는 위치부터,
-    다음 노트가 나오면 끊습니다(bmson은 한 키음 파일을 잘라 씁니다)."""
+def bmson_chart(data: dict) -> Chart:
+    """bmson 차트. 이어 재생(c) 노트는 같은 채널의 앞 노트에 이어지는 위치부터, 다음 노트가 나오면 끊습니다
+    (bmson은 한 키음 파일을 잘라 씁니다). 플레이 노트는 x가 있는 노트(롱노트는 끝 y+l도)입니다."""
     info = data.get("info") if isinstance(data.get("info"), dict) else {}
     resolution = _float(info.get("resolution"), 240.0) or 240.0
     if resolution <= 0:
@@ -261,17 +312,26 @@ def bmson_sounds(data: dict) -> list[Sound]:
     stops = [(beat(e.get("y")), beat(e.get("duration"))) for e in items("stop_events")]
     channels = []
     beats = []
+    plays = []
     for channel in items("sound_channels"):
+        raw = channel.get("notes")
+        raw = [n for n in (raw if isinstance(raw, list) else []) if isinstance(n, dict)]
+        for n in raw:
+            if _float(n.get("x"), 0.0):
+                plays.append(beat(n.get("y")))
+                if (_float(n.get("l"), 0.0) or 0.0) > 0:
+                    plays.append(beat(n.get("y")) + beat(n.get("l")))
         name = channel.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
-        raw = channel.get("notes")
-        notes = sorted(
-            (beat(n.get("y")), bool(n.get("c"))) for n in (raw if isinstance(raw, list) else []) if isinstance(n, dict)
-        )
+        notes = sorted((beat(n.get("y")), bool(n.get("c"))) for n in raw)
         channels.append((name.strip(), notes))
         beats.extend(b for b, _ in notes)
-    beats = sorted(set(beats))
+    bga = data.get("bga") if isinstance(data.get("bga"), dict) else {}
+    for key in ("bga_events", "layer_events", "poor_events"):
+        events = bga.get(key)
+        beats.extend(beat(e.get("y")) for e in (events if isinstance(events, list) else []) if isinstance(e, dict))
+    beats = sorted(set(beats) | set(plays))
     at = dict(zip(beats, _Timeline(bpm, changes, stops).times(beats)))
 
     sounds = []
@@ -284,14 +344,20 @@ def bmson_sounds(data: dict) -> list[Sound]:
             end = at[notes[i + 1][0]] if i + 1 < len(notes) else None
             sounds.append(Sound(time, name, time - restart, end))
     sounds.sort(key=lambda s: s.time)
-    return sounds
+    return Chart(sounds, sorted(at[b] for b in plays), max(at.values(), default=0.0))
 
 
-def chart_sounds(chart: bytes) -> list[Sound]:
+def parse_chart(chart: bytes) -> Chart:
     from .db import _bmson
 
     data = _bmson(chart)
-    return bmson_sounds(data) if data is not None else bms_sounds(chart)
+    return bmson_chart(data) if data is not None else bms_chart(chart)
+
+
+def clip_start(chart: Chart) -> float:
+    """미리듣기를 시작할 시각(초). 하이라이트부터 PREVIEW_SECONDS초가 곡 안에 들도록 앞당기되 첫 소리보다 앞서지 않습니다."""
+    first = chart.sounds[0].time
+    return max(first, min(highlight(chart.notes, chart.length), chart.length - PREVIEW_SECONDS))
 
 
 def _is_audio(path: str) -> bool:
@@ -393,11 +459,15 @@ def mix(sounds: list[Sound], samples: dict[str, np.ndarray], start: float) -> np
         if data is None:
             continue
         pos = int(round((s.time - start) * SAMPLE_RATE))
-        if pos < 0 or pos >= length:
+        if pos >= length:
             continue
         seg = data[int(round(s.offset * SAMPLE_RATE)) :]
         if s.end is not None:
             seg = seg[: max(0, int(round((s.end - s.time) * SAMPLE_RATE)))]
+        if pos < 0:
+            # start 앞에서 울리기 시작한 소리는 start에 걸친 부분부터 섞습니다.
+            seg = seg[-pos:]
+            pos = 0
         n = min(len(seg), length - pos)
         if n <= 0:
             continue
@@ -430,11 +500,13 @@ def render(files: list[dict], read: Callable[[dict], bytes]) -> tuple[str, bytes
     charts = [f for f in files if posixpath.splitext(f["path"])[1].lower() in constant.BMS_FORMAT]
     chart_entry = max(charts, key=lambda f: (f["size"], f["path"]))
     by_path = {f["path"]: f for f in files}
-    sounds = chart_sounds(read(chart_entry))
-    if not sounds:
+    chart = parse_chart(read(chart_entry))
+    if not chart.sounds:
         return None
-    start = sounds[0].time
-    sounds = sounds[: bisect.bisect_left([s.time for s in sounds], start + PREVIEW_SECONDS)]
+    start = clip_start(chart)
+    # start 앞에서 시작한 소리도 길면 start까지 울리므로 섞습니다(끊는 시각이 start 전인 것만 뺍니다).
+    sounds = chart.sounds[: bisect.bisect_left([s.time for s in chart.sounds], start + PREVIEW_SECONDS)]
+    sounds = [s for s in sounds if s.end is None or s.end > start]
     resolver = _Resolver(list(by_path))
     base = posixpath.dirname(chart_entry["path"])
     targets: dict[str, str | None] = {}
@@ -450,7 +522,9 @@ def render(files: list[dict], read: Callable[[dict], bytes]) -> tuple[str, bytes
             target = pathlib.Path(tmp) / f"{i}{posixpath.splitext(member)[1].lower()}"
             target.write_bytes(read(by_path[member]))
             files_on_disk.append(target)
-        decoded = _decode_sounds(ffmpeg, files_on_disk, PREVIEW_SECONDS + max(s.offset for s in sounds))
+        decoded = _decode_sounds(
+            ffmpeg, files_on_disk, PREVIEW_SECONDS + max(s.offset + max(0.0, start - s.time) for s in sounds)
+        )
     by_member = dict(zip(members, decoded))
     samples = {name: by_member[t] for name, t in targets.items() if t and by_member.get(t) is not None}
     buf = mix(sounds, samples, start)
