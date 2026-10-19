@@ -44,6 +44,8 @@ SONGS_PER_MANIFEST_CHUNK = 1000
 # 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_PRE_CHUNK
 # 난이도표를 고른 클라이언트가 표에 없는 곡을 덜 받도록 작게 둡니다. 바꾸면 서버 시작 뒤 사전 청크를 모두 다시 만듭니다.
 SONGS_PER_PRE_CHUNK = 8
+# 미리듣기 음원이 없는 곡에 서버가 미리듣기를 만들어 사전 파일로 줄지(preview.py, ffmpeg 필요).
+PREVIEW_ENABLED = os.environ.get("EBMS_PREVIEW", "1") not in ("0", "false", "no", "")
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
 # 난이도표(tables.py)를 읽을 때 주소 하나의 응답 시간·크기 한도
 TABLE_FETCH_TIMEOUT = 30

@@ -139,6 +139,7 @@ zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`
 
 - `folder`: 등록할 때의 곡 폴더명. 이전 버전에서 등록된 곡은 song id 문자열입니다.
 - `chart_files`: 차트별 SHA-256, 파일 경로(곡 zip 안 경로 또는 등록할 때의 파일명), 파일 크기 목록.
+- `preview`(있을 때만): 서버가 만든 미리듣기 음원 `{"path", "size", "crc32"}`. 곡 zip에 없는 사전 파일이라 `files`에는 없고, 사전 청크와 `/api/pre/song/{song_id}/file?path=`로 받습니다([다운로드 문서](download.md)).
 - `files`: 곡 zip 안의 파일(디렉터리 제외). `offset`은 local file header 위치, `method`는 zip 압축 방식(0 무압축, 8 Deflate), `kind`는 사전(`pre`)/플레이(`play`) 구분입니다. 파일 하나만 받으려면 `offset`부터 30바이트를 받아 파일명/extra 길이(26~29바이트)를 읽고, 그 뒤 `comp_size` 바이트를 `Range`로 받습니다.
 
 ## `GET /api/play/song/{song_id}`
