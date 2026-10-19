@@ -143,6 +143,15 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+class TableStaticFiles(StaticFiles):
+    """정적 파일에 `Access-Control-Allow-Origin: *`를 붙입니다(공유용 난이도표)."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -184,6 +193,9 @@ app.mount(
     StaticFiles(directory=constant.BASE_DIR / "src" / "ebms_server" / "static"),
     name="static",
 )
+# 공유용 난이도표 페이지(constant.TABLE_PAGE_DIR). 로그인 없이 열리고, 다른 사이트의 난이도표 뷰어가
+# header·data JSON을 읽을 수 있게 CORS를 엽니다.
+app.mount("/table", TableStaticFiles(directory=constant.TABLE_PAGE_DIR), name="table")
 app.include_router(auth.router)
 app.include_router(downloads.router)
 app.include_router(proxy.router)
