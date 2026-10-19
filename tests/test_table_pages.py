@@ -30,3 +30,19 @@ def test_table_page_served(tmp_path, monkeypatch):
 
 def test_table_dir_exists():
     assert constant.TABLE_PAGE_DIR.is_dir()
+
+
+def test_shared_tables_parse():
+    """폴더의 난이도표가 beatoraja 방식(tables.parse_table)으로 읽히는지."""
+    from ebms_server import tables
+
+    client = TestClient(main.app)
+
+    def get(url):
+        r = client.get(url)
+        assert r.status_code == 200, url
+        return r.content
+
+    for page in constant.TABLE_PAGE_DIR.glob("*.html"):
+        table = tables.parse_table(f"http://testserver/table/{page.name}", get=get)
+        assert table["charts"], page.name
