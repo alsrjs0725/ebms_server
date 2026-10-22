@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="bmstable" content="bof22/header.json">
+<title>BOF22 통합팩 곡 ID 테이블</title>
+<link rel="stylesheet" href="bof22/style.css">
+</head>
+<body>
+<header>
+<h1>BOF22 통합팩 곡 ID 테이블</h1>
+<div class="sub">THE BMS OF FIGHTERS 22 · 레벨 대신 곡 ID(작품 번호) · beatoraja에서는 이 페이지 주소를 난이도표로 추가</div>
+</header>
+<div class="bar">
+<input id="q" type="search" placeholder="곡명 / 아티스트 / ID / 파일명 검색">
+<a class="btn" href="bof22/header.json">header.json</a>
+<a class="btn" href="bof22/data.json">data.json</a>
+<span class="count" id="count"></span>
+</div>
+<div class="wrap">
+<table>
+<thead><tr>
+<th data-k="id">ID ▲</th><th data-k="title">곡명</th><th data-k="artist">아티스트</th><th data-k="file">채보 파일</th><th data-k="md5">MD5</th>
+</tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</div>
+<script src="bof22/page.js"></script>
+</body>
+</html>
