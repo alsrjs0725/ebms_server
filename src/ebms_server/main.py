@@ -69,6 +69,12 @@ def configure_access_log() -> None:
 
 
 def backfill_pre_chunks() -> None:
+    # pre/play 판정 규칙(FILE_KINDS_VERSION)이 바뀌었으면 기존 곡의 kind를 다시 판정한다. 곡이 많으면 오래 걸리므로
+    # 시작(healthcheck)을 막지 않게 여기서 한다. 그동안은 곡마다 바뀌기 전 규칙의 kind로 나간다.
+    try:
+        Database().backfill_file_kinds()
+    except Exception:
+        logging.getLogger(__name__).exception("backfill_file_kinds failed")
     # 청크 크기(CHARTS_PER_CHUNK)가 바뀌었으면 차트 청크를 다시 묶는다. 그동안 임포트는 기다린다.
     try:
         Database().rechunk_charts()

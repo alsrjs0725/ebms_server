@@ -1000,7 +1000,6 @@ class Database:
         self.logger = logging.getLogger(__name__)
         self.generate_database()
         self.backfill_manifest()
-        self.backfill_file_kinds()
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT @@max_allowed_packet")
             self.max_allowed_packet = cur.fetchone()[0]
