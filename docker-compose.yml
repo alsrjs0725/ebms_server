@@ -38,7 +38,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      # 비정상 종료 뒤 InnoDB 복구(redo 적용)에 몇 분 걸릴 수 있습니다. 이 시간 안의 실패는 unhealthy로 세지 않습니다(성공하면 바로 healthy).
+      start_period: 5m
 
   ebms:
     # 배포된 이미지를 받아 실행. 소스에서 직접 빌드하려면 `docker compose up -d --build`
