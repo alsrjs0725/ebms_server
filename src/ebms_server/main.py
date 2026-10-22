@@ -1,6 +1,7 @@
 import importlib.metadata
 import logging
 import logging.handlers
+import shutil
 import threading
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -176,6 +177,7 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     # 받던 업로드는 이어 받을 수 있게 남기고, 이전 실행에서 임포트 도중 꺼져 남은 임시 폴더는 지운다
     importer.recover()
+    shutil.rmtree(constant.CACHE_DIR / "work", ignore_errors=True)
     # 대기 묶음을 풀거나 commit하던 중에 꺼졌다면 그 자리부터 이어서 한다
     staging.recover()
     # var/tmp는 서버 시작 시 가져오지 않는다(관리자가 "var/tmp 가져오기"를 누를 때만). 폴더만 만들어 둔다

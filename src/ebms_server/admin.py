@@ -21,7 +21,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-from . import audit, auth, constant, db, download_log, downloads, importer, logs, quota, staging
+from . import audit, auth, cache, constant, db, download_log, downloads, importer, logs, quota, staging
 from .accounts import User
 from .templating import templates
 
@@ -581,6 +581,12 @@ def _stage_call(fn, *args, **kwargs):
 def list_stages(admin: Annotated[User, Depends(web_admin)]):
     """대기 묶음 목록(최근 순)."""
     return staging.list_stages()
+
+
+@router.get("/api/admin/import/cache")
+def cache_status(admin: Annotated[User, Depends(web_admin)]):
+    """임포트 캐시(SSD) 사용량. 꺼져 있으면 enabled false."""
+    return cache.status()
 
 
 @router.get("/api/admin/import/stages/{stage_id}")

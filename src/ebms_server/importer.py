@@ -4,6 +4,7 @@
 - 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
   받는 중인 업로드는 `{id}.json`에 이름·크기를 적어 두므로 서버를 다시 시작해도 받은 곳부터 이어 받습니다.
+  임포트 캐시(cache.py)에 자리가 있으면 `var/import/` 대신 `cache/import/`에 받습니다.
   작업 상태는 메모리에만 두고, 풀거나 commit하던 묶음은 서버를 다시 시작하면 staging.recover가 이어서 합니다.
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
 - 작업을 "천천히"(Job.slow)로 돌리면 작은 배치로 커밋하고 커밋마다 쉬어 서비스(다운로드·DB 응답)에 디스크를 양보합니다.
@@ -20,7 +21,7 @@ import uuid
 import zipfile
 from collections import OrderedDict
 
-from . import constant
+from . import cache, constant
 from .db import AmbiguousSongError, Database
 
 logger = logging.getLogger(__name__)
@@ -333,15 +334,16 @@ def start_upload(filename: str, size: int) -> dict:
     """조각 업로드를 시작합니다. 디스크가 모자라면 UploadError(507)."""
     if size < 0:
         raise UploadError(400, "size must be >= 0")
-    constant.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(constant.IMPORT_DIR).free
-    if size + DISK_MARGIN > free:
-        raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     _drop_stale_uploads()
     upload_id = uuid.uuid4().hex
-    path = constant.IMPORT_DIR / f"{upload_id}.upload"
+    # 캐시(SSD)에 자리가 있으면 거기에 받습니다. 아니면 var/import.
+    path = cache.place("import", constant.IMPORT_DIR, f"{upload_id}.upload", size)
+    if path.parent == constant.IMPORT_DIR:
+        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        if size + DISK_MARGIN > free:
+            raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     path.touch()
-    meta = constant.IMPORT_DIR / f"{upload_id}.json"
+    meta = path.parent / f"{upload_id}.json"
     meta.write_text(json.dumps({"filename": filename, "size": size}, ensure_ascii=False), "utf-8")
     with _lock:
         _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta}
@@ -362,6 +364,7 @@ def _drop_upload(upload_id: str) -> None:
     if upload is not None:
         upload["path"].unlink(missing_ok=True)
         upload["meta"].unlink(missing_ok=True)
+        cache.release(upload["path"])
 
 
 def _drop_stale_uploads() -> None:
@@ -384,9 +387,12 @@ def _mtime(path: pathlib.Path) -> float:
 def recover() -> None:
     """서버 시작 시: 받던 업로드(`{id}.upload`와 `{id}.json`)를 다시 받을 수 있게 읽고, 나머지(이전 실행의 임시 폴더 등)는 지웁니다.
     관리자 페이지는 연결이 끊기면 받은 곳부터 다시 보내므로, 서버가 다시 시작돼도 업로드가 이어집니다."""
-    root = constant.IMPORT_DIR
-    if not root.is_dir():
-        return
+    for root in (constant.IMPORT_DIR, constant.CACHE_DIR / "import"):
+        if root.is_dir():
+            _recover_uploads(root)
+
+
+def _recover_uploads(root: pathlib.Path) -> None:
     keep: set[str] = set()
     for meta in root.glob("*.json"):
         upload_id = meta.stem
@@ -467,6 +473,9 @@ def finish_uploads(upload_ids: list[str]) -> Job:
     with _lock:
         for upload_id in upload_ids:
             _uploads.pop(upload_id, None)
+    for upload in uploads:
+        # 다 받았으므로 이제 실제 크기로 셉니다.
+        cache.release(upload["path"])
     # 올린 파일은 작업 스레드에서 새 묶음으로 옮깁니다. 묶음에 있으므로 풀다가 서버가 꺼져도 다시 시작할 때 이어서 풉니다.
 
     def drop_meta():

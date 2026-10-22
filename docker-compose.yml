@@ -24,9 +24,15 @@ services:
       - --max_allowed_packet=1G
       - --innodb_buffer_pool_size=512M
       - --max_connections=200
+      # 쓰기 로그(binlog·redo log·doublewrite)는 /var/lib/mysql-log에 둡니다. EBMS_MYSQL_LOG_DIR(SSD 등)를 비우면
+      # 데이터 폴더를 그 자리에 한 번 더 붙이므로 지금까지와 같은 파일입니다(docs/deployment.md#쓰기-로그를-ssd에-두기).
+      - --log-bin=/var/lib/mysql-log/binlog
+      - --innodb-log-group-home-dir=/var/lib/mysql-log
+      - --innodb-doublewrite-dir=/var/lib/mysql-log
     volumes:
       # EBMS_MYSQL_DIR에 절대 경로(예: HDD)를 주면 그 폴더에, 비우면 docker 볼륨에 저장
       - ${EBMS_MYSQL_DIR:-mysql-data}:/var/lib/mysql
+      - ${EBMS_MYSQL_LOG_DIR:-${EBMS_MYSQL_DIR:-mysql-data}}:/var/lib/mysql-log
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
       interval: 10s
@@ -70,6 +76,8 @@ services:
       EBMS_RETENTION_INTERVAL_HOURS: ${EBMS_RETENTION_INTERVAL_HOURS:-24}
       # 등록한 난이도표를 다시 읽는 주기(시간). 0이면 관리자 페이지에서 직접(docs/admin.md)
       EBMS_TABLE_REFRESH_HOURS: ${EBMS_TABLE_REFRESH_HOURS:-24}
+      # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
+      EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로
@@ -78,7 +86,10 @@ services:
     volumes:
       # 로그·임포트 대기 폴더. EBMS_VAR_DIR로 위치 변경
       - ${EBMS_VAR_DIR:-ebms-var}:/app/var
+      # 임포트 중간 작업 공간(업로드·풀어 둔 대기 묶음). EBMS_CACHE_DIR로 빠른 디스크 경로 지정
+      - ${EBMS_CACHE_DIR:-ebms-cache}:/app/cache
 
 volumes:
   mysql-data:
   ebms-var:
+  ebms-cache:

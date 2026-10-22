@@ -24,7 +24,7 @@ COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
-RUN mkdir -p var/log var/tmp
+RUN mkdir -p var/log var/tmp cache
 
 EXPOSE 8000
 

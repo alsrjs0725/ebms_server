@@ -19,6 +19,21 @@ IMPORT_DIR = BASE_DIR / "var" / "import"
 # 올리거나 var/tmp에서 가져온 곡을 등록 전에 검토하도록 풀어 두는 폴더(staging.py). commit하거나 버리면 지웁니다.
 STAGED_DIR = BASE_DIR / "var" / "staged"
 LOG_DIR = BASE_DIR / "var" / "log"
+
+
+def parse_size(text: str) -> int:
+    """'50G', '512M', '1073741824' 같은 크기를 바이트로. 단위는 K·M·G·T(1024배)."""
+    text = text.strip().upper().removesuffix("B").removesuffix("I")
+    units = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(text or 0)
+
+
+# 임포트 중간 작업 공간(cache.py). 빠른 디스크(SSD)를 이 폴더에 붙이고 EBMS_CACHE_MAX_BYTES(예: 50G)로 한도를 줍니다.
+# 0이면 끄고 모두 var/ 아래를 씁니다. 한도를 넘는 업로드·묶음은 var/(HDD)에 둡니다.
+CACHE_DIR = pathlib.Path(os.environ.get("EBMS_CACHE_DIR", BASE_DIR / "cache"))
+CACHE_MAX_BYTES = parse_size(os.environ.get("EBMS_CACHE_MAX_BYTES", "0"))
 # HTTP 접근 로그(var/log/access.log, 접속 IP·경로)를 날마다 돌려 남기는 일수. 처리방침의 보유기간과 맞춥니다.
 ACCESS_LOG_DAYS = 30
 # 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
