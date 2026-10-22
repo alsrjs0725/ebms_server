@@ -177,6 +177,8 @@ async def lifespan(app: FastAPI):
         logging.getLogger(__name__).warning("No OAuth login is configured. Set EBMS_GOOGLE_* or EBMS_DISCORD_*.")
     # 이전 실행에서 임포트 도중 꺼졌다면 남은 임시 폴더를 지운다
     shutil.rmtree(constant.IMPORT_DIR, ignore_errors=True)
+    shutil.rmtree(constant.CACHE_DIR / "import", ignore_errors=True)
+    shutil.rmtree(constant.CACHE_DIR / "work", ignore_errors=True)
     # 대기 묶음을 풀거나 commit하던 중에 꺼졌다면 다시 검토할 수 있게 되돌린다
     staging.recover()
     # var/tmp는 서버 시작 시 가져오지 않는다(관리자가 "var/tmp 가져오기"를 누를 때만). 폴더만 만들어 둔다

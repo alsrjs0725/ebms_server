@@ -724,11 +724,21 @@ function stageCounts(stage) {
         (c.failed ? ` · 지난 commit 실패 ${c.failed}` : "");
 }
 
+async function loadCache() {
+    const res = await fetch("/api/admin/import/cache");
+    if (!res.ok) return;
+    const c = await res.json();
+    const el = document.getElementById("cache-usage");
+    el.textContent = `임포트 캐시: ${size(c.used)} / ${size(c.max)} 사용`;
+    el.classList.toggle("d-none", !c.enabled);
+}
+
 async function loadStages() {
     stagesLoaded = true;
     const res = await fetch("/api/admin/import/stages");
     if (!res.ok) return;
     const stages = await res.json();
+    loadCache();
     stageIds = new Set(stages.map((s) => s.id));
     renderJobs();
     const box = document.getElementById("stages");
@@ -746,7 +756,14 @@ async function loadStages() {
             status.textContent = ({ ready: "검토 대기", staging: "푸는 중", committing: "등록 중" })[stage.status];
             const meta = document.createElement("div");
             meta.textContent = `${new Date(stage.created_at * 1000).toLocaleString()} · ${stageCounts(stage)}`;
-            btn.append(title, status, meta);
+            btn.append(title, status);
+            if (stage.cached) {
+                const cached = document.createElement("span");
+                cached.className = "badge ms-1 text-bg-light border";
+                cached.textContent = "캐시";
+                btn.append(cached);
+            }
+            btn.append(meta);
             btn.addEventListener("click", () => openStage(stage.id));
             return btn;
         }));

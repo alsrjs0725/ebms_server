@@ -29,7 +29,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from . import constant
+from . import cache, constant
 
 logger = logging.getLogger(__name__)
 
@@ -516,7 +516,7 @@ def render(files: list[dict], read: Callable[[dict], bytes]) -> tuple[str, bytes
     members = sorted({t for t in targets.values() if t})
     if not members:
         return None
-    with tempfile.TemporaryDirectory(dir=constant.TMP_DIR) as tmp:
+    with tempfile.TemporaryDirectory(dir=cache.work_dir()) as tmp:
         files_on_disk = []
         for i, member in enumerate(members):
             target = pathlib.Path(tmp) / f"{i}{posixpath.splitext(member)[1].lower()}"

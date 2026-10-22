@@ -153,6 +153,9 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(constant, "UNUSED_DIR", tmp_path / "var_unused")
     monkeypatch.setattr(constant, "STAGED_DIR", tmp_path / "var_staged")
+    # 임포트 캐시는 기본으로 끄고, test_cache가 켭니다.
+    monkeypatch.setattr(constant, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 0)
     # 미리듣기는 뒤 스레드에서 만들므로 테스트에서는 끄고, test_preview가 직접 부릅니다.
     monkeypatch.setattr(constant, "PREVIEW_ENABLED", False)
     original_connect = db_module.connect

@@ -3,7 +3,7 @@
 - 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip·rar를 대기 묶음(staging.py)으로 옮깁니다.
 - 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
-  작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음).
+  작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음). 임포트 캐시(cache.py)에 자리가 있으면 `cache/import/`에 받습니다.
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
 - 작업을 "천천히"(Job.slow)로 돌리면 작은 배치로 커밋하고 커밋마다 쉬어 서비스(다운로드·DB 응답)에 디스크를 양보합니다.
   돌고 있는 작업도 바꿀 수 있습니다.
@@ -18,7 +18,7 @@ import uuid
 import zipfile
 from collections import OrderedDict
 
-from . import constant
+from . import cache, constant
 from .db import AmbiguousSongError, Database
 
 logger = logging.getLogger(__name__)
@@ -326,12 +326,13 @@ def start_upload(filename: str, size: int) -> dict:
     """조각 업로드를 시작합니다. 디스크가 모자라면 UploadError(507)."""
     if size < 0:
         raise UploadError(400, "size must be >= 0")
-    constant.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(constant.IMPORT_DIR).free
-    if size + DISK_MARGIN > free:
-        raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     upload_id = uuid.uuid4().hex
-    path = constant.IMPORT_DIR / f"{upload_id}.upload"
+    # 캐시(SSD)에 자리가 있으면 거기에 받습니다. 아니면 var/import.
+    path = cache.place("import", constant.IMPORT_DIR, f"{upload_id}.upload", size)
+    if path.parent == constant.IMPORT_DIR:
+        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        if size + DISK_MARGIN > free:
+            raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     path.touch()
     with _lock:
         _uploads[upload_id] = {"filename": filename, "size": size, "path": path}
@@ -401,6 +402,9 @@ def finish_uploads(upload_ids: list[str]) -> Job:
     with _lock:
         for upload_id in upload_ids:
             _uploads.pop(upload_id, None)
+    for upload in uploads:
+        # 다 받았으므로 이제 실제 크기로 셉니다.
+        cache.release(upload["path"])
 
     if seven:
         upload = uploads[0]
@@ -432,12 +436,12 @@ def finish_uploads(upload_ids: list[str]) -> Job:
 
     def run_rar():
         from . import staging
-        # unrar가 나머지 볼륨을 이름으로 찾으므로 원래 이름으로 한 폴더에 모읍니다.
-        folder = constant.IMPORT_DIR / uuid.uuid4().hex
+        # unrar가 나머지 볼륨을 이름으로 찾으므로 원래 이름으로 한 폴더에 모읍니다(볼륨이 캐시와 var에 나뉘었으면 복사).
+        folder = uploads[0]["path"].parent / uuid.uuid4().hex
         try:
             folder.mkdir()
             for upload, name in zip(uploads, names):
-                upload["path"].rename(folder / name)
+                shutil.move(upload["path"], folder / name)
             staging.stage_rar(folder / first, first, job)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
@@ -452,6 +456,7 @@ def cancel_upload(upload_id: str) -> None:
         upload = _uploads.pop(upload_id, None)
     if upload is not None:
         upload["path"].unlink(missing_ok=True)
+        cache.release(upload["path"])
 
 
 def start_tmp_job() -> Job:

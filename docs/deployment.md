@@ -86,6 +86,35 @@ EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
   # release.env에 EBMS_MYSQL_DIR 추가 후 다시 up
   ```
 
+### SSD를 작업 공간으로 쓰기
+
+곡은 모두 MySQL에 들어가므로 데이터는 큰 디스크(HDD)에 두고, 작은 SSD는 임포트 중간 작업과 MySQL 쓰기 로그에만 씁니다. SMR HDD에서는 압축 풀기·commit이 디스크를 다투어 곡 하나에 몇 분씩 걸릴 수 있습니다.
+
+```bash
+# /opt/ebms/release.env
+EBMS_CACHE_DIR=/mnt/ssd/ebms/release/cache
+EBMS_CACHE_MAX_BYTES=50G
+EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
+```
+
+- **임포트 캐시**(`EBMS_CACHE_DIR`, `EBMS_CACHE_MAX_BYTES`): 웹으로 올린 파일과, 풀어 둔 대기 묶음(commit 작업 폴더 포함)을 이 폴더에 둡니다. 미리듣기 임시 파일도 여기서 만듭니다. 새 업로드·묶음마다 크기(zip은 풀린 크기, rar·7z는 압축 파일의 2배로 추정)를 보고, 지금 쓰는 양과 합쳐 한도 안이고 디스크에 1GB 이상 남으면 캐시에, 아니면 지금처럼 `var/`에 둡니다. 대기 묶음은 commit하거나 버릴 때까지 한도에 들어갑니다. 관리자 페이지 **검토 대기**에 사용량이 나오고, 캐시에 둔 묶음에는 "캐시" 표시가 붙습니다. `EBMS_CACHE_MAX_BYTES=0`(기본)이면 끕니다. 껐다가 켜도 이미 만든 묶음은 있던 자리에서 그대로 찾습니다.
+- **MySQL 쓰기 로그**(`EBMS_MYSQL_LOG_DIR`): binlog, redo log, doublewrite 파일을 이 폴더에 둡니다(테이블 데이터는 `EBMS_MYSQL_DIR`에 그대로). 몇 GB면 충분합니다. 비우면 데이터 폴더를 같은 자리에 붙이므로 지금까지와 같습니다.
+
+  이미 데이터가 있는 DB에서 처음 켤 때는 MySQL을 멈추고 파일을 옮긴 뒤 켭니다. 옮기지 않고 켜면 redo log가 없어 MySQL이 뜨지 않습니다(데이터는 그대로이니 옮긴 뒤 다시 켜면 됩니다).
+
+  ```bash
+  docker compose -p ebms-release --env-file /opt/ebms/release.env stop mysql ebms
+  DATA=/mnt/hdd/ebms/release/mysql LOG=/mnt/ssd/ebms/release/mysql-log
+  sudo mkdir -p $LOG
+  sudo mv "$DATA/#innodb_redo" "$DATA"/#ib_*.dblwr "$DATA"/binlog.* $LOG/
+  # binlog 목록의 ./binlog.NNN(데이터 폴더 기준)을 새 위치로 바꿉니다.
+  sudo sed -i 's#^\./#/var/lib/mysql-log/#' $LOG/binlog.index
+  sudo chown -R --reference="$DATA" $LOG
+  # release.env에 EBMS_MYSQL_LOG_DIR 추가 후 다시 up
+  ```
+
+  SSD도 부팅 시 자동 마운트되게 해 두세요. 마운트 전에 MySQL이 뜨면 redo log가 없어 시작하지 못합니다.
+
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |

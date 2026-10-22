@@ -10,6 +10,7 @@
   2개 이상 같은 기존 곡을 비슷한 곡(similar) 후보로 찾고, 가장 많이 겹치는 곡이 하나면 auto는 그 곡에 추가합니다.
   파일이 그보다 많은 곡은 겹치는 차트로만 판정합니다.
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
+- 캐시(cache.py, SSD)를 켜 두면 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 풉니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
 """
 import hashlib
 import json
@@ -23,7 +24,7 @@ import time
 import uuid
 import zipfile
 
-from . import constant, db, importer, rar, sevenzip
+from . import cache, constant, db, importer, rar, sevenzip
 from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ SIMILAR_FILES = 50
 SIMILAR_MIN_FIELDS = 2
 # 비슷한 곡 후보 최대 수
 SIMILAR_LIMIT = 10
+# rar·7z는 풀린 크기를 미리 알 수 없어 압축 파일 크기의 이 배수로 추정합니다(캐시에 둘지 정할 때).
+EXTRACT_RATIO = 2
 
 _lock = threading.RLock()
 
@@ -55,10 +58,20 @@ class StageError(Exception):
 
 # ---- 저장 ----
 
+def _cache_root() -> pathlib.Path:
+    return constant.CACHE_DIR / "staged"
+
+
+def _roots() -> list[pathlib.Path]:
+    """묶음을 두는 폴더들(캐시, var/staged). 캐시를 끈 뒤에도 캐시에 남은 묶음을 찾습니다."""
+    return [root for root in (_cache_root(), constant.STAGED_DIR) if root.is_dir()]
+
+
 def _dir(stage_id: str) -> pathlib.Path:
     if not stage_id or not all(c in "0123456789abcdef" for c in stage_id):
         raise StageError(404, "stage not found")
-    return constant.STAGED_DIR / stage_id
+    cached = _cache_root() / stage_id
+    return cached if cached.is_dir() else constant.STAGED_DIR / stage_id
 
 
 def _load(stage_id: str) -> dict:
@@ -80,7 +93,8 @@ def _unit_dir(stage: dict, unit: dict) -> pathlib.Path:
     return _dir(stage["id"]) / unit["id"] / unit["name"]
 
 
-def _new_stage(kind: str, name: str) -> dict:
+def _new_stage(kind: str, name: str, size: int) -> dict:
+    """새 묶음. size(풀린 크기 추정)가 캐시 한도 안이면 캐시에, 아니면 var/staged에 둡니다."""
     stage = {
         "id": uuid.uuid4().hex,
         "kind": kind,
@@ -91,17 +105,16 @@ def _new_stage(kind: str, name: str) -> dict:
         "error": None,
         "units": [],
     }
+    path = cache.place("staged", constant.STAGED_DIR, stage["id"], size)
     with _lock:
-        _dir(stage["id"]).mkdir(parents=True)
+        path.mkdir(parents=True)
         _save(stage)
     return stage
 
 
 def recover() -> None:
     """서버 시작 시: 이전 실행에서 작업 도중 꺼진 묶음을 검토할 수 있는 상태로 되돌리고, 목록에 없는 폴더를 지웁니다."""
-    if not constant.STAGED_DIR.is_dir():
-        return
-    for path in constant.STAGED_DIR.iterdir():
+    for path in (p for root in _roots() for p in root.iterdir()):
         if not path.is_dir():
             continue
         try:
@@ -306,6 +319,7 @@ class _Writer:
     def finish(self, error: str | None = None) -> None:
         """판정을 채우고 검토할 수 있게 합니다. 곡이 하나도 없으면 묶음을 지웁니다."""
         stage = self.stage
+        cache.release(_dir(stage["id"]))
         if not stage["units"]:
             shutil.rmtree(_dir(stage["id"]), ignore_errors=True)
             self.job.stage_id = None
@@ -393,9 +407,33 @@ def _stage_7z(writer: _Writer, path: pathlib.Path, filename: str | None = None) 
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _zip_size(path: pathlib.Path) -> int:
+    """zip의 풀린 크기. 읽지 못하면 파일 크기(풀 때 다시 실패합니다)."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return sum(info.file_size for info in zf.infolist())
+    except (zipfile.BadZipFile, OSError):
+        return path.stat().st_size if path.exists() else 0
+
+
+def _tmp_size(root: pathlib.Path) -> int:
+    """var/tmp의 곡 폴더와 압축 파일이 풀린 크기 추정."""
+    total = 0
+    for child in root.iterdir():
+        if child.is_symlink():
+            continue
+        if child.is_dir():
+            total += cache._du(child)
+        elif child.suffix.lower() == ".zip":
+            total += _zip_size(child)
+        elif rar.is_volume(child.name) or sevenzip.is_7z(child.name):
+            total += child.stat().st_size * EXTRACT_RATIO
+    return total
+
+
 def stage_7z(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
     """올린 7z 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("7z", filename)
+    stage = _new_stage("7z", filename, path.stat().st_size * EXTRACT_RATIO)
     job.stage_id = stage["id"]
     writer = _Writer(stage, job)
     try:
@@ -409,7 +447,8 @@ def stage_7z(path: pathlib.Path, filename: str, job: importer.Job) -> dict | Non
 
 def stage_rar(first: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
     """올린 rar(분할 압축이면 첫 볼륨, 나머지는 같은 폴더) 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("rar", filename)
+    size = sum(p.stat().st_size for p in first.parent.iterdir() if rar.is_volume(p.name) and p.is_file())
+    stage = _new_stage("rar", filename, size * EXTRACT_RATIO)
     job.stage_id = stage["id"]
     writer = _Writer(stage, job)
     try:
@@ -423,7 +462,7 @@ def stage_rar(first: pathlib.Path, filename: str, job: importer.Job) -> dict | N
 
 def stage_zip(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
     """올린 zip 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("zip", filename)
+    stage = _new_stage("zip", filename, _zip_size(path))
     job.stage_id = stage["id"]
     writer = _Writer(stage, job)
     try:
@@ -440,7 +479,7 @@ def stage_tmp(job: importer.Job) -> dict | None:
     zip·7z와 rar(분할 압축이면 볼륨 전체)는 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
     root = constant.TMP_DIR
     root.mkdir(parents=True, exist_ok=True)
-    stage = _new_stage("tmp", "var/tmp")
+    stage = _new_stage("tmp", "var/tmp", _tmp_size(root))
     job.stage_id = stage["id"]
     writer = _Writer(stage, job)
     try:
@@ -550,15 +589,14 @@ def summary(stage: dict) -> dict:
         "charts": sum(len(unit["charts"]) for unit in stage["units"]),
         "size": sum(unit["size"] for unit in stage["units"]),
         "counts": _counts(stage),
+        "cached": _dir(stage["id"]).parent == _cache_root(),
     }
 
 
 def list_stages() -> list[dict]:
-    if not constant.STAGED_DIR.is_dir():
-        return []
     stages = []
     with _lock:
-        for path in constant.STAGED_DIR.iterdir():
+        for path in (p for root in _roots() for p in root.iterdir()):
             try:
                 stages.append(summary(_load(path.name)))
             except (StageError, ValueError, KeyError):
