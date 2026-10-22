@@ -326,6 +326,8 @@ loadSongs(1);
 const MB = 1024 * 1024;
 const MIN_CHUNK = MB / 4;
 let chunkSize = 32 * MB;  // 프록시가 413을 주면 줄입니다.
+// 연결이 끊기거나 서버가 5xx를 주면 이만큼 다시 보냅니다(최대 30초 간격, 약 10분). 서버를 다시 시작하는 동안에도 이어집니다.
+const MAX_FAILURES = 24;
 let cancelled = false;
 let currentUpload = null;
 
@@ -379,7 +381,7 @@ async function uploadFile(file, index, count) {
         } catch (e) {
             // 연결이 끊기면 잠시 뒤 받은 곳부터 다시 보냅니다. 큰 요청을 프록시가 끊는 경우도 있어 조각을 줄입니다.
             chunkSize = Math.max(MIN_CHUNK, chunkSize / 2);
-            if (++failures > 8) throw new Error("연결이 계속 끊깁니다. 다시 시도하세요.");
+            if (++failures > MAX_FAILURES) throw new Error("연결이 계속 끊깁니다. 다시 시도하세요.");
             await sleep(1000 * Math.min(30, 2 ** failures));
             continue;
         }
@@ -395,7 +397,7 @@ async function uploadFile(file, index, count) {
             continue;
         }
         if (!res.ok) {
-            if (res.status >= 500 && ++failures <= 8) {
+            if (res.status >= 500 && ++failures <= MAX_FAILURES) {
                 await sleep(1000 * Math.min(30, 2 ** failures));
                 continue;
             }
@@ -594,6 +596,12 @@ function jobCard(job) {
     badge.className = "badge ms-2 " + ({ running: "text-bg-primary", done: "text-bg-success", failed: "text-bg-danger" })[job.status];
     badge.textContent = ({ running: commitJob ? "등록 중" : "푸는 중", done: "완료", failed: "실패" })[job.status];
     title.append(name, badge);
+    if (job.resumed) {
+        const resumed = document.createElement("span");
+        resumed.className = "badge ms-1 text-bg-warning";
+        resumed.textContent = "서버 재시작 후 이어서";
+        title.append(resumed);
+    }
     if (!commitJob && job.stage_id && stageIds.has(job.stage_id)) {
         const review = document.createElement("button");
         review.type = "button";

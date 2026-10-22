@@ -66,8 +66,8 @@ def test_over_limit_falls_back_to_var(client, monkeypatch, cache_on):
 
 
 def test_staged_counts_toward_limit(client, monkeypatch, cache_on):
-    # 업로드 파일도 다 풀 때까지 캐시에 있으므로 함께 셉니다(곡 하나 약 100KB: 업로드 + 묶음이 한도 안, 둘째 묶음은 넘음).
-    monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 250_000)
+    # 올린 파일도 다 풀 때까지 묶음에 있으므로 함께 셉니다(곡 하나 약 100KB: 업로드 + 원본 + 풀린 크기가 한도 안, 둘째 묶음은 넘음).
+    monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 350_000)
     admin_login(client, monkeypatch)
     first = stage(client, "one.zip", make_zip({"s/a.bms": b"#TITLE A\n", "s/k.wav": b"k" * 100_000}), chunk=50_000)
     second = stage(client, "two.zip", make_zip({"t/b.bms": b"#TITLE B\n", "t/k.wav": b"j" * 100_000}), chunk=50_000)
