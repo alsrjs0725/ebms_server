@@ -38,6 +38,8 @@ IMPORT_SLOW_REST_RATIO = 1.0
 IMPORT_SLOW_REST_MAX = 60
 # 서버 시작 시 기존 곡을 다시 처리(매니페스트·pre/play 판정 채우기)할 때 커밋하는 곡 수
 BACKFILL_BATCH_SONGS = 100
+# 기존 곡을 다시 처리할 때 진행도 로그를 남기는 간격(초)
+BACKFILL_PROGRESS_SECONDS = 10
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 SONGS_PER_MANIFEST_CHUNK = 1000

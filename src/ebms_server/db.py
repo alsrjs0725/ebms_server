@@ -677,6 +677,25 @@ def _zip_count(data: bytes) -> int:
         return len(zf.infolist())
 
 
+class _Progress:
+    """오래 걸리는 기존 곡 처리의 진행도를 BACKFILL_PROGRESS_SECONDS마다 로그로 남깁니다(서버 시작·migrate)."""
+
+    def __init__(self, logger: logging.Logger, name: str, total: int):
+        self.logger = logger
+        self.name = name
+        self.total = total
+        self.start = self.last = time.monotonic()
+
+    def update(self, done: int) -> None:
+        now = time.monotonic()
+        if done < self.total and now - self.last < constant.BACKFILL_PROGRESS_SECONDS:
+            return
+        self.last = now
+        elapsed = now - self.start
+        eta = f", about {elapsed / done * (self.total - done):.0f}s left" if 0 < done < self.total else ""
+        self.logger.info(f"{self.name}: {done}/{self.total} ({done * 100 // max(self.total, 1)}%, {elapsed:.0f}s{eta})")
+
+
 def pre_arcname(song_id: int, path: str) -> str:
     """사전 청크 안의 항목 이름."""
     return f"{song_id}/{path}"
@@ -1669,6 +1688,7 @@ class Database:
 
         inserted = failed = 0
         step = constant.BACKFILL_BATCH_SONGS
+        progress = _Progress(self.logger, "backfill_chart_formats", len(song_ids))
         for i in range(0, len(song_ids), step):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
@@ -1690,6 +1710,7 @@ class Database:
                     con.rollback()
                     failed += 1
                     self.logger.exception(f"backfill_chart_formats: Skipped songs from song[{song_ids[i]}]")
+            progress.update(min(i + step, len(song_ids)))
 
         if failed:
             self.logger.warning(f"backfill_chart_formats: {failed} songs failed. Retrying on next start.")
@@ -1752,7 +1773,10 @@ class Database:
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT id FROM song WHERE data IS NOT NULL ORDER BY id")
             legacy_ids = [row[0] for row in cur.fetchall()]
-        for song_id in legacy_ids:
+        if legacy_ids:
+            self.logger.info(f"backfill_manifest: Moving {len(legacy_ids)} songs to song_part.")
+        progress = _Progress(self.logger, "backfill_manifest(song_part)", len(legacy_ids))
+        for n, song_id in enumerate(legacy_ids, 1):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
                     cur.execute("SELECT data FROM song WHERE id = %s AND data IS NOT NULL", (song_id,))
@@ -1769,6 +1793,7 @@ class Database:
                 except Exception:
                     con.rollback()
                     self.logger.exception(f"backfill_manifest: Skipped moving song[{song_id}] data to song_part")
+            progress.update(n)
 
         # 2) 매니페스트 항목·차트 파일명 채우기
         with connect() as con, con.cursor() as cur:
@@ -1781,8 +1806,11 @@ class Database:
             song_ids_no_filenames = set(row[0] for row in cur.fetchall())
 
         affected_song_ids = sorted(song_ids_no_files | song_ids_no_filenames)
+        if affected_song_ids:
+            self.logger.info(f"backfill_manifest: Filling manifest of {len(affected_song_ids)} songs.")
         updated = failed = 0
         step = constant.BACKFILL_BATCH_SONGS
+        progress = _Progress(self.logger, "backfill_manifest", len(affected_song_ids))
         for i in range(0, len(affected_song_ids), step):
             batch = affected_song_ids[i : i + step]
             with self._write_lock, connect() as con, con.cursor() as cur:
@@ -1808,6 +1836,7 @@ class Database:
                     con.rollback()
                     failed += len(batch)
                     self.logger.exception(f"backfill_manifest: Skipped songs {batch[0]}..{batch[-1]}")
+            progress.update(i + len(batch))
         if updated:
             self.logger.info(f"backfill_manifest: Updated manifest of {updated} songs.")
         if failed:
@@ -1850,9 +1879,11 @@ class Database:
                 return 0
             cur.execute("SELECT id FROM song ORDER BY id")
             song_ids = [r[0] for r in cur.fetchall()]
+        self.logger.info(f"backfill_file_kinds: Rechecking pre/play kinds of {len(song_ids)} songs (rule version {FILE_KINDS_VERSION}).")
 
         changed = failed = 0
         step = constant.BACKFILL_BATCH_SONGS
+        progress = _Progress(self.logger, "backfill_file_kinds", len(song_ids))
         for i in range(0, len(song_ids), step):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
@@ -1878,6 +1909,7 @@ class Database:
                     con.rollback()
                     failed += 1
                     self.logger.exception(f"backfill_file_kinds: Skipped songs from song[{song_ids[i]}]")
+            progress.update(min(i + step, len(song_ids)))
 
         if failed:
             self.logger.warning(f"backfill_file_kinds: {failed} songs failed. Retrying on next start.")
@@ -1919,8 +1951,10 @@ class Database:
         with self._write_lock, connect() as con, con.cursor() as cur:
             cur.execute("SELECT id FROM chart_chunk ORDER BY id")
             chunk_ids = [row[0] for row in cur.fetchall()]
+            progress = _Progress(self.logger, "migrate_chart_chunk_names", len(chunk_ids))
             try:
-                for chunk_no in chunk_ids:
+                for n, chunk_no in enumerate(chunk_ids, 1):
+                    progress.update(n - 1)
                     cur.execute("SELECT data FROM chart_chunk WHERE id = %s FOR UPDATE", (chunk_no,))
                     old = cur.fetchone()[0]
                     buf = io.BytesIO()
