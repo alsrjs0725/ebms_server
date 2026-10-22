@@ -351,3 +351,26 @@ def test_zip_name_encoding_unknown():
     zf = _mixed_name_zip([(Cp932ZipInfo, "曲/ドラム.wav"), (Cp949ZipInfo, "曲/노래.bms")])
     with pytest.raises(importer.ZipNameEncodingError, match="cp932"):
         importer._song_groups(zf)
+
+
+def test_upload_resumes_after_restart(client, monkeypatch):
+    """받던 업로드는 서버를 다시 시작해도 받은 곳부터 이어 받습니다."""
+    admin_login(client, monkeypatch)
+    data = make_zip({"s/a.bms": b"#TITLE A\n"})
+    r = client.post("/api/admin/import/uploads", json={"filename": "r.zip", "size": len(data)})
+    upload_id = r.json()["id"]
+    half = len(data) // 2
+    assert client.put(f"/api/admin/import/uploads/{upload_id}", params={"offset": 0}, content=data[:half]).status_code == 200
+    stray = constant.IMPORT_DIR / "leftover"
+    stray.mkdir()
+    # 다시 시작: 메모리의 업로드 목록이 비고, recover가 디스크에서 다시 읽습니다.
+    importer._uploads.clear()
+    importer.recover()
+    assert not stray.exists()
+    r = client.put(f"/api/admin/import/uploads/{upload_id}", params={"offset": 0}, content=data)
+    assert r.status_code == 409 and f"offset must be {half}" in r.text
+    assert client.put(f"/api/admin/import/uploads/{upload_id}", params={"offset": half}, content=data[half:]).status_code == 200
+    job = wait(client, client.post(f"/api/admin/import/uploads/{upload_id}/finish").json())
+    assert job["status"] == "done" and job["stage_id"]
+    assert list(constant.IMPORT_DIR.iterdir()) == []
+

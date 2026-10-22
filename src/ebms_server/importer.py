@@ -3,11 +3,13 @@
 - 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip·rar를 대기 묶음(staging.py)으로 옮깁니다.
 - 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
   다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
-  작업 상태는 메모리에만 둡니다(대기 묶음은 디스크에 남음).
+  받는 중인 업로드는 `{id}.json`에 이름·크기를 적어 두므로 서버를 다시 시작해도 받은 곳부터 이어 받습니다.
+  작업 상태는 메모리에만 두고, 풀거나 commit하던 묶음은 서버를 다시 시작하면 staging.recover가 이어서 합니다.
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
 - 작업을 "천천히"(Job.slow)로 돌리면 작은 배치로 커밋하고 커밋마다 쉬어 서비스(다운로드·DB 응답)에 디스크를 양보합니다.
   돌고 있는 작업도 바꿀 수 있습니다.
 """
+import json
 import logging
 import os
 import pathlib
@@ -65,6 +67,8 @@ class Job:
         self._wake = threading.Event()
         self._work_since = time.monotonic()
         self.resting_until: float | None = None
+        # 서버가 다시 시작돼 이어서 하는 작업
+        self.resumed = False
 
     @property
     def slow(self) -> bool:
@@ -110,6 +114,7 @@ class Job:
             "slow": self._slow,
             "resting": self.resting_until is not None,
             "stage_id": self.stage_id,
+            "resumed": self.resumed,
         }
 
 
@@ -309,6 +314,8 @@ def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> lis
 MAX_JOBS = 50
 # zip 크기 외에 남겨둘 여유 디스크(곡 하나를 풀 공간)
 DISK_MARGIN = 2 * 1024 ** 3
+# 이 시간(초) 동안 조각이 오지 않은 업로드는 버려진 것으로 보고 지웁니다(창을 닫는 등).
+UPLOAD_KEEP_SECONDS = 24 * 3600
 
 _lock = threading.Lock()
 _uploads: dict[str, dict] = {}
@@ -330,11 +337,14 @@ def start_upload(filename: str, size: int) -> dict:
     free = shutil.disk_usage(constant.IMPORT_DIR).free
     if size + DISK_MARGIN > free:
         raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
+    _drop_stale_uploads()
     upload_id = uuid.uuid4().hex
     path = constant.IMPORT_DIR / f"{upload_id}.upload"
     path.touch()
+    meta = constant.IMPORT_DIR / f"{upload_id}.json"
+    meta.write_text(json.dumps({"filename": filename, "size": size}, ensure_ascii=False), "utf-8")
     with _lock:
-        _uploads[upload_id] = {"filename": filename, "size": size, "path": path}
+        _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta}
     return {"id": upload_id, "received": 0, "size": size}
 
 
@@ -344,6 +354,62 @@ def _upload(upload_id: str) -> dict:
     if upload is None:
         raise UploadError(404, "upload not found")
     return upload
+
+
+def _drop_upload(upload_id: str) -> None:
+    with _lock:
+        upload = _uploads.pop(upload_id, None)
+    if upload is not None:
+        upload["path"].unlink(missing_ok=True)
+        upload["meta"].unlink(missing_ok=True)
+
+
+def _drop_stale_uploads() -> None:
+    """UPLOAD_KEEP_SECONDS 동안 조각이 오지 않은 업로드를 지웁니다."""
+    now = time.time()
+    with _lock:
+        stale = [i for i, u in _uploads.items() if now - _mtime(u["path"]) > UPLOAD_KEEP_SECONDS]
+    for upload_id in stale:
+        logger.info(f"import: removed stale upload[{upload_id}]")
+        _drop_upload(upload_id)
+
+
+def _mtime(path: pathlib.Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def recover() -> None:
+    """서버 시작 시: 받던 업로드(`{id}.upload`와 `{id}.json`)를 다시 받을 수 있게 읽고, 나머지(이전 실행의 임시 폴더 등)는 지웁니다.
+    관리자 페이지는 연결이 끊기면 받은 곳부터 다시 보내므로, 서버가 다시 시작돼도 업로드가 이어집니다."""
+    root = constant.IMPORT_DIR
+    if not root.is_dir():
+        return
+    keep: set[str] = set()
+    for meta in root.glob("*.json"):
+        upload_id = meta.stem
+        path = root / f"{upload_id}.upload"
+        try:
+            info = json.loads(meta.read_text("utf-8"))
+            filename, size = str(info["filename"]), int(info["size"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if not path.is_file() or path.stat().st_size > size or time.time() - _mtime(path) > UPLOAD_KEEP_SECONDS:
+            continue
+        with _lock:
+            _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta}
+        keep.update((meta.name, path.name))
+    for child in root.iterdir():
+        if child.name in keep:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+    if keep:
+        logger.info(f"import: kept {len(keep) // 2} unfinished uploads")
 
 
 def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
@@ -401,6 +467,12 @@ def finish_uploads(upload_ids: list[str]) -> Job:
     with _lock:
         for upload_id in upload_ids:
             _uploads.pop(upload_id, None)
+    # 올린 파일은 작업 스레드에서 새 묶음으로 옮깁니다. 묶음에 있으므로 풀다가 서버가 꺼져도 다시 시작할 때 이어서 풉니다.
+
+    def drop_meta():
+        for upload in uploads:
+            upload["meta"].unlink(missing_ok=True)
+            upload["path"].unlink(missing_ok=True)
 
     if seven:
         upload = uploads[0]
@@ -411,7 +483,7 @@ def finish_uploads(upload_ids: list[str]) -> Job:
             try:
                 staging.stage_7z(upload["path"], upload["filename"], job)
             finally:
-                upload["path"].unlink(missing_ok=True)
+                drop_meta()
 
         return _start(job, run_7z)
 
@@ -424,7 +496,7 @@ def finish_uploads(upload_ids: list[str]) -> Job:
             try:
                 staging.stage_zip(upload["path"], upload["filename"], job)
             finally:
-                upload["path"].unlink(missing_ok=True)
+                drop_meta()
 
         return _start(job, run)
 
@@ -432,26 +504,17 @@ def finish_uploads(upload_ids: list[str]) -> Job:
 
     def run_rar():
         from . import staging
-        # unrar가 나머지 볼륨을 이름으로 찾으므로 원래 이름으로 한 폴더에 모읍니다.
-        folder = constant.IMPORT_DIR / uuid.uuid4().hex
+        # unrar가 나머지 볼륨을 이름으로 찾으므로 묶음 안 한 폴더에 원래 이름으로 모읍니다.
         try:
-            folder.mkdir()
-            for upload, name in zip(uploads, names):
-                upload["path"].rename(folder / name)
-            staging.stage_rar(folder / first, first, job)
+            staging.stage_rar([(u["path"], name) for u, name in zip(uploads, names)], first, job)
         finally:
-            shutil.rmtree(folder, ignore_errors=True)
-            for upload in uploads:
-                upload["path"].unlink(missing_ok=True)
+            drop_meta()
 
     return _start(job, run_rar)
 
 
 def cancel_upload(upload_id: str) -> None:
-    with _lock:
-        upload = _uploads.pop(upload_id, None)
-    if upload is not None:
-        upload["path"].unlink(missing_ok=True)
+    _drop_upload(upload_id)
 
 
 def start_tmp_job() -> Job:
