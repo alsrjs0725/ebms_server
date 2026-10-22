@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import zipfile
+from collections import OrderedDict
 
 import pytest
 
@@ -17,6 +18,8 @@ from test_quota import admin_login
 @pytest.fixture(autouse=True)
 def import_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(constant, "IMPORT_DIR", tmp_path / "import")
+    # 작업 목록은 모듈 전역이라 다른 테스트의 작업이 섞이지 않도록 비웁니다.
+    monkeypatch.setattr(importer, "_jobs", OrderedDict())
 
 
 class Cp932ZipInfo(zipfile.ZipInfo):

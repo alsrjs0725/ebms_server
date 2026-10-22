@@ -20,8 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      # rar 임포트 테스트용
-      - run: sudo apt-get update && sudo apt-get install -y unrar
+      # rar·7z 임포트 테스트용
+      - run: sudo apt-get update && sudo apt-get install -y unrar 7zip
       - run: uv sync --frozen
       - run: uv run pytest
 

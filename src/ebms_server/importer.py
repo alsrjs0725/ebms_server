@@ -366,8 +366,8 @@ def finish_upload(upload_id: str) -> Job:
 
 def finish_uploads(upload_ids: list[str]) -> Job:
     """다 받은 파일을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 작업이 끝나면 올린 파일을 지웁니다.
-    파일 하나면 zip 또는 rar, 여럿이면 한 rar 분할 압축의 볼륨들(첫 볼륨 포함)이어야 합니다."""
-    from . import rar
+    파일 하나면 zip·rar·7z, 여럿이면 한 rar 분할 압축의 볼륨들(첫 볼륨 포함)이어야 합니다."""
+    from . import rar, sevenzip
     if not upload_ids or len(set(upload_ids)) != len(upload_ids):
         raise UploadError(400, "upload ids required")
     uploads = [_upload(i) for i in upload_ids]
@@ -391,9 +391,29 @@ def finish_uploads(upload_ids: list[str]) -> Job:
         free = shutil.disk_usage(constant.IMPORT_DIR).free
         if need > free:
             raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, rar를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
+    seven = not volumes and sevenzip.is_7z(names[0])
+    if seven:
+        # 7z도 통째로 푸므로 7z 크기만큼 더 필요합니다.
+        need = uploads[0]["size"] + DISK_MARGIN
+        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        if need > free:
+            raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 7z를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
     with _lock:
         for upload_id in upload_ids:
             _uploads.pop(upload_id, None)
+
+    if seven:
+        upload = uploads[0]
+        job = Job("7z", upload["filename"])
+
+        def run_7z():
+            from . import staging
+            try:
+                staging.stage_7z(upload["path"], upload["filename"], job)
+            finally:
+                upload["path"].unlink(missing_ok=True)
+
+        return _start(job, run_7z)
 
     if not volumes:
         upload = uploads[0]
