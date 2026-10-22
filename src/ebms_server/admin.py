@@ -3,7 +3,7 @@
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
 - 곡 관리: 곡 검색·삭제(사용 중지)·복원, 곡 zip의 파일 구조 보기·파일 받기
-- 곡 임포트: zip 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
+- 곡 임포트: zip·rar·7z 조각 업로드 후 백그라운드 등록, `var/tmp/` 가져오기
 - 서버 로그 조회: 수준·로거·검색어 필터
 - 곡 다운로드 기록 조회: 사용자·곡·결과 필터
 
@@ -527,7 +527,7 @@ def _upload_call(fn, *args):
 
 @router.post("/api/admin/import/uploads")
 def start_upload(body: UploadStart, admin: Annotated[User, Depends(web_admin)]):
-    """zip·rar 조각 업로드를 시작합니다. 디스크가 모자라면 507."""
+    """zip·rar·7z 조각 업로드를 시작합니다. 디스크가 모자라면 507."""
     return _upload_call(importer.start_upload, body.filename, body.size)
 
 
@@ -546,7 +546,7 @@ def cancel_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
 
 @router.post("/api/admin/import/uploads/{upload_id}/finish")
 def finish_upload(upload_id: str, admin: Annotated[User, Depends(web_admin)]):
-    """다 받은 zip(또는 rar)을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 등록은 검토 뒤 commit할 때 합니다."""
+    """다 받은 zip(또는 rar·7z)을 대기 묶음에 푸는 작업을 백그라운드로 시작합니다. 등록은 검토 뒤 commit할 때 합니다."""
     job = _upload_call(importer.finish_upload, upload_id)
     logger.info(f"import job {job.id} by {admin.id}: {job.name}")
     return job.json()

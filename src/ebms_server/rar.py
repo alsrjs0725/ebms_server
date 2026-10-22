@@ -75,7 +75,7 @@ def extract(path: pathlib.Path, dest: pathlib.Path) -> None:
     env = {**os.environ, "LC_ALL": "C.UTF-8"}
     proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", env=env)
     message = " ".join((proc.stderr + proc.stdout).split())
-    _remove_symlinks(dest)
+    remove_symlinks(dest, "rar")
     # 1은 치명적이지 않은 경고(위험한 링크를 건너뜀 등)입니다.
     if proc.returncode not in (0, 1):
         raise RarError(f"rar를 풀지 못했습니다(unrar {proc.returncode}): {message or '알 수 없는 오류'}")
@@ -83,11 +83,11 @@ def extract(path: pathlib.Path, dest: pathlib.Path) -> None:
         logger.warning(f"unrar warning[{path}]: {message}")
 
 
-def _remove_symlinks(root: pathlib.Path) -> None:
+def remove_symlinks(root: pathlib.Path, kind: str) -> None:
     """풀린 심볼릭 링크를 지웁니다(곡 밖의 파일을 가리키지 않도록)."""
     for dirpath, dirnames, filenames in os.walk(root):
         links = [n for n in dirnames + filenames if os.path.islink(os.path.join(dirpath, n))]
         dirnames[:] = [d for d in dirnames if d not in links]
         for name in links:
-            logger.warning(f"rar: removed symlink[{os.path.join(dirpath, name)}]")
+            logger.warning(f"{kind}: removed symlink[{os.path.join(dirpath, name)}]")
             os.unlink(os.path.join(dirpath, name))

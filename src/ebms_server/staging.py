@@ -1,7 +1,7 @@
-"""곡 임포트 대기(staged). 올린 zip·rar와 var/tmp의 곡을 바로 DB에 넣지 않고 `var/staged/`에 곡 단위로 풀어 두고,
+"""곡 임포트 대기(staged). 올린 zip·rar·7z와 var/tmp의 곡을 바로 DB에 넣지 않고 `var/staged/`에 곡 단위로 풀어 두고,
 관리자가 곡마다(또는 차트마다) 넣을 곳을 검토·지정한 뒤 commit하면 그때 등록합니다.
 
-- 묶음(stage): zip이나 rar(분할 압축이면 볼륨 전체) 하나, 또는 var/tmp 가져오기 한 번. `var/staged/{묶음}/stage.json`에 상태와 곡 목록을 두고,
+- 묶음(stage): zip이나 7z, rar(분할 압축이면 볼륨 전체) 하나, 또는 var/tmp 가져오기 한 번. `var/staged/{묶음}/stage.json`에 상태와 곡 목록을 두고,
   곡은 `var/staged/{묶음}/{곡}/{폴더명}/`에 풉니다. 디스크에 있으므로 서버를 다시 시작해도 남습니다.
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
@@ -23,7 +23,7 @@ import time
 import uuid
 import zipfile
 
-from . import constant, db, importer, rar
+from . import constant, db, importer, rar, sevenzip
 from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
 
 logger = logging.getLogger(__name__)
@@ -379,6 +379,34 @@ def _stage_rar(writer: _Writer, first: pathlib.Path, filename: str | None = None
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _stage_7z(writer: _Writer, path: pathlib.Path, filename: str | None = None) -> None:
+    """7z를 묶음 안 임시 폴더에 통째로 푼 뒤 곡 폴더를 옮깁니다(rar와 같음).
+    최상위에 차트가 있으면 7z 이름을 곡 폴더명으로 씁니다. 풀지 못하면 sevenzip.SevenZipError."""
+    name = pathlib.PurePath((filename or path.name).replace("\\", "/")).stem
+    if name in ("", ".", ".."):
+        name = "song"
+    work = _dir(writer.stage["id"]) / f"7z-{uuid.uuid4().hex[:12]}"
+    try:
+        sevenzip.extract(path, work / name)
+        _move_songs(writer, importer.find_song_dirs(work / name), work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def stage_7z(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
+    """올린 7z 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    stage = _new_stage("7z", filename)
+    job.stage_id = stage["id"]
+    writer = _Writer(stage, job)
+    try:
+        _stage_7z(writer, path, filename)
+    except BaseException as e:
+        writer.finish(f"7z를 다 풀지 못했습니다: {e}")
+        raise
+    writer.finish()
+    return stage if stage["units"] else None
+
+
 def stage_rar(first: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
     """올린 rar(분할 압축이면 첫 볼륨, 나머지는 같은 폴더) 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
     stage = _new_stage("rar", filename)
@@ -408,8 +436,8 @@ def stage_zip(path: pathlib.Path, filename: str, job: importer.Job) -> dict | No
 
 
 def stage_tmp(job: importer.Job) -> dict | None:
-    """`var/tmp/`의 곡 폴더와 zip·rar를 새 묶음으로 옮깁니다. 곡 폴더는 옮기고(원래 자리에서 사라짐),
-    zip과 rar(분할 압축이면 볼륨 전체)는 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    """`var/tmp/`의 곡 폴더와 zip·rar·7z를 새 묶음으로 옮깁니다. 곡 폴더는 옮기고(원래 자리에서 사라짐),
+    zip·7z와 rar(분할 압축이면 볼륨 전체)는 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
     root = constant.TMP_DIR
     root.mkdir(parents=True, exist_ok=True)
     stage = _new_stage("tmp", "var/tmp")
@@ -453,6 +481,20 @@ def stage_tmp(job: importer.Job) -> dict | None:
             if not any("error" in song for song in job.songs[start:]):
                 for name in names:
                     (root / name).unlink(missing_ok=True)
+        for path in sorted(p for p in root.iterdir() if sevenzip.is_7z(p.name)):
+            if path.is_symlink() or not path.is_file():
+                if path.is_symlink():
+                    logger.warning(f"import: skipped symlink[{path}]")
+                continue
+            start = len(job.songs)
+            try:
+                _stage_7z(writer, path)
+            except (sevenzip.SevenZipError, OSError) as e:
+                logger.warning(f"stage_tmp: cannot extract 7z[{path}]: {e}")
+                writer.error(path.name, f"{e} (아직 복사 중일 수 있습니다)")
+                continue
+            if not any("error" in song for song in job.songs[start:]):
+                path.unlink(missing_ok=True)
     except BaseException as e:
         writer.finish(f"var/tmp를 다 옮기지 못했습니다: {e}")
         raise
