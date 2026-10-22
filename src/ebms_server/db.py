@@ -1186,10 +1186,12 @@ class Database:
                 with connect() as con, con.cursor() as cur:
                     self._set_setting(cur, CHART_RECHUNK_PHASE_SETTING, "delete")
                     con.commit()
-            for chunk_no in old_ids:
+            progress = _Progress(self.logger, "rechunk_charts(delete)", len(old_ids))
+            for i, chunk_no in enumerate(old_ids, 1):
                 with connect() as con, con.cursor() as cur:
                     cur.execute("DELETE FROM chart_chunk WHERE id = %s", (chunk_no,))
                     con.commit()
+                progress.update(i)
             with connect() as con, con.cursor() as cur:
                 self._set_setting(cur, CHART_RECHUNK_SETTING, None)
                 self._set_setting(cur, CHART_RECHUNK_PHASE_SETTING, None)
@@ -1222,6 +1224,7 @@ class Database:
                     raise
             chunk_no, entries, size, md5s = chunk_no + 1, [], 0, []
 
+        progress = _Progress(self.logger, "rechunk_charts(copy, old chunks)", len(old_ids))
         for i, old in enumerate(old_ids, 1):
             with connect() as con, con.cursor() as cur:
                 cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (old,))
@@ -1238,8 +1241,7 @@ class Database:
                         flush()
                     entries.append((info.filename, content))
                     size += len(content)
-            if i % 10 == 0:
-                self.logger.info(f"rechunk_charts: {i}/{len(old_ids)} old chunks read")
+            progress.update(i)
         if entries:
             flush()
         return chunk_no - first_id
@@ -1345,8 +1347,11 @@ class Database:
         groups: dict[int, list[tuple[int, str]]] = defaultdict(list)
         for song_id, sha256 in pending:
             groups[song_id // constant.SONGS_PER_PRE_CHUNK].append((song_id, sha256))
-        done = 0
+        done = seen = 0
+        progress = _Progress(self.logger, "render_previews", len(pending))
         for chunk_no, songs in sorted(groups.items()):
+            progress.update(seen)
+            seen += len(songs)
             results = []
             for song_id, sha256 in songs:
                 files = self.get_song_files(song_id)
@@ -1404,6 +1409,7 @@ class Database:
                     con.rollback()
                     raise
             done += len(changed)
+        progress.update(len(pending))
         self.logger.info(f"render_previews: Rendered {done} previews.")
         return done
 
@@ -1515,6 +1521,7 @@ class Database:
             missing = sorted(wanted - {row[0] for row in cur.fetchall()})
         if missing:
             self.logger.info(f"backfill_pre_chunks: Building {len(missing)} pre chunks.")
+        progress = _Progress(self.logger, "backfill_pre_chunks", len(missing))
         for i, chunk_no in enumerate(missing, 1):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
@@ -1525,8 +1532,7 @@ class Database:
                 except Exception:
                     con.rollback()
                     raise
-            if i % 100 == 0:
-                self.logger.info(f"backfill_pre_chunks: {i}/{len(missing)}")
+            progress.update(i)
         if missing:
             self.logger.info(f"backfill_pre_chunks: Built {len(missing)} pre chunks.")
         self._drop_orphan_pre_parts()
@@ -1561,7 +1567,9 @@ class Database:
         self.logger.info(f"backfill_chart_md5: Filling md5 of {len(missing)} charts.")
         filled = 0
         broken = False
-        for chunk_no in chunk_ids:
+        progress = _Progress(self.logger, "backfill_chart_md5(chart chunks)", len(chunk_ids))
+        for n, chunk_no in enumerate(chunk_ids):
+            progress.update(n)
             with connect() as con, con.cursor() as cur:
                 cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
                 row = cur.fetchone()
@@ -1590,6 +1598,7 @@ class Database:
                     raise
             missing.difference_update(sha256 for _, sha256 in found)
             filled += len(found)
+        progress.update(len(chunk_ids))
         self.logger.info(f"backfill_chart_md5: Filled md5 of {filled} charts.")
         if missing and not broken:
             # 어느 청크에도 없는 차트는 ''로 두어 시작할 때마다 청크를 다시 읽지 않게 합니다(난이도표 md5와 맞지 않음).
@@ -1613,7 +1622,9 @@ class Database:
         self.logger.info(f"backfill_chart_meta: Filling meta keys of {len(missing)} charts.")
         filled = 0
         broken = False
-        for chunk_no in chunk_ids:
+        progress = _Progress(self.logger, "backfill_chart_meta(chart chunks)", len(chunk_ids))
+        for n, chunk_no in enumerate(chunk_ids):
+            progress.update(n)
             with connect() as con, con.cursor() as cur:
                 cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
                 row = cur.fetchone()
@@ -1646,6 +1657,7 @@ class Database:
                     raise
             missing.difference_update(sha256 for *_, sha256 in found)
             filled += len(found)
+        progress.update(len(chunk_ids))
         self.logger.info(f"backfill_chart_meta: Filled meta keys of {filled} charts.")
         if missing and not broken:
             # 어느 청크에도 없는 차트는 ''로 두어 시작할 때마다 청크를 다시 읽지 않게 합니다.
