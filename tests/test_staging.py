@@ -309,3 +309,48 @@ def test_analyze_fills_meta_of_old_units_and_backfill(client, monkeypatch):
     path.write_text(json.dumps(data), "utf-8")
     assert client.post(f"/api/admin/import/stages/{sid}/analyze").status_code == 200
     assert units(client, sid)["pack/s"]["suggestion"]["merge"] == 1
+
+
+def test_units_are_packed_into_one_file(client, monkeypatch):
+    """대기 곡은 낱개 파일로 풀지 않고 곡마다 압축하지 않은 zip 하나로 둡니다(작은 파일의 할당 단위 낭비 방지)."""
+    admin_login(client, monkeypatch)
+    keys = {f"p/s/k{i:03d}.wav": bytes([i]) * 10 for i in range(200)}
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", **keys}))
+    sid = job["stage_id"]
+    unit = units(client, sid)["pack/p/s"]
+    assert unit["files"] == 201
+    assert sorted(p.name for p in (constant.STAGED_DIR / sid / unit["id"]).iterdir()) == [staging.PACK_FILE]
+    files = client.get(f"/api/admin/import/stages/{sid}/units/{unit['id']}/files").json()
+    assert len(files) == 200 and files[0] == {"path": "k000.wav", "size": 10}
+
+    # var/tmp의 곡 폴더도 묶어 옮기고, 빈 폴더도 곡에 남습니다.
+    song = constant.TMP_DIR / "t"
+    (song / "bga" / "empty").mkdir(parents=True)
+    (song / "b.bms").write_bytes(b"#TITLE B\n")
+    (song / "bga" / "x.png").write_bytes(b"png")
+    tmp = wait(client, client.post("/api/admin/import/tmp").json())
+    tunit = units(client, tmp["stage_id"])["t"]
+    assert sorted(p.name for p in (constant.STAGED_DIR / tmp["stage_id"] / tunit["id"]).iterdir()) == [staging.PACK_FILE]
+    assert not song.exists()
+
+    commit_stage(client, sid)
+    commit_stage(client, tmp["stage_id"])
+    rows = {name: song_id for song_id, name in song_rows()}
+    assert len(song_files(rows["s"])) == 201
+    assert song_files(rows["t"]) == ["b.bms", "bga/empty/", "bga/x.png"]
+
+
+def test_old_unpacked_units_still_commit(client, monkeypatch):
+    """이전 버전에서 폴더로 풀어 둔 곡도 읽고 commit합니다."""
+    admin_login(client, monkeypatch)
+    job = stage(client, "pack.zip", make_zip({"s/a.bms": b"#TITLE A\n", "s/k.wav": b"k"}))
+    sid = job["stage_id"]
+    unit = units(client, sid)["pack/s"]
+    unit_root = constant.STAGED_DIR / sid / unit["id"]
+    with zipfile.ZipFile(unit_root / staging.PACK_FILE) as zf:
+        zf.extractall(unit_root / "s")
+    (unit_root / staging.PACK_FILE).unlink()
+    files = client.get(f"/api/admin/import/stages/{sid}/units/{unit['id']}/files").json()
+    assert files == [{"path": "k.wav", "size": 1}]
+    commit_stage(client, sid)
+    assert song_files(song_rows()[0][0]) == ["a.bms", "k.wav"]

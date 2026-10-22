@@ -27,15 +27,19 @@ def enabled() -> bool:
     return constant.CACHE_MAX_BYTES > 0
 
 
-def _du(path: pathlib.Path) -> int:
-    """폴더(또는 파일)의 바이트 수."""
+def _du(path: pathlib.Path, apparent: bool = False) -> int:
+    """폴더(또는 파일)가 디스크에서 차지하는 바이트 수. 작은 파일도 할당 단위(블록)만큼 셉니다.
+    apparent면 파일 크기의 합입니다."""
+    def size(st: os.stat_result) -> int:
+        return st.st_size if apparent else st.st_blocks * 512
+
     if path.is_file():
-        return path.stat().st_size
+        return size(path.lstat())
     total = 0
     for dirpath, _, filenames in os.walk(path):
         for name in filenames:
             try:
-                total += os.lstat(os.path.join(dirpath, name)).st_size
+                total += size(os.lstat(os.path.join(dirpath, name)))
             except OSError:
                 pass
     return total

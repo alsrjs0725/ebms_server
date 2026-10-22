@@ -2,7 +2,10 @@
 관리자가 곡마다(또는 차트마다) 넣을 곳을 검토·지정한 뒤 commit하면 그때 등록합니다.
 
 - 묶음(stage): zip이나 7z, rar(분할 압축이면 볼륨 전체) 하나, 또는 var/tmp 가져오기 한 번. `var/staged/{묶음}/stage.json`에 상태와 곡 목록을 두고,
-  곡은 `var/staged/{묶음}/{곡}/{폴더명}/`에 풉니다. 디스크에 있으므로 서버를 다시 시작해도 남습니다.
+  곡은 `var/staged/{묶음}/{곡}/song.zip`(압축하지 않은 zip, 곡 폴더 안 경로 그대로)에 하나의 파일로 둡니다.
+  작은 파일(키음 등)을 낱개로 풀어 두면 파일마다 디스크 할당 단위만큼 자리를 차지해 실제 크기보다 몇 배로 커지기 때문입니다.
+  commit할 때 곡 하나씩 작업 폴더에 풀어 넣고 지웁니다. 디스크에 있으므로 서버를 다시 시작해도 남습니다.
+  (이전 버전에서 만든 묶음은 `{곡}/{폴더명}/` 폴더 그대로 두고 읽습니다.)
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
@@ -25,11 +28,13 @@ import uuid
 import zipfile
 
 from . import cache, constant, db, importer, rar, sevenzip
-from .db import META_HEADERS, Database, _chart_refs, chart_files, chart_meta, meta_keys
+from .db import META_HEADERS, Database, _chart_refs, chart_meta, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
 
 STAGE_FILE = "stage.json"
+# 곡 하나의 파일을 묶어 두는 압축하지 않은 zip
+PACK_FILE = "song.zip"
 # 작업 중 stage.json을 저장하는 간격(초). 곡마다 저장하면 곡이 많을 때 쓰기가 너무 많아집니다.
 SAVE_INTERVAL = 2.0
 # 검토 화면 한 쪽의 곡 수
@@ -90,7 +95,55 @@ def _save(stage: dict) -> None:
 
 
 def _unit_dir(stage: dict, unit: dict) -> pathlib.Path:
+    """이전 버전에서 풀어 둔 곡 폴더."""
     return _dir(stage["id"]) / unit["id"] / unit["name"]
+
+
+def _pack_path(stage: dict, unit: dict) -> pathlib.Path:
+    return _dir(stage["id"]) / unit["id"] / PACK_FILE
+
+
+def _pack(song_dir: pathlib.Path, pack: pathlib.Path) -> None:
+    """곡 폴더를 압축하지 않은 zip 하나로 묶습니다(빈 폴더 포함, 심볼릭 링크는 뺌)."""
+    root = song_dir.resolve()
+    with zipfile.ZipFile(pack, "w", zipfile.ZIP_STORED) as zf:
+        for path, is_dir in song_dir_entries(root):
+            rel = path.relative_to(root).as_posix()
+            if is_dir:
+                zf.writestr(rel + "/", b"")
+            else:
+                zf.write(path, rel)
+
+
+def _read(stage: dict, unit: dict, rel: str) -> bytes:
+    """곡 안 파일 하나의 내용."""
+    pack = _pack_path(stage, unit)
+    if pack.is_file():
+        with zipfile.ZipFile(pack) as zf:
+            return zf.read(rel)
+    return (_unit_dir(stage, unit) / rel).read_bytes()
+
+
+def _unpack(stage: dict, unit: dict, work: pathlib.Path) -> pathlib.Path:
+    """commit할 곡 폴더. 묶어 둔 곡은 work/{폴더명}에 풀고, 이전 버전의 폴더는 그대로 돌려줍니다."""
+    pack = _pack_path(stage, unit)
+    if not pack.is_file():
+        return _unit_dir(stage, unit)
+    out = work / unit["name"]
+    out.mkdir(parents=True)
+    with zipfile.ZipFile(pack) as zf:
+        for info in zf.infolist():
+            parts = [p for p in info.filename.split("/") if p]
+            if not parts or any(p in (".", "..") for p in parts):
+                continue
+            target = out.joinpath(*parts)
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as fin, open(target, "wb") as fout:
+                shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
+    return out
 
 
 def _new_stage(kind: str, name: str, size: int) -> dict:
@@ -147,10 +200,9 @@ def _set_meta(chart: dict, content: bytes) -> None:
     chart["keys"] = meta_keys(meta)
 
 
-def _chart_info(path: pathlib.Path, root: pathlib.Path) -> dict:
-    content = path.read_bytes()
+def _chart_info(rel: str, content: bytes) -> dict:
     chart = {
-        "path": path.relative_to(root).as_posix(),
+        "path": rel,
         "size": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
         "target": None,
@@ -159,15 +211,21 @@ def _chart_info(path: pathlib.Path, root: pathlib.Path) -> dict:
     return chart
 
 
-def _make_unit(unit_id: str, song_dir: pathlib.Path, folder: str) -> dict:
-    files = [p for p in song_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+def _make_unit(unit_id: str, pack: pathlib.Path, name: str, folder: str) -> dict:
+    """묶어 둔 곡(pack)의 정보. 차트는 곡 폴더 바로 아래의 차트 파일입니다(db.chart_files와 같음)."""
+    with zipfile.ZipFile(pack) as zf:
+        files = sorted((i for i in zf.infolist() if not i.is_dir()), key=lambda i: i.filename)
+        charts = [
+            _chart_info(i.filename, zf.read(i)) for i in files
+            if "/" not in i.filename and pathlib.PurePath(i.filename).suffix.lower() in constant.BMS_FORMAT
+        ]
     return {
         "id": unit_id,
-        "name": song_dir.name,
+        "name": name,
         "folder": folder,
         "files": len(files),
-        "size": sum(p.stat().st_size for p in files),
-        "charts": [_chart_info(p, song_dir) for p in chart_files(song_dir)],
+        "size": sum(i.file_size for i in files),
+        "charts": charts,
         "target": "auto",
         "suggestion": None,
         "result": None,
@@ -223,8 +281,8 @@ def _fill_meta(stage: dict, unit: dict) -> None:
         if "keys" in chart:
             continue
         try:
-            _set_meta(chart, (_unit_dir(stage, unit) / chart["path"]).read_bytes())
-        except OSError:
+            _set_meta(chart, _read(stage, unit, chart["path"]))
+        except (OSError, KeyError, zipfile.BadZipFile):
             chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS})
 
 
@@ -287,26 +345,42 @@ class _Writer:
         self.job = job
         self._saved = time.monotonic()
 
-    def unit_dir(self) -> tuple[str, pathlib.Path]:
-        unit_id = uuid.uuid4().hex[:12]
-        return unit_id, _dir(self.stage["id"]) / unit_id
+    def unit_id(self) -> str:
+        return uuid.uuid4().hex[:12]
 
     def add(self, unit_id: str, song_dir: pathlib.Path, folder: str) -> None:
+        """곡 폴더(어디에 있든)를 묶음의 곡 파일로 묶어 더하고 폴더는 지웁니다. 묶지 못하면 폴더는 남깁니다."""
+        work = _dir(self.stage["id"]) / unit_id
+        work.mkdir(exist_ok=True)
         try:
-            unit = _make_unit(unit_id, song_dir, folder)
+            _pack(song_dir, work / PACK_FILE)
         except Exception as e:
             logger.exception(f"staging failed[{song_dir}]")
-            shutil.rmtree(song_dir.parent, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
             self.job.songs.append({"folder": folder, "error": str(e) or type(e).__name__})
             return
+        if self.add_pack(unit_id, song_dir.name, folder):
+            shutil.rmtree(song_dir, ignore_errors=True)
+
+    def add_pack(self, unit_id: str, name: str, folder: str) -> bool:
+        """묶음의 {unit_id}/song.zip을 곡으로 더합니다. 읽지 못하면 False(곡 파일은 지움)."""
+        work = _dir(self.stage["id"]) / unit_id
+        try:
+            unit = _make_unit(unit_id, work / PACK_FILE, name, folder)
+        except Exception as e:
+            logger.exception(f"staging failed[{folder}]")
+            shutil.rmtree(work, ignore_errors=True)
+            self.job.songs.append({"folder": folder, "error": str(e) or type(e).__name__})
+            return False
         if not unit["charts"]:
-            shutil.rmtree(song_dir.parent, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
             self.job.songs.append({"folder": folder, "error": "곡에 넣을 수 있는 차트 파일이 없습니다."})
-            return
+            return True
         self.stage["units"].append(unit)
         self.job.songs.append({"folder": folder, "staged": True, "charts": len(unit["charts"])})
         if time.monotonic() - self._saved >= SAVE_INTERVAL:
             self.save()
+        return True
 
     def error(self, folder: str, message: str) -> None:
         self.job.songs.append({"folder": folder, "error": message})
@@ -345,38 +419,31 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
         for root, members in groups.items():
             name = root[-1] if root else stem
             folder = "/".join((stem, *root))
-            unit_id, work = writer.unit_dir()
-            song_dir = work / name
+            unit_id = writer.unit_id()
+            work = _dir(writer.stage["id"]) / unit_id
+            # 폴더에 풀지 않고 곡 파일(압축하지 않은 zip)로 바로 옮겨 담습니다.
             try:
-                for info, rel in members:
-                    target = song_dir.joinpath(*rel)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info) as fin, open(target, "wb") as fout:
-                        shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
+                work.mkdir()
+                with zipfile.ZipFile(work / PACK_FILE, "w", zipfile.ZIP_STORED) as pack:
+                    for info, rel in members:
+                        with zf.open(info) as fin, pack.open(
+                            "/".join(rel), "w", force_zip64=info.file_size >= zipfile.ZIP64_LIMIT
+                        ) as fout:
+                            shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
             except Exception as e:
                 logger.exception(f"staging failed[{filename}:{folder}]")
                 shutil.rmtree(work, ignore_errors=True)
                 writer.error(folder, str(e) or type(e).__name__)
                 continue
-            writer.add(unit_id, song_dir, folder)
+            writer.add_pack(unit_id, name, folder)
     return len(groups)
 
 
 def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Path) -> None:
-    """곡 폴더들을 묶음의 곡으로 옮깁니다. 곡 이름(folder)은 root 기준 경로입니다."""
+    """곡 폴더들을 묶음의 곡 파일로 묶어 옮깁니다(원래 폴더는 지움). 곡 이름(folder)은 root 기준 경로입니다."""
     writer.job.total = (writer.job.total or 0) + len(song_dirs)
     for song_dir in song_dirs:
-        folder = song_dir.relative_to(root).as_posix()
-        unit_id, work = writer.unit_dir()
-        work.mkdir()
-        try:
-            shutil.move(song_dir, work / song_dir.name)
-        except OSError as e:
-            logger.exception(f"staging failed[{song_dir}]")
-            shutil.rmtree(work, ignore_errors=True)
-            writer.error(folder, str(e) or type(e).__name__)
-            continue
-        writer.add(unit_id, work / song_dir.name, folder)
+        writer.add(writer.unit_id(), song_dir, song_dir.relative_to(root).as_posix())
 
 
 def _stage_rar(writer: _Writer, first: pathlib.Path, filename: str | None = None) -> None:
@@ -423,7 +490,8 @@ def _tmp_size(root: pathlib.Path) -> int:
         if child.is_symlink():
             continue
         if child.is_dir():
-            total += cache._du(child)
+            # 곡 파일로 묶으면 할당 단위 낭비가 없어지므로 파일 크기의 합으로 셉니다.
+            total += cache._du(child, apparent=True)
         elif child.suffix.lower() == ".zip":
             total += _zip_size(child)
         elif rar.is_volume(child.name) or sevenzip.is_7z(child.name):
@@ -672,8 +740,16 @@ def unit_files(stage_id: str, unit_id: str) -> list[dict]:
     unit = next((u for u in stage["units"] if u["id"] == unit_id), None)
     if unit is None:
         raise StageError(404, "unit not found")
-    root = _unit_dir(stage, unit)
     charts = {chart["path"] for chart in unit["charts"]}
+    pack = _pack_path(stage, unit)
+    if pack.is_file():
+        with zipfile.ZipFile(pack) as zf:
+            files = [
+                {"path": i.filename, "size": i.file_size}
+                for i in zf.infolist() if not i.is_dir() and i.filename not in charts
+            ]
+        return sorted(files, key=lambda f: f["path"].lower())
+    root = _unit_dir(stage, unit)
     files = []
     for path in root.rglob("*") if root.is_dir() else []:
         if path.is_symlink() or not path.is_file():
@@ -838,10 +914,19 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     if not batch.open:
                         settle()
                     continue
-                unit_dir = _unit_dir(stage, unit)
                 split = len(groups) > 1 or len(groups[0][1]) != len(unit["charts"])
                 all_charts = [chart["path"] for chart in unit["charts"]]
-                for target, charts in groups:
+                # 곡 데이터는 배치 트랜잭션과 메모리에 들어가므로 풀어 둔 폴더는 넣은 뒤 바로 지워도 됩니다.
+                source = work_root / uuid.uuid4().hex
+                try:
+                    unit_dir = _unpack(stage, unit, source)
+                except Exception as e:
+                    logger.exception(f"commit failed[{unit['folder']}]")
+                    unit_dir = None
+                    info = {"folder": unit["folder"], "error": str(e) or type(e).__name__}
+                    infos.append(info)
+                    job.songs.append(info)
+                for target, charts in groups if unit_dir is not None else []:
                     label = _label(unit, charts, split)
                     work = work_root / uuid.uuid4().hex
                     try:
@@ -855,6 +940,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
                         shutil.rmtree(work, ignore_errors=True)
                     infos.append(info)
                     job.songs.append(info)
+                shutil.rmtree(source, ignore_errors=True)
                 pending.append((unit, infos))
                 if not batch.open:
                     settle()
