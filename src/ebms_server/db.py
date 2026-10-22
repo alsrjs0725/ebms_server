@@ -403,6 +403,8 @@ CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
 FILE_KINDS_VERSION = 3
 # FILE_KINDS_VERSION을 적용한 버전을 저장하는 setting 이름
 FILE_KINDS_SETTING = "file_kinds_version"
+# backfill_file_kinds가 어디까지 판정했는지("버전:마지막 곡 번호"). 도중에 꺼지면 다음 시작 때 그 뒤부터 이어서 합니다.
+FILE_KINDS_PROGRESS_SETTING = "file_kinds_progress"
 # 지금 차트 청크·사전 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK)를 저장하는 setting 이름.
 # 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
 CHART_CHUNK_SETTING = "chart_chunk_charts"
@@ -1869,17 +1871,23 @@ class Database:
         곡 zip 전체를 읽지 않고 매니페스트의 항목 목록과 차트 파일만 읽어 판정합니다. kind가 바뀐 곡은 같은 트랜잭션에서
         매니페스트 청크를 다시 만들고, 사전 청크는 지워 backfill_pre_chunks가 새 규칙으로 다시 만들게 합니다
         (그동안 클라이언트는 파일별 사전 API로 받고, 이 API도 새 kind를 봅니다).
-        BACKFILL_BATCH_SONGS곡마다 커밋합니다. 판정하지 못한 곡은 로그를 남기고 건너뛰며, 그때는 버전을 올리지 않아
-        다음 시작 때 다시 시도합니다.
+        BACKFILL_BATCH_SONGS곡마다 커밋하고, 같은 트랜잭션에 어디까지 했는지(FILE_KINDS_PROGRESS_SETTING) 적어 두어
+        도중에 꺼지면 다음 시작 때 그 뒤부터 이어서 합니다. 판정하지 못한 곡은 로그를 남기고 건너뛰며, 그때는 버전을 올리지 않고
+        진행 기록도 지워 다음 시작 때 처음부터 다시 시도합니다.
         """
         with connect() as con, con.cursor() as cur:
             cur.execute("SELECT value FROM setting WHERE name = %s", (FILE_KINDS_SETTING,))
             row = cur.fetchone()
             if row is not None and int(row[0]) >= FILE_KINDS_VERSION:
                 return 0
-            cur.execute("SELECT id FROM song ORDER BY id")
+            after = 0
+            version, _, last = (self._setting(cur, FILE_KINDS_PROGRESS_SETTING) or "").partition(":")
+            if version == str(FILE_KINDS_VERSION) and last.isdigit():
+                after = int(last)
+            cur.execute("SELECT id FROM song WHERE id > %s ORDER BY id", (after,))
             song_ids = [r[0] for r in cur.fetchall()]
-        self.logger.info(f"backfill_file_kinds: Rechecking pre/play kinds of {len(song_ids)} songs (rule version {FILE_KINDS_VERSION}).")
+        resumed = f" after song[{after}]" if after else ""
+        self.logger.info(f"backfill_file_kinds: Rechecking pre/play kinds of {len(song_ids)} songs{resumed} (rule version {FILE_KINDS_VERSION}).")
 
         changed = failed = 0
         step = constant.BACKFILL_BATCH_SONGS
@@ -1903,6 +1911,9 @@ class Database:
                     for chunk_no in sorted({s // constant.SONGS_PER_PRE_CHUNK for s in batch_changed}):
                         cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
                         cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
+                    if not failed:
+                        last_id = song_ids[min(i + step, len(song_ids)) - 1]
+                        self._set_setting(cur, FILE_KINDS_PROGRESS_SETTING, f"{FILE_KINDS_VERSION}:{last_id}")
                     con.commit()
                     changed += len(batch_changed)
                 except Exception:
@@ -1913,8 +1924,12 @@ class Database:
 
         if failed:
             self.logger.warning(f"backfill_file_kinds: {failed} songs failed. Retrying on next start.")
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                self._set_setting(cur, FILE_KINDS_PROGRESS_SETTING, None)
+                con.commit()
         else:
             with self._write_lock, connect() as con, con.cursor() as cur:
+                self._set_setting(cur, FILE_KINDS_PROGRESS_SETTING, None)
                 cur.execute("UPDATE setting SET value = %s WHERE name = %s", (str(FILE_KINDS_VERSION), FILE_KINDS_SETTING))
                 if cur.rowcount == 0:
                     cur.execute(

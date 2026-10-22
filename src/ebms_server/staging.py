@@ -11,6 +11,7 @@
   파일이 그보다 많은 곡은 겹치는 차트로만 판정합니다.
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 """
+import errno
 import hashlib
 import json
 import logging
@@ -31,6 +32,12 @@ logger = logging.getLogger(__name__)
 STAGE_FILE = "stage.json"
 # 작업 중 stage.json을 저장하는 간격(초). 곡마다 저장하면 곡이 많을 때 쓰기가 너무 많아집니다.
 SAVE_INTERVAL = 2.0
+# 올린 zip·rar·7z를 다 풀 때까지 두는 묶음 안 폴더
+SOURCE_DIR = "_source"
+# var/tmp에서 곡 폴더를 옮기는 동안 곡 자리에 두는 원래 위치. 옮기다 꺼지면 recover가 보고 var/tmp로 되돌립니다.
+ORIGIN_FILE = ".origin.json"
+# 서버가 다시 시작될 때 이어서 하는 최대 횟수(작업 때문에 서버가 꺼져 계속 다시 시작하는 것을 막음)
+MAX_RESUMES = 5
 # 검토 화면 한 쪽의 곡 수
 UNITS_PER_PAGE = 50
 # 판정(suggestion.kind): new 새 곡, add 기존 곡에 추가, ambiguous 기존 곡 여러 개와 겹침, unused 사용 중지한 곡과 겹침,
@@ -80,7 +87,9 @@ def _unit_dir(stage: dict, unit: dict) -> pathlib.Path:
     return _dir(stage["id"]) / unit["id"] / unit["name"]
 
 
-def _new_stage(kind: str, name: str) -> dict:
+def _new_stage(kind: str, name: str, sources: list[tuple[pathlib.Path, str]] = ()) -> dict:
+    """새 묶음을 만듭니다. sources(올린 파일, 묶음 안 이름)는 묶음의 SOURCE_DIR로 옮겨 두고 다 풀면 지웁니다.
+    서버가 도중에 꺼져도 다시 시작할 때 이 파일로 이어서 풉니다."""
     stage = {
         "id": uuid.uuid4().hex,
         "kind": kind,
@@ -89,18 +98,47 @@ def _new_stage(kind: str, name: str) -> dict:
         "created_at": int(time.time()),
         "analyzed_at": None,
         "error": None,
+        "source": [name for _, name in sources],
         "units": [],
     }
     with _lock:
         _dir(stage["id"]).mkdir(parents=True)
         _save(stage)
+        if sources:
+            source = _dir(stage["id"]) / SOURCE_DIR
+            source.mkdir()
+            for path, name in sources:
+                shutil.move(path, source / name)
     return stage
 
 
+def _restore_origin(child: pathlib.Path) -> None:
+    """var/tmp에서 옮기다 꺼진 곡 폴더(ORIGIN_FILE이 있는 곡 자리)를 var/tmp로 되돌립니다. 다음 가져오기에서 다시 옮깁니다."""
+    try:
+        origin = json.loads((child / ORIGIN_FILE).read_text("utf-8"))
+        src = pathlib.Path(origin["from"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return  # 옮기기 전(원본이 그대로 있음)
+    moved = child / src.name
+    if not moved.is_dir():
+        return
+    if origin.get("copied"):
+        # 다른 디스크로 다 복사한 뒤 원본을 지우던 중이었습니다. 남은 원본은 복사본과 같으므로 지웁니다.
+        shutil.rmtree(src, ignore_errors=True)
+    elif src.exists():
+        return  # 복사하다 꺼짐: 원본이 그대로 있습니다
+    src.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(moved, src)
+    logger.info(f"staging: returned song to var/tmp[{src}]")
+
+
 def recover() -> None:
-    """서버 시작 시: 이전 실행에서 작업 도중 꺼진 묶음을 검토할 수 있는 상태로 되돌리고, 목록에 없는 폴더를 지웁니다."""
+    """서버 시작 시: 이전 실행에서 풀거나 commit하던 중 꺼진 묶음을 그 자리부터 이어서 하는 작업을 시작하고, 목록에 없는 폴더를 지웁니다.
+    마지막 저장(SAVE_INTERVAL) 뒤에 푼 곡은 다시 풀고, var/tmp에서 옮기던 곡은 var/tmp로 되돌려 다시 옮깁니다.
+    MAX_RESUMES번 이어서 해도 끝나지 않으면(작업 때문에 서버가 꺼지는 경우) 멈추고 검토할 수 있게 둡니다."""
     if not constant.STAGED_DIR.is_dir():
         return
+    resumes = []
     for path in constant.STAGED_DIR.iterdir():
         if not path.is_dir():
             continue
@@ -110,20 +148,42 @@ def recover() -> None:
             logger.warning(f"staging: removed broken stage[{path}]")
             shutil.rmtree(path, ignore_errors=True)
             continue
-        if stage["status"] != "ready":
-            stage["error"] = (
-                "서버가 다시 시작돼 작업이 중단됐습니다. "
-                + ("이미 등록된 곡은 다시 commit해도 바뀌지 않습니다." if stage["status"] == "committing" else "풀어 둔 곡까지만 남았습니다.")
-            )
-            stage["status"] = "ready"
+        status = stage["status"]
         known = {unit["id"] for unit in stage["units"]}
+        if status == "staging":
+            known.add(SOURCE_DIR)
         for child in path.iterdir():
             if child.is_dir() and child.name not in known:
+                _restore_origin(child)
                 shutil.rmtree(child, ignore_errors=True)
-        if stage["units"]:
+        if status != "ready":
+            stage["resumes"] = stage.get("resumes", 0) + 1
+            if stage["resumes"] > MAX_RESUMES:
+                logger.warning(f"staging: gave up resuming stage[{stage['id']}] after {MAX_RESUMES} restarts")
+                stage["error"] = (
+                    f"서버를 다시 시작할 때마다 이어서 했지만 {MAX_RESUMES}번 모두 끝나기 전에 꺼져 멈췄습니다. "
+                    + ("이미 등록된 곡은 다시 commit해도 바뀌지 않습니다." if status == "committing" else "풀어 둔 곡까지만 남았습니다.")
+                )
+                stage["status"] = "ready"
+                stage.pop("resumes")
+                shutil.rmtree(path / SOURCE_DIR, ignore_errors=True)
+            else:
+                resumes.append(stage)
+        if stage["units"] or stage["status"] != "ready":
             _save(stage)
         else:
             shutil.rmtree(path, ignore_errors=True)
+    for stage in resumes:
+        logger.info(f"staging: resuming {stage['status']} stage[{stage['id']}] {stage['name']}")
+        if stage["status"] == "committing":
+            job = importer.Job("commit", stage["name"], stage.get("slow", False))
+            job.stage_id = stage["id"]
+            job.resumed = True
+            importer._start(job, lambda stage=stage, job=job: commit(stage["id"], job))
+        else:
+            job = importer.Job(stage["kind"], stage["name"], stage.get("slow", False))
+            job.resumed = True
+            importer._start(job, lambda stage=stage, job=job: _run(stage, job))
 
 
 # ---- 곡 분석 ----
@@ -273,6 +333,8 @@ class _Writer:
         self.stage = stage
         self.job = job
         self._saved = time.monotonic()
+        # 이어서 풀 때 이미 묶음에 있는 곡(곡 이름)은 건너뜁니다.
+        self.done = {unit["folder"] for unit in stage["units"]}
 
     def unit_dir(self) -> tuple[str, pathlib.Path]:
         unit_id = uuid.uuid4().hex[:12]
@@ -304,7 +366,7 @@ class _Writer:
         self._saved = time.monotonic()
 
     def finish(self, error: str | None = None) -> None:
-        """판정을 채우고 검토할 수 있게 합니다. 곡이 하나도 없으면 묶음을 지웁니다."""
+        """판정을 채우고 검토할 수 있게 합니다. 곡이 하나도 없으면 묶음을 지웁니다. 다 푼 원본(SOURCE_DIR)은 지웁니다."""
         stage = self.stage
         if not stage["units"]:
             shutil.rmtree(_dir(stage["id"]), ignore_errors=True)
@@ -317,18 +379,24 @@ class _Writer:
             logger.exception(f"staging analyze failed[{stage['id']}]")
         stage["status"] = "ready"
         stage["error"] = error
+        stage.pop("resumes", None)
         self.save()
+        shutil.rmtree(_dir(stage["id"]) / SOURCE_DIR, ignore_errors=True)
 
 
 def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
-    """zip의 곡을 묶음에 풉니다. 푼 곡 수를 반환합니다(실패한 곡 포함). zip이 아니면 zipfile.BadZipFile."""
+    """zip의 곡을 묶음에 풉니다. 푼 곡 수를 반환합니다(실패한 곡 포함, 이미 묶음에 있어 건너뛴 곡 제외).
+    zip이 아니면 zipfile.BadZipFile."""
     stem = pathlib.PurePath(filename.replace("\\", "/")).stem
     if stem in ("", ".", ".."):
         stem = "song"
     with zipfile.ZipFile(path) as zf:
-        groups = importer._song_groups(zf)
+        groups = [
+            (root, members) for root, members in importer._song_groups(zf).items()
+            if "/".join((stem, *root)) not in writer.done
+        ]
         writer.job.total = (writer.job.total or 0) + len(groups)
-        for root, members in groups.items():
+        for root, members in groups:
             name = root[-1] if root else stem
             folder = "/".join((stem, *root))
             unit_id, work = writer.unit_dir()
@@ -348,15 +416,38 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
     return len(groups)
 
 
-def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Path) -> None:
-    """곡 폴더들을 묶음의 곡으로 옮깁니다. 곡 이름(folder)은 root 기준 경로입니다."""
+def _move_out(song_dir: pathlib.Path, work: pathlib.Path, folder: str) -> None:
+    """var/tmp의 곡 폴더를 곡 자리(work)로 옮깁니다. 옮기다 꺼져도 recover가 var/tmp로 되돌릴 수 있게
+    먼저 원래 위치(ORIGIN_FILE)를 적어 둡니다. 다른 디스크면 다 복사한 뒤 그렇게 적고 원본을 지웁니다."""
+    origin = work / ORIGIN_FILE
+    origin.write_text(json.dumps({"from": str(song_dir), "folder": folder}, ensure_ascii=False), "utf-8")
+    try:
+        os.rename(song_dir, work / song_dir.name)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    shutil.copytree(song_dir, work / song_dir.name, symlinks=True)
+    origin.write_text(json.dumps({"from": str(song_dir), "folder": folder, "copied": True}, ensure_ascii=False), "utf-8")
+    shutil.rmtree(song_dir, ignore_errors=True)
+    if song_dir.exists():
+        logger.warning(f"staging: could not remove moved song from var/tmp[{song_dir}]")
+
+
+def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Path, origin: bool = False) -> None:
+    """곡 폴더들을 묶음의 곡으로 옮깁니다. 곡 이름(folder)은 root 기준 경로입니다. 이미 묶음에 있는 곡은 건너뜁니다.
+    origin이면(var/tmp의 원본) 옮기다 꺼져도 되돌릴 수 있게 옮깁니다(_move_out)."""
+    song_dirs = [d for d in song_dirs if d.relative_to(root).as_posix() not in writer.done]
     writer.job.total = (writer.job.total or 0) + len(song_dirs)
     for song_dir in song_dirs:
         folder = song_dir.relative_to(root).as_posix()
         unit_id, work = writer.unit_dir()
         work.mkdir()
         try:
-            shutil.move(song_dir, work / song_dir.name)
+            if origin:
+                _move_out(song_dir, work, folder)
+            else:
+                shutil.move(song_dir, work / song_dir.name)
         except OSError as e:
             logger.exception(f"staging failed[{song_dir}]")
             shutil.rmtree(work, ignore_errors=True)
@@ -393,113 +484,122 @@ def _stage_7z(writer: _Writer, path: pathlib.Path, filename: str | None = None) 
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _stage_tmp(writer: _Writer) -> None:
+    root = constant.TMP_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    job = writer.job
+    song_dirs = []
+    for child in sorted(root.iterdir()):
+        if child.is_symlink():
+            logger.warning(f"import: skipped symlink[{child}]")
+        elif child.is_dir():
+            song_dirs.extend(importer.find_song_dirs(child))
+    _move_songs(writer, song_dirs, root, origin=True)
+    for path in sorted(p for p in root.iterdir() if p.suffix.lower() == ".zip"):
+        if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                logger.warning(f"import: skipped symlink[{path}]")
+            continue
+        start = len(job.songs)
+        try:
+            _stage_zip(writer, path, path.name)
+        except importer.ZipNameEncodingError as e:
+            logger.warning(f"stage_tmp: {e} [{path}]")
+            writer.error(path.name, str(e))
+            continue
+        except (zipfile.BadZipFile, OSError) as e:
+            logger.warning(f"stage_tmp: cannot read zip[{path}]: {e}")
+            writer.error(path.name, f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}")
+            continue
+        if not any("error" in song for song in job.songs[start:]):
+            path.unlink(missing_ok=True)
+    files = [p.name for p in root.iterdir() if rar.is_volume(p.name) and p.is_file() and not p.is_symlink()]
+    for names in rar.volume_sets(files).values():
+        start = len(job.songs)
+        try:
+            _stage_rar(writer, root / rar.first_volume(names))
+        except (rar.RarError, OSError) as e:
+            logger.warning(f"stage_tmp: cannot extract rar[{names[0]}]: {e}")
+            writer.error(names[0], f"{e} (아직 복사 중이거나 볼륨이 빠졌을 수 있습니다)")
+            continue
+        if not any("error" in song for song in job.songs[start:]):
+            for name in names:
+                (root / name).unlink(missing_ok=True)
+    for path in sorted(p for p in root.iterdir() if sevenzip.is_7z(p.name)):
+        if path.is_symlink() or not path.is_file():
+            if path.is_symlink():
+                logger.warning(f"import: skipped symlink[{path}]")
+            continue
+        start = len(job.songs)
+        try:
+            _stage_7z(writer, path)
+        except (sevenzip.SevenZipError, OSError) as e:
+            logger.warning(f"stage_tmp: cannot extract 7z[{path}]: {e}")
+            writer.error(path.name, f"{e} (아직 복사 중일 수 있습니다)")
+            continue
+        if not any("error" in song for song in job.songs[start:]):
+            path.unlink(missing_ok=True)
+
+
+# 작업이 끝나지 못했을 때 묶음에 붙이는 오류의 앞부분
+_FAILED = {
+    "zip": "zip을 다 풀지 못했습니다",
+    "rar": "rar를 다 풀지 못했습니다",
+    "7z": "7z를 다 풀지 못했습니다",
+    "tmp": "var/tmp를 다 옮기지 못했습니다",
+}
+
+
+def _run(stage: dict, job: importer.Job) -> dict | None:
+    """묶음의 원본(올린 파일이나 var/tmp)을 풉니다. 처음 풀 때와 서버가 다시 시작돼 이어서 풀 때 모두 씁니다.
+    곡이 없으면 묶음을 지우고 None."""
+    job.stage_id = stage["id"]
+    writer = _Writer(stage, job)
+    source = _dir(stage["id"]) / SOURCE_DIR
+    kind = stage["kind"]
+    try:
+        if kind != "tmp" and not (stage.get("source") and all((source / name).is_file() for name in stage["source"])):
+            raise RuntimeError("올린 파일이 남아 있지 않아 이어서 풀 수 없습니다")
+        if kind == "tmp":
+            _stage_tmp(writer)
+        elif kind == "zip":
+            _stage_zip(writer, source / stage["source"][0], stage["name"])
+        elif kind == "7z":
+            _stage_7z(writer, source / stage["source"][0], stage["name"])
+        else:
+            _stage_rar(writer, source / rar.first_volume(stage["source"]), stage["name"])
+    except BaseException as e:
+        writer.finish(f"{_FAILED[kind]}: {e}")
+        raise
+    writer.finish()
+    return stage if stage["units"] else None
+
+
+def _source_name(filename: str, suffix: str) -> str:
+    name = pathlib.PurePath(filename.replace("\\", "/")).name
+    return name if name not in ("", ".", "..") else "source" + suffix
+
+
 def stage_7z(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
-    """올린 7z 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("7z", filename)
-    job.stage_id = stage["id"]
-    writer = _Writer(stage, job)
-    try:
-        _stage_7z(writer, path, filename)
-    except BaseException as e:
-        writer.finish(f"7z를 다 풀지 못했습니다: {e}")
-        raise
-    writer.finish()
-    return stage if stage["units"] else None
+    """올린 7z 하나를 새 묶음으로 옮겨(path는 사라짐) 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    return _run(_new_stage("7z", filename, [(path, _source_name(filename, ".7z"))]), job)
 
 
-def stage_rar(first: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
-    """올린 rar(분할 압축이면 첫 볼륨, 나머지는 같은 폴더) 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("rar", filename)
-    job.stage_id = stage["id"]
-    writer = _Writer(stage, job)
-    try:
-        _stage_rar(writer, first, filename)
-    except BaseException as e:
-        writer.finish(f"rar를 다 풀지 못했습니다: {e}")
-        raise
-    writer.finish()
-    return stage if stage["units"] else None
+def stage_rar(volumes: list[tuple[pathlib.Path, str]], first: str, job: importer.Job) -> dict | None:
+    """올린 rar 볼륨들((파일, 볼륨 이름), 분할 압축이 아니면 하나)을 새 묶음으로 옮겨 풉니다. first는 첫 볼륨 이름.
+    곡이 없으면 묶음을 만들지 않고 None."""
+    return _run(_new_stage("rar", first, volumes), job)
 
 
 def stage_zip(path: pathlib.Path, filename: str, job: importer.Job) -> dict | None:
-    """올린 zip 하나를 새 묶음으로 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    stage = _new_stage("zip", filename)
-    job.stage_id = stage["id"]
-    writer = _Writer(stage, job)
-    try:
-        _stage_zip(writer, path, filename)
-    except BaseException as e:
-        writer.finish(f"zip을 다 풀지 못했습니다: {e}")
-        raise
-    writer.finish()
-    return stage if stage["units"] else None
+    """올린 zip 하나를 새 묶음으로 옮겨(path는 사라짐) 풉니다. 곡이 없으면 묶음을 만들지 않고 None."""
+    return _run(_new_stage("zip", filename, [(path, _source_name(filename, ".zip"))]), job)
 
 
 def stage_tmp(job: importer.Job) -> dict | None:
     """`var/tmp/`의 곡 폴더와 zip·rar·7z를 새 묶음으로 옮깁니다. 곡 폴더는 옮기고(원래 자리에서 사라짐),
     zip·7z와 rar(분할 압축이면 볼륨 전체)는 모든 곡을 풀면 지웁니다. 곡이 없으면 묶음을 만들지 않고 None."""
-    root = constant.TMP_DIR
-    root.mkdir(parents=True, exist_ok=True)
-    stage = _new_stage("tmp", "var/tmp")
-    job.stage_id = stage["id"]
-    writer = _Writer(stage, job)
-    try:
-        song_dirs = []
-        for child in sorted(root.iterdir()):
-            if child.is_symlink():
-                logger.warning(f"import: skipped symlink[{child}]")
-            elif child.is_dir():
-                song_dirs.extend(importer.find_song_dirs(child))
-        _move_songs(writer, song_dirs, root)
-        for path in sorted(p for p in root.iterdir() if p.suffix.lower() == ".zip"):
-            if path.is_symlink() or not path.is_file():
-                if path.is_symlink():
-                    logger.warning(f"import: skipped symlink[{path}]")
-                continue
-            start = len(job.songs)
-            try:
-                _stage_zip(writer, path, path.name)
-            except importer.ZipNameEncodingError as e:
-                logger.warning(f"stage_tmp: {e} [{path}]")
-                writer.error(path.name, str(e))
-                continue
-            except (zipfile.BadZipFile, OSError) as e:
-                logger.warning(f"stage_tmp: cannot read zip[{path}]: {e}")
-                writer.error(path.name, f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}")
-                continue
-            if not any("error" in song for song in job.songs[start:]):
-                path.unlink(missing_ok=True)
-        files = [p.name for p in root.iterdir() if rar.is_volume(p.name) and p.is_file() and not p.is_symlink()]
-        for names in rar.volume_sets(files).values():
-            start = len(job.songs)
-            try:
-                _stage_rar(writer, root / rar.first_volume(names))
-            except (rar.RarError, OSError) as e:
-                logger.warning(f"stage_tmp: cannot extract rar[{names[0]}]: {e}")
-                writer.error(names[0], f"{e} (아직 복사 중이거나 볼륨이 빠졌을 수 있습니다)")
-                continue
-            if not any("error" in song for song in job.songs[start:]):
-                for name in names:
-                    (root / name).unlink(missing_ok=True)
-        for path in sorted(p for p in root.iterdir() if sevenzip.is_7z(p.name)):
-            if path.is_symlink() or not path.is_file():
-                if path.is_symlink():
-                    logger.warning(f"import: skipped symlink[{path}]")
-                continue
-            start = len(job.songs)
-            try:
-                _stage_7z(writer, path)
-            except (sevenzip.SevenZipError, OSError) as e:
-                logger.warning(f"stage_tmp: cannot extract 7z[{path}]: {e}")
-                writer.error(path.name, f"{e} (아직 복사 중일 수 있습니다)")
-                continue
-            if not any("error" in song for song in job.songs[start:]):
-                path.unlink(missing_ok=True)
-    except BaseException as e:
-        writer.finish(f"var/tmp를 다 옮기지 못했습니다: {e}")
-        raise
-    writer.finish()
-    return stage if stage["units"] else None
+    return _run(_new_stage("tmp", "var/tmp"), job)
 
 
 # ---- 검토 ----
@@ -769,11 +869,21 @@ def commit(stage_id: str, job: importer.Job) -> None:
     job.total = len(units)
     pending: list[tuple[dict, list[dict]]] = []  # 커밋을 기다리는 (곡, 그 곡의 등록 결과들)
     done: set[str] = set()
+    removable: list[str] = []  # 등록해서 묶음에서 뺐지만 아직 stage.json에 저장하지 않은 곡(저장한 뒤 폴더를 지움)
     saved = time.monotonic()
 
-    def settle() -> None:
-        """커밋된(또는 롤백된) 곡의 결과를 정리합니다."""
+    def save() -> None:
         nonlocal saved
+        with _lock:
+            _save(stage)
+        saved = time.monotonic()
+        for unit_id in removable:
+            shutil.rmtree(root / unit_id, ignore_errors=True)
+        removable.clear()
+
+    def settle(committed: bool) -> None:
+        """커밋된(또는 롤백된) 곡의 결과를 정리합니다. 배치를 커밋했으면(committed) 바로 저장해,
+        서버가 꺼졌다 켜져 이어서 commit할 때 등록한 곡을 다시 넣지 않게 합니다."""
         for unit, infos in pending:
             errors = [info["error"] for info in infos if info.get("error")]
             conflicts = sorted({c for info in infos for c in info.get("conflicts", [])})
@@ -781,13 +891,11 @@ def commit(stage_id: str, job: importer.Job) -> None:
                 unit["result"] = {"error": "; ".join(errors) or None, "conflicts": conflicts, "songs": infos}
             else:
                 done.add(unit["id"])
-                shutil.rmtree(root / unit["id"], ignore_errors=True)
+                removable.append(unit["id"])
         pending.clear()
         stage["units"] = [u for u in stage["units"] if u["id"] not in done]
-        if time.monotonic() - saved >= SAVE_INTERVAL:
-            with _lock:
-                _save(stage)
-            saved = time.monotonic()
+        if committed or time.monotonic() - saved >= SAVE_INTERVAL:
+            save()
 
     try:
         with Database().batch() as batch:
@@ -798,7 +906,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     job.songs.append({"folder": unit["folder"], "skipped": "admin"})
                     pending.append((unit, infos))
                     if not batch.open:
-                        settle()
+                        settle(False)
                     continue
                 unit_dir = _unit_dir(stage, unit)
                 split = len(groups) > 1 or len(groups[0][1]) != len(unit["charts"])
@@ -819,21 +927,22 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     job.songs.append(info)
                 pending.append((unit, infos))
                 if not batch.open:
-                    settle()
+                    settle(True)
                 job.rest(batch)
-        settle()
+        settle(True)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
         with _lock:
             stage["status"] = "ready"
             stage["error"] = None
+            stage.pop("resumes", None)
             if stage["units"]:
                 try:
                     _analyze(stage)
                     stage["analyzed_at"] = int(time.time())
                 except Exception:
                     logger.exception(f"staging analyze failed[{stage_id}]")
-                _save(stage)
+                save()
             else:
                 shutil.rmtree(root, ignore_errors=True)
 
@@ -843,6 +952,7 @@ def start_commit(stage_id: str, slow: bool = False) -> importer.Job:
         stage = _load(stage_id)
         _require_ready(stage)
         stage["status"] = "committing"
+        stage["slow"] = slow  # 서버가 다시 시작돼 이어서 commit할 때도 같은 속도로
         _save(stage)
     job = importer.Job("commit", stage["name"], slow)
     job.stage_id = stage_id

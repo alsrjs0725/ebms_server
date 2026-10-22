@@ -703,3 +703,29 @@ def test_metered_reads_in_download_limiter_and_writes_usage_off_loop_when_cancel
     assert closed == [True]
     assert [(u, n) for u, n, _ in writes] == [("u-cancel", quota.THROTTLE_PIECE)]
     assert writes[0][2] != loop_thread
+
+
+def test_backfill_file_kinds_resumes_after_restart(tmp_path, client, monkeypatch):
+    """도중에 꺼지면 다음 시작 때 기록한 곡 뒤부터 이어서 판정합니다."""
+    add_songs(tmp_path, 2)
+    db = Database()
+    with db_module.connect() as con, con.cursor() as cur:
+        for song_id in (1, 2):
+            files = db.get_song_files(song_id)
+            cur.execute(
+                "UPDATE song SET files = %s WHERE id = %s",
+                (json.dumps([{**e, "kind": "pre"} for e in files]), song_id),
+            )
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
+        # 곡 1까지 판정하고 꺼진 상태
+        cur.execute(
+            "INSERT INTO setting (name, value) VALUES (%s, %s)",
+            (db_module.FILE_KINDS_PROGRESS_SETTING, f"{db_module.FILE_KINDS_VERSION}:1"),
+        )
+        con.commit()
+    assert db.backfill_file_kinds() == 1
+    assert {e["kind"] for e in db.get_song_files(1)} == {"pre"}
+    assert {e["path"]: e["kind"] for e in db.get_song_files(2)} == EXPECTED_KINDS
+    with db_module.connect() as con, con.cursor() as cur:
+        assert db._setting(cur, db_module.FILE_KINDS_PROGRESS_SETTING) is None
+        assert db._setting(cur, db_module.FILE_KINDS_SETTING) == str(db_module.FILE_KINDS_VERSION)

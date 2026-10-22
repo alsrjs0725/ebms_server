@@ -3,7 +3,7 @@ import io
 import json
 import zipfile
 
-from ebms_server import constant, db as db_module, staging
+from ebms_server import constant, db as db_module, importer, staging
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_import import commit, import_dir, make_zip, song_rows, stage, upload, wait  # noqa: F401
@@ -198,20 +198,90 @@ def test_tmp_is_staged_and_recover(client, monkeypatch):
     # 빈 var/tmp는 묶음을 만들지 않습니다.
     assert wait(client, client.post("/api/admin/import/tmp").json())["stage_id"] is None
 
-    # commit 도중 꺼진 묶음은 다시 시작하면 검토할 수 있게 되돌립니다.
+    # commit 도중 꺼진 묶음은 다시 시작하면 이어서 commit합니다.
     sid = job["stage_id"]
-    path = constant.STAGED_DIR / sid / staging.STAGE_FILE
-    data = json.loads(path.read_text("utf-8"))
-    data["status"] = "committing"
-    path.write_text(json.dumps(data), "utf-8")
+    set_status(sid, "committing")
     (constant.STAGED_DIR / sid / "stray").mkdir()
     assert client.post(f"/api/admin/import/stages/{sid}/commit").status_code == 409
     staging.recover()
-    got = detail(client, sid)
-    assert got["status"] == "ready" and got["error"]
     assert not (constant.STAGED_DIR / sid / "stray").exists()
-    commit_stage(client, sid)
+    resumed = resumed_job(client, "var/tmp")
+    assert resumed["kind"] == "commit" and resumed["status"] == "done"
     assert [tuple(r) for r in song_rows()] == [(1, "s1")]
+    assert not (constant.STAGED_DIR / sid).exists()
+
+
+def set_status(sid, status, **fields):
+    path = constant.STAGED_DIR / sid / staging.STAGE_FILE
+    data = json.loads(path.read_text("utf-8"))
+    data.update(status=status, **fields)
+    path.write_text(json.dumps(data), "utf-8")
+    return data
+
+
+def resumed_job(client, name):
+    """서버 시작(recover) 때 이어서 시작한 작업이 끝날 때까지 기다립니다."""
+    jobs = [j for j in importer.list_jobs() if j.resumed and j.name == name]
+    assert jobs, "no resumed job"
+    return wait(client, jobs[0].json())
+
+
+def test_staging_resumes_after_restart(client, monkeypatch):
+    """zip을 풀다가 꺼지면 다시 시작할 때 마지막 저장 뒤의 곡부터 이어서 풉니다(이미 푼 곡은 다시 풀지 않음)."""
+    admin_login(client, monkeypatch)
+    data = make_zip({"p/a/a.bms": b"#TITLE A\n", "p/b/b.bms": b"#TITLE B\n", "p/c/c.bms": b"#TITLE C\n"})
+    job = stage(client, "pack.zip", data)
+    sid = job["stage_id"]
+    root = constant.STAGED_DIR / sid
+    assert not (root / staging.SOURCE_DIR).exists()
+    # 곡 c를 푼 뒤 stage.json에 저장하기 전에 꺼진 상태로 되돌립니다.
+    before = json.loads((root / staging.STAGE_FILE).read_text("utf-8"))
+    kept = [u for u in before["units"] if u["folder"] != "pack/p/c"]
+    lost = next(u for u in before["units"] if u["folder"] == "pack/p/c")
+    set_status(sid, "staging", units=kept, analyzed_at=None)
+    (root / staging.SOURCE_DIR).mkdir()
+    (root / staging.SOURCE_DIR / "pack.zip").write_bytes(data)
+    staging.recover()
+    assert not (root / lost["id"]).exists()
+    resumed = resumed_job(client, "pack.zip")
+    assert resumed["status"] == "done"
+    assert [s["folder"] for s in resumed["songs"]] == ["pack/p/c"]
+    got = detail(client, sid)
+    assert got["status"] == "ready" and not got["error"]
+    assert sorted(u["folder"] for u in got["items"]) == ["pack/p/a", "pack/p/b", "pack/p/c"]
+    assert {u["id"] for u in kept} <= {u["id"] for u in got["items"]}
+    assert not (root / staging.SOURCE_DIR).exists()
+
+
+def test_tmp_move_interrupted_returns_song(client, monkeypatch):
+    """var/tmp에서 곡을 옮긴 뒤 저장 전에 꺼지면 var/tmp로 되돌렸다가 이어서 다시 옮깁니다(곡을 잃지 않음)."""
+    admin_login(client, monkeypatch)
+    song = constant.TMP_DIR / "g" / "s1"
+    song.mkdir(parents=True)
+    (song / "a.bms").write_bytes(b"#TITLE T\n")
+    stage_ = staging._new_stage("tmp", "var/tmp")
+    unit = constant.STAGED_DIR / stage_["id"] / "abc123"
+    unit.mkdir()
+    staging._move_out(song, unit, "g/s1")
+    assert not song.exists()
+    staging.recover()
+    resumed = resumed_job(client, "var/tmp")
+    assert resumed["songs"] == [{"folder": "g/s1", "staged": True, "charts": 1}]
+    got = detail(client, stage_["id"])
+    assert [u["folder"] for u in got["items"]] == ["g/s1"]
+    assert not unit.exists()
+
+
+def test_resume_gives_up_after_max(client, monkeypatch):
+    """이어서 해도 계속 끝나지 않으면(작업 때문에 서버가 꺼지는 경우) MAX_RESUMES번 뒤 멈추고 검토할 수 있게 둡니다."""
+    admin_login(client, monkeypatch)
+    job = stage(client, "one.zip", make_zip({"s/a.bms": b"#TITLE A\n"}))
+    sid = job["stage_id"]
+    set_status(sid, "committing", resumes=staging.MAX_RESUMES)
+    staging.recover()
+    got = detail(client, sid)
+    assert got["status"] == "ready" and "멈췄습니다" in got["error"]
+    assert not [j for j in importer.list_jobs() if j.resumed and j.name == "one.zip"]
 
 
 def test_bad_stage_id(client, monkeypatch):
