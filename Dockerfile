@@ -28,7 +28,8 @@ RUN mkdir -p var/log var/tmp cache
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+# 기동 시 DB 로드와 recover 단계가 HDD가 바쁠 때 2분 이상 걸릴 수 있습니다. 이 시간 안의 실패는 unhealthy로 세지 않습니다(성공하면 바로 healthy).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5m --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/version', timeout=3)" || exit 1
 
 # 프록시 헤더(X-Forwarded-*)는 EBMS_FORWARDED_ALLOW_IPS(쉼표 구분, 기본 127.0.0.1)에서 온 요청만 믿습니다.
