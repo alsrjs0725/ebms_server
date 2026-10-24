@@ -499,7 +499,7 @@ class _Writer:
             self.save()
 
     def error(self, folder: str, message: str) -> None:
-        self.job.songs.append({"folder": folder, "error": message})
+        self.job.songs.append({"folder": _text(folder), "error": _text(message)})
 
     def save(self) -> None:
         with _lock:
@@ -520,7 +520,7 @@ class _Writer:
         except Exception:
             logger.exception(f"staging analyze failed[{stage['id']}]")
         stage["status"] = "ready"
-        stage["error"] = error
+        stage["error"] = _text(error) if error else error
         stage.pop("resumes", None)
         self.save()
         shutil.rmtree(_dir(stage["id"]) / SOURCE_DIR, ignore_errors=True)
@@ -560,6 +560,11 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
     return len(groups)
 
 
+def _text(text: str) -> str:
+    """UTF-8로 쓸 수 없는 문자(UTF-8이 아닌 파일 이름에서 온 서로게이트)를 \\udc81처럼 적은 글자."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _move_out(song_dir: pathlib.Path, work: pathlib.Path, folder: str) -> None:
     """var/tmp의 곡 폴더를 곡 자리(work)로 옮깁니다. 옮기다 꺼져도 recover가 var/tmp로 되돌릴 수 있게
     먼저 원래 위치(ORIGIN_FILE)를 적어 둡니다. 다른 디스크면 다 복사한 뒤 그렇게 적고 원본을 지웁니다."""
@@ -585,6 +590,10 @@ def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Pa
     writer.job.total = (writer.job.total or 0) + len(song_dirs)
     for song_dir in song_dirs:
         folder = song_dir.relative_to(root).as_posix()
+        if _text(folder) != folder:
+            # 디스크의 이름이 UTF-8이 아니면(cp932 바이트 그대로 등) stage.json·응답에 넣을 수 없어 옮기지 않습니다.
+            writer.error(folder, "곡 폴더 이름이 UTF-8이 아닙니다. 이름을 UTF-8로 바꾼 뒤 다시 가져오세요.")
+            continue
         unit_id, work = writer.unit_dir()
         work.mkdir()
         try:
