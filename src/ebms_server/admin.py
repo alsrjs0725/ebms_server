@@ -18,8 +18,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from . import audit, auth, cache, constant, db, download_log, downloads, importer, logs, quota, staging
 from .accounts import User
@@ -618,6 +619,19 @@ def set_unit_target(stage_id: str, unit_id: str, body: UnitTarget, admin: Annota
 def unit_files(stage_id: str, unit_id: str, admin: Annotated[User, Depends(web_admin)]):
     """곡에서 차트가 아닌 파일 목록 [{path, size}]."""
     return _stage_call(staging.unit_files, stage_id, unit_id)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/zip")
+def download_unit(stage_id: str, unit_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """등록 전 곡 파일(zip). 검토하거나 인코딩 오류 곡을 직접 고치려고 내려받습니다."""
+    path, name, temporary = _stage_call(staging.unit_download, stage_id, unit_id)
+    logger.info(f"import stage {stage_id} unit {unit_id} downloaded by {admin.id}")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=name,
+        background=BackgroundTask(path.unlink, missing_ok=True) if temporary else None,
+    )
 
 
 @router.post("/api/admin/import/stages/{stage_id}/analyze")

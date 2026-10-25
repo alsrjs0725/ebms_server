@@ -21,7 +21,7 @@ import uuid
 import zipfile
 from collections import OrderedDict
 
-from . import cache, constant
+from . import cache, charset, constant
 from .db import AmbiguousSongError, Database
 
 logger = logging.getLogger(__name__)
@@ -202,20 +202,6 @@ def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
     return info.filename.encode("cp437")
 
 
-def _odd_chars(text: str) -> int:
-    """잘못된 인코딩으로 풀면 늘어나는 문자 수. cp949 이름을 cp932로 풀면 반각 가타카나가,
-    cp932 이름을 cp949로 풀면 KS X 1001 밖의 확장 한글(UHC)이 잔뜩 나옵니다."""
-    count = 0
-    for ch in text:
-        if "\uff61" <= ch <= "\uff9f":
-            count += 1
-        elif "\uac00" <= ch <= "\ud7a3":
-            lead, trail = ch.encode("cp949")
-            if lead < 0xB0 or trail < 0xA1:
-                count += 1
-    return count
-
-
 def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
     """UTF-8 플래그가 없는 항목 이름 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것.
     zip 하나는 한 인코딩으로 만들어지므로 항목마다 따로 고르지 않습니다. 풀 이름이 없으면 None,
@@ -223,27 +209,10 @@ def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
     raws = [raw for info in zf.infolist() if (raw := _raw_name(info)) is not None]
     if not raws:
         return None
-    encoding, failures = guess_name_encoding(raws, ZIP_NAME_ENCODINGS)
+    encoding, failures = charset.guess_encoding(raws, ZIP_NAME_ENCODINGS)
     if encoding is None:
         raise ZipNameEncodingError("zip 파일 이름의 인코딩을 알 수 없습니다(" + "; ".join(failures) + ")")
     return encoding
-
-
-def guess_name_encoding(raws: list[bytes], encodings: tuple[str, ...]) -> tuple[str | None, list[str]]:
-    """이름 바이트 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것과, 풀지 못한 인코딩의 이유.
-    동점이면 encodings에서 앞선 것. 맞는 인코딩이 없으면 (None, 이유들)."""
-    best = None
-    failures = []
-    for encoding in encodings:
-        try:
-            score = sum(_odd_chars(raw.decode(encoding)) for raw in raws)
-        except UnicodeDecodeError as e:
-            failures.append(f"{encoding}: {e.object!r}")
-            continue
-        logger.debug(f"name encoding candidate[{encoding}] odd chars={score}")
-        if best is None or score < best[1]:
-            best = (encoding, score)
-    return (best[0] if best else None), failures
 
 
 def _entry_name(info: zipfile.ZipInfo, encoding: str | None) -> str:

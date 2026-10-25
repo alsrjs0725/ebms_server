@@ -12,7 +12,7 @@ import pathlib
 import shutil
 import subprocess
 
-from . import importer
+from . import charset, importer
 from .rar import remove_symlinks
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ def _fix_names(dest: pathlib.Path) -> None:
                 bad.append((parent, raw))
     if not bad:
         return
-    encoding, failures = importer.guess_name_encoding([raw for _, raw in bad], NAME_ENCODINGS)
+    encoding, failures = charset.guess_encoding([raw for _, raw in bad], NAME_ENCODINGS)
     if encoding is None:
         raise SevenZipError("7z 파일 이름이 UTF-8이 아니고 인코딩도 알 수 없습니다(" + "; ".join(failures) + ")")
     logger.info(f"7z non-UTF-8 names decoded as {encoding}: {len(bad)}")

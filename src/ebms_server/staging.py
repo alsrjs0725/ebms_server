@@ -311,13 +311,17 @@ def _set_meta(chart: dict, content: bytes) -> None:
 
 
 def _chart_info(rel: str, content: bytes) -> dict:
+    """차트 정보. 헤더 인코딩을 알 수 없으면 헤더 값을 비우고 error에 이유를 적습니다(곡은 등록하지 않고 묶음에 남김)."""
     chart = {
         "path": rel,
         "size": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
         "target": None,
     }
-    _set_meta(chart, content)
+    try:
+        _set_meta(chart, content)
+    except db.ChartEncodingError as e:
+        chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS}, error=str(e))
     return chart
 
 
@@ -329,6 +333,7 @@ def _make_unit(unit_id: str, pack: pathlib.Path, name: str, folder: str) -> dict
             _chart_info(i.filename, zf.read(i)) for i in files
             if "/" not in i.filename and pathlib.PurePath(i.filename).suffix.lower() in constant.BMS_FORMAT
         ]
+    errors = [f"{chart['path']}: {chart['error']}" for chart in charts if chart.get("error")]
     return {
         "id": unit_id,
         "name": name,
@@ -339,6 +344,8 @@ def _make_unit(unit_id: str, pack: pathlib.Path, name: str, folder: str) -> dict
         "target": "auto",
         "suggestion": None,
         "result": None,
+        # 등록하지 않고 묶음에 남기는 이유(차트 헤더 인코딩 오류). 관리자가 곡 파일을 내려받아 고친 뒤 다시 올립니다.
+        "error": "; ".join(errors) or None,
     }
 
 
@@ -392,6 +399,9 @@ def _fill_meta(stage: dict, unit: dict) -> None:
             continue
         try:
             _set_meta(chart, _read(stage, unit, chart["path"]))
+        except db.ChartEncodingError as e:
+            chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS}, error=str(e))
+            unit["error"] = "; ".join(filter(None, [unit.get("error"), f"{chart['path']}: {e}"]))
         except (OSError, KeyError, zipfile.BadZipFile):
             chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS})
 
@@ -495,7 +505,11 @@ class _Writer:
             self.error(folder, "곡에 넣을 수 있는 차트 파일이 없습니다.")
             return
         self.stage["units"].append(unit)
-        self.job.songs.append({"folder": folder, "staged": True, "charts": len(unit["charts"])})
+        if unit["error"]:
+            logger.warning(f"staging: held[{folder}]: {unit['error']}")
+            self.job.songs.append({"folder": folder, "error": f"{unit['error']} (검토 대기에 등록 불가로 남김)"})
+        else:
+            self.job.songs.append({"folder": folder, "staged": True, "charts": len(unit["charts"])})
         logger.info(f"staging: staged[{folder}] {len(unit['charts'])} charts, {unit['files']} files, {unit['size']} bytes")
         if time.monotonic() - self._saved >= SAVE_INTERVAL:
             self.save()
@@ -805,9 +819,14 @@ def _counts(stage: dict) -> dict:
             counts["skip"] += 1
         elif _changed(unit):
             counts["changed"] += 1
-        if unit.get("result") and unit["result"].get("error"):
+        if _failed(unit):
             counts["failed"] += 1
     return counts
+
+
+def _failed(unit: dict) -> bool:
+    """등록할 수 없는 곡(차트 헤더 인코딩 오류)이거나 지난 commit에서 실패한 곡."""
+    return bool(unit.get("error") or (unit.get("result") and unit["result"].get("error")))
 
 
 def _changed(unit: dict) -> bool:
@@ -855,7 +874,7 @@ def _matches(unit: dict, show: str, q: str) -> bool:
         return False
     if show == "changed" and not _changed(unit):
         return False
-    if show == "failed" and not (unit.get("result") and unit["result"].get("error")):
+    if show == "failed" and not _failed(unit):
         return False
     if q:
         text = "\n".join(
@@ -883,7 +902,8 @@ SORTS = {
 
 
 def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: str = "") -> dict:
-    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused/similar)이나 changed(대상을 바꾼 곡), failed(지난 commit에서 실패).
+    """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused/similar)이나 changed(대상을 바꾼 곡),
+    failed(등록할 수 없는 곡·지난 commit에서 실패한 곡).
     sort는 SORTS의 이름(파일 수 많은/적은 순)이고, 없거나 모르는 값이면 넣은 순서입니다."""
     with _lock:
         stage = _load(stage_id)
@@ -936,6 +956,30 @@ def unit_files(stage_id: str, unit_id: str) -> list[dict]:
         if rel not in charts:
             files.append({"path": rel, "size": path.stat().st_size})
     return sorted(files, key=lambda f: f["path"].lower())
+
+
+def unit_download(stage_id: str, unit_id: str) -> tuple[pathlib.Path, str, bool]:
+    """곡 파일(zip)을 내려받을 (경로, 파일 이름, 보낸 뒤 지울지). 곡 폴더 안의 파일이 zip 최상위에 있습니다.
+    이전 버전에서 폴더로 풀어 둔 곡은 임시 zip으로 묶습니다."""
+    with _lock:
+        stage = _load(stage_id)
+        unit = next((u for u in stage["units"] if u["id"] == unit_id), None)
+        if unit is None:
+            raise StageError(404, "unit not found")
+        name = f"{unit['name']}.zip"
+        pack = _pack_path(stage, unit)
+        if pack.is_file():
+            return pack, name, False
+        root = _unit_dir(stage, unit)
+        if not root.is_dir():
+            raise StageError(404, "곡 파일이 없습니다")
+        tmp = pack.with_name(f".download-{uuid.uuid4().hex}.zip")
+        try:
+            _pack(root, tmp)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        return tmp, name, True
 
 
 def _check_target(value, allow_none: bool) -> str | int | None:
@@ -1092,6 +1136,10 @@ def commit(stage_id: str, job: importer.Job) -> None:
     try:
         with Database().batch() as batch:
             for unit in units:
+                if unit.get("error") and not _effective_skip(unit):
+                    # 등록할 수 없는 곡은 제외(skip)로 두지 않는 한 건드리지 않고 묶음에 남깁니다.
+                    job.songs.append({"folder": unit["folder"], "error": unit["error"]})
+                    continue
                 groups = _groups(unit)
                 infos: list[dict] = []
                 if not groups:
