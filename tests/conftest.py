@@ -153,6 +153,7 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(constant, "UNUSED_DIR", tmp_path / "var_unused")
     monkeypatch.setattr(constant, "STAGED_DIR", tmp_path / "var_staged")
+    monkeypatch.setattr(constant, "IMPORT_DIR", tmp_path / "var_import")
     # 임포트 캐시는 기본으로 끄고, test_cache가 켭니다.
     monkeypatch.setattr(constant, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 0)

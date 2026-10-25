@@ -10,7 +10,7 @@ from .db import Database
 from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, preview, proxy, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Annotated
 
@@ -194,6 +194,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    """처리하지 못한 예외(500). 관리자 API는 화면에 원인이 보이게 예외 종류와 메시지를 detail로 돌려줍니다.
+    트레이스백은 그대로 로그에 남습니다."""
+    if request.url.path.startswith("/api/admin/"):
+        return JSONResponse({"detail": f"서버 오류({type(exc).__name__}): {exc}"}, status_code=500)
+    return PlainTextResponse("Internal Server Error", status_code=500)
 
 app.mount(
     "/static",

@@ -439,6 +439,12 @@ def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
     return {"id": upload_id, "received": received + len(data), "size": upload["size"]}
 
 
+def _staged_free() -> int:
+    """rar·7z를 풀 var/staged 디스크의 남은 공간. 업로드가 캐시(SSD)에만 놓였으면 var/import는 없을 수 있어 그 폴더는 보지 않습니다."""
+    constant.STAGED_DIR.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(constant.STAGED_DIR).free
+
+
 def finish_upload(upload_id: str) -> Job:
     return finish_uploads([upload_id])
 
@@ -467,14 +473,14 @@ def finish_uploads(upload_ids: list[str]) -> Job:
             raise UploadError(400, str(e))
         # rar는 통째로 푸므로 rar 크기만큼 더 필요합니다.
         need = sum(u["size"] for u in uploads) + DISK_MARGIN
-        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        free = _staged_free()
         if need > free:
             raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, rar를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
     seven = not volumes and sevenzip.is_7z(names[0])
     if seven:
         # 7z도 통째로 푸므로 7z 크기만큼 더 필요합니다.
         need = uploads[0]["size"] + DISK_MARGIN
-        free = shutil.disk_usage(constant.IMPORT_DIR).free
+        free = _staged_free()
         if need > free:
             raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 7z를 풀려면 {need / 1024 ** 3:.1f}GB 필요).")
     with _lock:
