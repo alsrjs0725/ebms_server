@@ -52,3 +52,19 @@
     max-height: 16rem;
     overflow-y: auto;
 }
+
+/* 서버 로그 표. 열 폭을 고정해 긴 트레이스백이 다른 열을 밀어내지 않게 합니다. */
+.log-table {
+    table-layout: fixed;
+    min-width: 48em;
+}
+
+/* 로그 "자세히" 내용. 긴 줄·긴 트레이스백은 상자 안에서 스크롤합니다. */
+.log-detail {
+    max-height: 24rem;
+    overflow: auto;
+    white-space: pre;
+    background: var(--bs-gray-100);
+    padding: 0.5rem;
+    border-radius: 0.25rem;
+}
