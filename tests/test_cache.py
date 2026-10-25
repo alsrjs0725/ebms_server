@@ -1,11 +1,17 @@
 """임포트 캐시(SSD 작업 공간): 한도 안이면 업로드·대기 묶음을 캐시에, 넘으면 var에 두는지."""
-import pytest
+import pathlib
 
-from ebms_server import cache, constant, staging
+import pytest
+from fastapi.testclient import TestClient
+
+from ebms_server import cache, constant, importer, staging
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_import import commit, make_zip, song_rows, stage, wait  # noqa: F401
 from test_quota import admin_login
+from test_rar import send
+
+DATA = pathlib.Path(__file__).parent / "data"
 
 
 @pytest.fixture
@@ -101,3 +107,31 @@ def test_recover_finds_cached_stage(client, monkeypatch, cache_on):
     staging.recover()
     assert not (constant.CACHE_DIR / "staged" / sid / "stray").exists()
     assert sid in stages(client)
+
+
+@pytest.mark.parametrize("name", ["solo.7z", "solo.rar"])
+def test_finish_cached_upload_without_var_import(client, monkeypatch, cache_on, name):
+    """업로드가 캐시에만 놓여 var/import가 없어도 rar·7z를 풀기 전 남은 공간 확인이 500을 내지 않습니다."""
+    admin_login(client, monkeypatch)
+    upload_id = send(client, name, (DATA / name).read_bytes())
+    assert (constant.CACHE_DIR / "import" / f"{upload_id}.upload").is_file()
+    assert not constant.IMPORT_DIR.exists()
+    r = client.post(f"/api/admin/import/uploads/{upload_id}/finish")
+    assert r.status_code == 200, r.text
+    wait(client, r.json())
+
+
+def test_admin_api_error_shows_cause(client, monkeypatch):
+    """관리자 API에서 처리하지 못한 예외는 "Internal Server Error" 대신 원인을 detail로 보여줍니다."""
+    admin_login(client, monkeypatch)
+    upload_id = send(client, "pack.7z", b"x")
+
+    def broken(ids):
+        raise FileNotFoundError(2, "No such file or directory", "/app/var/import")
+
+    monkeypatch.setattr(importer, "finish_uploads", broken)
+    quiet = TestClient(client.app, raise_server_exceptions=False, cookies=client.cookies)
+    r = quiet.post(f"/api/admin/import/uploads/{upload_id}/finish")
+    assert r.status_code == 500
+    assert r.json()["detail"] == "서버 오류(FileNotFoundError): [Errno 2] No such file or directory: '/app/var/import'"
+    assert quiet.get("/api/version").status_code == 200
