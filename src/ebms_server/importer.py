@@ -70,6 +70,8 @@ class Job:
         self.resting_until: float | None = None
         # 서버가 다시 시작돼 이어서 하는 작업
         self.resumed = False
+        # 지금 풀거나 옮기는 원본(압축 파일·곡 폴더). 실패 로그에 남깁니다.
+        self.source: str | None = None
 
     @property
     def slow(self) -> bool:
@@ -553,9 +555,9 @@ def _start(job: Job, run) -> Job:
             job.status = "failed"
             job.error = "zip 파일이 아닙니다."
         except Exception as e:
-            logger.exception(f"import job failed[{job.name}]")
+            logger.exception(f"import job failed[{job.name}]" + (f" while processing [{job.source}]" if job.source else ""))
             job.status = "failed"
-            job.error = str(e) or type(e).__name__
+            job.error = (str(e) or type(e).__name__) + (f" ({job.source})" if job.source else "")
         if job.status == "done" and job.total == 0:
             job.error = "차트 파일(" + ", ".join(constant.BMS_FORMAT) + ")이 있는 폴더가 없습니다."
         logger.info(f"import job {job.status}[{job.name}]: {len(job.songs)} songs")

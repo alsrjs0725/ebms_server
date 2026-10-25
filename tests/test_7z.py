@@ -134,3 +134,24 @@ def test_tmp_non_utf8_folder(client, monkeypatch):
     [failed] = [s for s in job["songs"] if "error" in s]
     assert failed["folder"] == "\\udc8bȁ[" and "UTF-8" in failed["error"], failed
     assert os.path.isdir(bad)
+
+
+def test_tmp_failure_names_source(client, monkeypatch, caplog):
+    """var/tmp 가져오기가 예상 못 한 오류로 멈추면 어느 압축 파일에서였는지 오류와 로그에 남깁니다."""
+    admin_login(client, monkeypatch)
+    constant.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    (constant.TMP_DIR / "ok").mkdir()
+    (constant.TMP_DIR / "ok" / "b.bms").write_bytes(b"#TITLE B\n")
+    shutil.copy(DATA / "pack.7z", constant.TMP_DIR / "pack.7z")
+
+    def boom(path, dest):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sevenzip, "extract", boom)
+    with caplog.at_level("INFO", logger="ebms_server"):
+        job = wait(client, client.post("/api/admin/import/tmp").json())
+    assert job["status"] == "failed", job
+    assert "(var/tmp/pack.7z)" in job["error"], job
+    assert "staging: staged[ok] 1 charts" in caplog.text
+    assert "staging: end[" in caplog.text and "var/tmp folders (1): 1 staged, 0 failed" in caplog.text
+    assert "import job failed[var/tmp] while processing [var/tmp/pack.7z]" in caplog.text
