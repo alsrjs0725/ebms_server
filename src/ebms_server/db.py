@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pymysql
 
-from . import constant, preview
+from . import charset, constant, preview
 
 SCHEMA = [
     """
@@ -435,13 +435,20 @@ META_KEY_LENGTH = 255
 META_HEADERS = {"title": b"#TITLE", "artist": b"#ARTIST", "bpm": b"#BPM", "genre": b"#GENRE"}
 
 
-def _decode_header(value: bytes) -> str:
-    for encoding in CHART_ENCODINGS:
-        try:
-            return value.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return value.decode("utf-8", "replace")
+class ChartEncodingError(ValueError):
+    """BMS 차트의 헤더를 CHART_ENCODINGS 중 어느 것으로도 다 풀 수 없습니다."""
+
+
+def chart_encoding(chart: bytes) -> str:
+    """BMS 차트의 헤더 줄('#'로 시작) 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것(charset.guess_encoding).
+    차트 하나는 한 인코딩으로 쓰므로 헤더마다 따로 고르지 않습니다. 풀 수 없으면 대체하지 않고 ChartEncodingError."""
+    lines = [line for line in chart.splitlines() if line.lstrip().startswith(b"#") and not line.isascii()]
+    if not lines:
+        return "utf-8"
+    encoding, failures = charset.guess_encoding(lines, CHART_ENCODINGS)
+    if encoding is None:
+        raise ChartEncodingError("차트 헤더의 인코딩을 알 수 없습니다(" + "; ".join(failures) + ")")
+    return encoding
 
 
 def _bmson(chart: bytes) -> dict | None:
@@ -471,7 +478,7 @@ def _bmson_text(value) -> str:
 
 
 def chart_meta(chart: bytes) -> dict[str, str]:
-    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''.
+    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''. 헤더 인코딩을 알 수 없으면 ChartEncodingError.
     bmson은 info의 title·artist·init_bpm·genre입니다(subtitle은 BMS #TITLE의 난이도 표기와 같아 뺍니다)."""
     data = _bmson(chart)
     if data is not None:
@@ -482,6 +489,7 @@ def chart_meta(chart: bytes) -> dict[str, str]:
             "bpm": _bmson_text(info.get("init_bpm")),
             "genre": _bmson_text(info.get("genre")),
         }
+    encoding = chart_encoding(chart)
     meta = {}
     for line in chart.splitlines():
         line = line.strip()
@@ -489,7 +497,7 @@ def chart_meta(chart: bytes) -> dict[str, str]:
             continue
         for field, header in META_HEADERS.items():
             if field not in meta and line[:len(header)].upper() == header and line[len(header):len(header) + 1] in (b" ", b"\t"):
-                meta[field] = _decode_header(line[len(header):].strip())
+                meta[field] = line[len(header):].strip().decode(encoding)
         if len(meta) == len(META_HEADERS):
             break
     return {field: meta.get(field, "") for field in META_HEADERS}
@@ -1638,7 +1646,12 @@ class Database:
                     for info in zf.infolist():
                         sha256 = info.filename.rsplit(".", 1)[0]
                         if sha256 in missing:
-                            found.append((*chart_meta_keys(zf.read(info)), sha256))
+                            try:
+                                found.append((*chart_meta_keys(zf.read(info)), sha256))
+                            except ChartEncodingError as e:
+                                # 이미 들어간 차트라 비교 키만 비워 둡니다(다음 시작 때 다시 읽지 않도록).
+                                self.logger.warning(f"backfill_chart_meta: {sha256}: {e}")
+                                found.append(("", "", "", "", sha256))
             except (zipfile.BadZipFile, zlib.error):
                 self.logger.exception(f"backfill_chart_meta: Skipped broken chart chunk {chunk_no}")
                 broken = True

@@ -3,6 +3,8 @@ import io
 import json
 import zipfile
 
+import pytest
+
 from ebms_server import constant, db as db_module, importer, staging
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
@@ -442,3 +444,66 @@ def test_restore_packed_origin(tmp_path):
     staging._restore_origin(child)
     assert (src / "a.bms").read_bytes() == b"#TITLE A\n"
     assert (src / "bga" / "x.png").read_bytes() == b"png"
+
+
+def test_chart_header_encoding_is_scored():
+    """헤더 줄 전체로 인코딩을 고릅니다. cp932·cp949 양쪽으로 풀리는 이름도 오판 흔적이 적은 쪽입니다."""
+    assert db_module.chart_meta("#TITLE 한글\n#ARTIST 바다\n".encode("cp949"))["title"] == "한글"
+    assert db_module.chart_meta("#TITLE 夜想曲\n#WAV01 音楽.wav\n".encode("cp932"))["title"] == "夜想曲"
+    assert db_module.chart_meta("#TITLE 노래\n".encode("utf-8"))["title"] == "노래"
+    # '#'로 시작하지 않는 줄(주석)은 보지 않습니다.
+    assert db_module.chart_meta(b"\x85\x40 memo\n#TITLE A\n")["title"] == "A"
+    with pytest.raises(db_module.ChartEncodingError, match="cp949"):
+        db_module.chart_meta(b"#TITLE \x85\x40\n")
+
+
+def test_chart_encoding_error_unit_is_held_and_downloadable(client, monkeypatch):
+    """헤더 인코딩을 알 수 없는 곡은 대체하지 않고 등록 불가로 묶음에 남기며, 내려받을 수 있습니다."""
+    admin_login(client, monkeypatch)
+    bad = b"#TITLE \x85\x40\n"
+    job = stage(client, "pack.zip", make_zip({
+        "p/ok/a.bms": "#TITLE 한글\n".encode("cp949"),
+        "p/bad/b.bms": bad,
+        "p/bad/k.wav": b"k",
+    }))
+    sid = job["stage_id"]
+    assert sorted(bool(s.get("error")) for s in job["songs"]) == [False, True]
+    got = units(client, sid)
+    assert got["pack/p/ok"]["error"] is None and got["pack/p/ok"]["charts"][0]["title"] == "한글"
+    held = got["pack/p/bad"]
+    assert "b.bms" in held["error"] and "인코딩" in held["charts"][0]["error"]
+    assert detail(client, sid)["counts"]["failed"] == 1
+    assert [u["folder"] for u in detail(client, sid, show="failed")["items"]] == ["pack/p/bad"]
+
+    r = client.get(f"/api/admin/import/stages/{sid}/units/{held['id']}/zip")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        assert sorted(zf.namelist()) == ["b.bms", "k.wav"] and zf.read("b.bms") == bad
+    assert client.get(f"/api/admin/import/stages/{sid}/units/nope/zip").status_code == 404
+
+    done = commit_stage(client, sid)
+    assert any(s.get("error") for s in done["songs"])
+    assert [tuple(r) for r in song_rows()] == [(1, "ok")]
+    # 등록 불가 곡은 묶음에 그대로 남습니다.
+    assert list(units(client, sid)) == ["pack/p/bad"]
+    # 제외로 두면 commit 때 묶음에서 빠집니다.
+    assert set_target(client, sid, held, "skip").status_code == 200
+    commit_stage(client, sid)
+    assert client.get("/api/admin/import/stages").json() == []
+
+
+def test_download_old_unpacked_unit(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    job = stage(client, "pack.zip", make_zip({"s/a.bms": b"#TITLE A\n", "s/k.wav": b"k"}))
+    sid = job["stage_id"]
+    unit = units(client, sid)["pack/s"]
+    unit_root = constant.STAGED_DIR / sid / unit["id"]
+    with zipfile.ZipFile(unit_root / staging.PACK_FILE) as zf:
+        zf.extractall(unit_root / "s")
+    (unit_root / staging.PACK_FILE).unlink()
+    r = client.get(f"/api/admin/import/stages/{sid}/units/{unit['id']}/zip")
+    assert r.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        assert sorted(zf.namelist()) == ["a.bms", "k.wav"]
+    # 임시로 묶은 zip은 보낸 뒤 지웁니다.
+    assert not list(unit_root.glob(".download-*"))

@@ -65,8 +65,8 @@ def sha(data):
 
 
 def test_insert_and_download_roundtrip(tmp_path, client):
-    chart_a = b"#TITLE A\n" + os.urandom(3000)
-    chart_b = b"#TITLE B\n" + os.urandom(3000)
+    chart_a = b"#TITLE A\n" + os.urandom(3000).hex().encode()
+    chart_b = b"#TITLE B\n" + os.urandom(3000).hex().encode()
     song = make_song(tmp_path, "song1", {"a.bms": chart_a, "b.bme": chart_b})
     Database().insert_song(song)
 
@@ -109,8 +109,8 @@ def test_insert_and_download_roundtrip(tmp_path, client):
 
 def test_chunk_rollover(tmp_path, client, monkeypatch):
     monkeypatch.setattr(constant, "BYTE_PER_CHUNK", 1000)
-    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": os.urandom(2000)}))
-    Database().insert_song(make_song(tmp_path, "s2", {"b.bms": os.urandom(2000)}))
+    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": os.urandom(2000).hex().encode()}))
+    Database().insert_song(make_song(tmp_path, "s2", {"b.bms": os.urandom(2000).hex().encode()}))
     assert sorted(client.get("/api/pre/charthash").json()) == ["0", "1"]
 
 
@@ -130,8 +130,8 @@ def test_song_too_large_is_skipped(tmp_path, database, monkeypatch):
 
 
 def test_same_chart_name_in_different_songs(tmp_path, client):
-    chart_a = b"#TITLE A\n" + os.urandom(100)
-    chart_b = b"#TITLE B\n" + os.urandom(100)
+    chart_a = b"#TITLE A\n" + os.urandom(100).hex().encode()
+    chart_b = b"#TITLE B\n" + os.urandom(100).hex().encode()
     Database().insert_song(make_song(tmp_path, "s1", {"normal.bms": chart_a}))
     Database().insert_song(make_song(tmp_path, "s2", {"NORMAL.BMS": chart_b}))
     with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/chart/0").content)) as zf:
@@ -140,7 +140,7 @@ def test_same_chart_name_in_different_songs(tmp_path, client):
 
 def test_migrate_chart_chunk_names(tmp_path, client, database):
     # 이전 버전처럼 원래 파일명으로 저장된(이름이 겹치는) chunk
-    chart_a, chart_b = b"#A" + os.urandom(100), b"#B" + os.urandom(100)
+    chart_a, chart_b = b"#A" + os.urandom(100).hex().encode(), b"#B" + os.urandom(100).hex().encode()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("normal.bms", chart_a)
@@ -211,7 +211,7 @@ def test_range_requests(tmp_path, client):
 
 
 def test_manifest(tmp_path, client):
-    chart_a, chart_b = b"#A" + os.urandom(10), b"#B" + os.urandom(10)
+    chart_a, chart_b = b"#A" + os.urandom(10).hex().encode(), b"#B" + os.urandom(10).hex().encode()
     song = make_song(tmp_path, "Artist - 제목", {"a.bms": chart_a, "b.bme": chart_b})
     Database().insert_song(song)
 
@@ -370,7 +370,7 @@ def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):
 def test_chart_chunk_range_reads_blob_once(tmp_path, client, database, monkeypatch):
     """차트 청크는 범위를 한 번에 읽어 BLOB_READ_SIZE 조각으로 나눠 보냅니다."""
     monkeypatch.setattr(constant, "BLOB_READ_SIZE", 7)
-    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE " + os.urandom(100)}))
+    Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE " + os.urandom(100).hex().encode()}))
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT data FROM chart_chunk WHERE id = 0")
         data = cur.fetchone()[0]

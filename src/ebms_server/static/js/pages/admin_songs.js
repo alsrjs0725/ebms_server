@@ -729,7 +729,7 @@ const SUGGESTION = {
 function stageCounts(stage) {
     const c = stage.counts;
     return `곡 ${stage.units}개 · 채보 ${stage.charts}개 · ${size(stage.size)} · 새 곡 ${c.new} · 추가 ${c.add} · 여러 곡과 겹침 ${c.ambiguous} · 사용 중지 곡 ${c.unused} · 비슷한 곡 ${c.similar} · 대상 바꿈 ${c.changed} · 제외 ${c.skip}` +
-        (c.failed ? ` · 지난 commit 실패 ${c.failed}` : "");
+        (c.failed ? ` · 등록 불가·commit 실패 ${c.failed}` : "");
 }
 
 async function loadCache() {
@@ -964,7 +964,18 @@ function unitRows(stage, unit, locked) {
     toggle.className = "btn btn-link btn-sm p-0 ms-1 align-baseline";
     const chartChanged = unit.charts.some((c) => c.target !== null);
     toggle.textContent = `채보 ${unit.charts.length}개${chartChanged ? " · 채보별 지정" : ""} · 파일 보기 ▾`;
-    folder.append(code, toggle);
+    // 등록 전 곡 파일을 내려받아 확인합니다(인코딩 오류 곡은 고친 뒤 다시 올림).
+    const download = document.createElement("a");
+    download.className = "btn btn-link btn-sm p-0 ms-2 align-baseline";
+    download.href = `/api/admin/import/stages/${stage.id}/units/${unit.id}/zip`;
+    download.textContent = "내려받기";
+    folder.append(code, toggle, download);
+    if (unit.error) {
+        const err = document.createElement("div");
+        err.className = "text-danger";
+        err.textContent = `등록 불가(내려받아 고친 뒤 다시 올리세요. 제외로 두면 commit 때 묶음에서 빠집니다): ${unit.error}`;
+        folder.append(err);
+    }
     if (unit.result) {
         const warn = document.createElement("div");
         warn.className = unit.result.error ? "text-danger" : "text-warning-emphasis";
@@ -995,8 +1006,8 @@ function unitRows(stage, unit, locked) {
         const name = document.createElement("code");
         name.textContent = chart.path;
         const st = document.createElement("span");
-        st.className = "text-muted";
-        st.textContent = chartStatus(stage, chart);
+        st.className = chart.error ? "text-danger" : "text-muted";
+        st.textContent = chart.error || chartStatus(stage, chart);
         const meta = document.createElement("span");
         meta.className = "small text-break";
         meta.textContent = [chart.title, chart.artist, chart.bpm && `BPM ${chart.bpm}`, chart.genre].filter(Boolean).join(" / ");
