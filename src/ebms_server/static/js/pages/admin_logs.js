@@ -45,7 +45,7 @@ function row(entry) {
         const s = document.createElement("summary");
         s.textContent = "자세히";
         const pre = document.createElement("pre");
-        pre.className = "small mb-0";
+        pre.className = "small mb-0 mt-1 log-detail";
         pre.textContent = entry.detail;
         d.append(s, pre);
         msg.append(d);
