@@ -15,6 +15,7 @@
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
 """
+import contextlib
 import errno
 import hashlib
 import json
@@ -491,15 +492,34 @@ class _Writer:
             return
         if not unit["charts"]:
             shutil.rmtree(work, ignore_errors=True)
-            self.job.songs.append({"folder": folder, "error": "곡에 넣을 수 있는 차트 파일이 없습니다."})
+            self.error(folder, "곡에 넣을 수 있는 차트 파일이 없습니다.")
             return
         self.stage["units"].append(unit)
         self.job.songs.append({"folder": folder, "staged": True, "charts": len(unit["charts"])})
+        logger.info(f"staging: staged[{folder}] {len(unit['charts'])} charts, {unit['files']} files, {unit['size']} bytes")
         if time.monotonic() - self._saved >= SAVE_INTERVAL:
             self.save()
 
     def error(self, folder: str, message: str) -> None:
+        logger.warning(f"staging: failed[{_text(folder)}]: {_text(message)}")
         self.job.songs.append({"folder": _text(folder), "error": _text(message)})
+
+    @contextlib.contextmanager
+    def source(self, label: str):
+        """원본 하나(압축 파일·var/tmp 곡 폴더들)를 처리하는 동안 job.source에 적고, 시작과 결과를 로그에 남깁니다."""
+        label = _text(label)
+        self.job.source = label
+        start, started = len(self.job.songs), time.monotonic()
+        logger.info(f"staging: start[{self.stage['id']}] {label}")
+        try:
+            yield
+        finally:
+            songs = self.job.songs[start:]
+            failed = sum("error" in song for song in songs)
+            logger.info(
+                f"staging: end[{self.stage['id']}] {label}: {len(songs) - failed} staged, {failed} failed, "
+                f"{time.monotonic() - started:.1f}s"
+            )
 
     def save(self) -> None:
         with _lock:
@@ -647,7 +667,9 @@ def _stage_tmp(writer: _Writer) -> None:
             logger.warning(f"import: skipped symlink[{child}]")
         elif child.is_dir():
             song_dirs.extend(importer.find_song_dirs(child))
-    _move_songs(writer, song_dirs, root, origin=True)
+    if song_dirs:
+        with writer.source(f"var/tmp folders ({len(song_dirs)})"):
+            _move_songs(writer, song_dirs, root, origin=True)
     for path in sorted(p for p in root.iterdir() if p.suffix.lower() == ".zip"):
         if path.is_symlink() or not path.is_file():
             if path.is_symlink():
@@ -655,7 +677,8 @@ def _stage_tmp(writer: _Writer) -> None:
             continue
         start = len(job.songs)
         try:
-            _stage_zip(writer, path, path.name)
+            with writer.source(f"var/tmp/{path.name}"):
+                _stage_zip(writer, path, path.name)
         except importer.ZipNameEncodingError as e:
             logger.warning(f"stage_tmp: {e} [{path}]")
             writer.error(path.name, str(e))
@@ -670,7 +693,8 @@ def _stage_tmp(writer: _Writer) -> None:
     for names in rar.volume_sets(files).values():
         start = len(job.songs)
         try:
-            _stage_rar(writer, root / rar.first_volume(names))
+            with writer.source(f"var/tmp/{rar.first_volume(names)}"):
+                _stage_rar(writer, root / rar.first_volume(names))
         except (rar.RarError, OSError) as e:
             logger.warning(f"stage_tmp: cannot extract rar[{names[0]}]: {e}")
             writer.error(names[0], f"{e} (아직 복사 중이거나 볼륨이 빠졌을 수 있습니다)")
@@ -685,7 +709,8 @@ def _stage_tmp(writer: _Writer) -> None:
             continue
         start = len(job.songs)
         try:
-            _stage_7z(writer, path)
+            with writer.source(f"var/tmp/{path.name}"):
+                _stage_7z(writer, path)
         except (sevenzip.SevenZipError, OSError) as e:
             logger.warning(f"stage_tmp: cannot extract 7z[{path}]: {e}")
             writer.error(path.name, f"{e} (아직 복사 중일 수 있습니다)")
@@ -715,14 +740,21 @@ def _run(stage: dict, job: importer.Job) -> dict | None:
             raise RuntimeError("올린 파일이 남아 있지 않아 이어서 풀 수 없습니다")
         if kind == "tmp":
             _stage_tmp(writer)
-        elif kind == "zip":
-            _stage_zip(writer, source / stage["source"][0], stage["name"])
-        elif kind == "7z":
-            _stage_7z(writer, source / stage["source"][0], stage["name"])
         else:
-            _stage_rar(writer, source / rar.first_volume(stage["source"]), stage["name"])
+            with writer.source(f"{kind} {stage['name']}"):
+                if kind == "zip":
+                    _stage_zip(writer, source / stage["source"][0], stage["name"])
+                elif kind == "7z":
+                    _stage_7z(writer, source / stage["source"][0], stage["name"])
+                else:
+                    _stage_rar(writer, source / rar.first_volume(stage["source"]), stage["name"])
     except BaseException as e:
-        writer.finish(f"{_FAILED[kind]}: {e}")
+        where = f" ({job.source})" if job.source else ""
+        try:
+            writer.finish(f"{_FAILED[kind]}{where}: {e}")
+        except Exception:
+            # 실패를 적다 또 실패해도 원래 오류를 올립니다.
+            logger.exception(f"staging: could not save failed stage[{stage['id']}]")
         raise
     writer.finish()
     return stage if stage["units"] else None
