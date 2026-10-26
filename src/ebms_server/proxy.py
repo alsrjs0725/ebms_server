@@ -126,7 +126,8 @@ def authorize(request: Request) -> Response:
         if nbytes:
             resumed = download_log.is_resume(request)
             try:
-                charged = quota.charge_play(user.id, row_id)
+                # 프록시는 보낸 바이트를 알려주지 않으므로 요청한 만큼을 미리 셉니다.
+                charged = quota.charge_play(user.id, row_id, nbytes, blob.size)
             except quota.NoTicket as e:
                 download_log.record(user.id, row_id, "no_ticket", resumed)
                 return _deny(429, "no download ticket", e.retry_after)

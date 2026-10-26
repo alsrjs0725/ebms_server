@@ -2,6 +2,7 @@
 
 - 플레이 다운로드(/api/play/*)는 곡 1개당 티켓 1개를 씁니다. 티켓은 타이머 없이 요청 때
   `min(최대, 저장값 + 경과초 / 리필초)`로 계산합니다. 차감한 곡은 grant_seconds 동안 다시 차감하지 않습니다.
+  단, 티켓 하나로 받을 수 있는 양은 곡 크기 × PLAYS_PER_TICKET 바이트까지이고, 넘으면 티켓을 다시 씁니다(#35).
 - 사전 다운로드(/api/pre/*)는 실제 전송한 바이트를 월별로 더하고, 한도를 넘으면 끊지 않고 감속합니다.
   감속 상태는 프로세스 메모리에 둡니다(워커 1개 전제).
 
@@ -40,6 +41,8 @@ KST = datetime.timezone(datetime.timedelta(hours=9))
 USAGE_FLUSH_BYTES = 8 * 1024 * 1024
 # 감속할 때 한 번에 보내는 크기
 THROTTLE_PIECE = 16 * 1024
+# 티켓 하나로 같은 곡을 받을 수 있는 횟수(곡 크기 기준 바이트 합계로 셉니다. 이어받기는 받은 만큼만 셈)
+PLAYS_PER_TICKET = 3
 # 사용자당 최대 동시 다운로드 수
 MAX_CONCURRENT_DOWNLOADS_PER_USER = 10
 
@@ -239,9 +242,11 @@ class NoTicket(Exception):
         self.retry_after = retry_after
 
 
-def charge_play(user_id: str, song_id: int) -> bool:
+def charge_play(user_id: str, song_id: int, nbytes: int = 0, size: int = 0) -> bool:
     """곡 플레이 다운로드에 티켓 1개를 씁니다. 유효한 grant가 있으면 차감하지 않습니다.
 
+    nbytes: 이번 요청으로 보낼 바이트, size: 곡 전체 크기. grant 안에서 받은 바이트가
+    size × PLAYS_PER_TICKET를 넘게 되면 grant가 끝난 것으로 보고 티켓을 다시 씁니다.
     반환값: 이번에 차감했으면 True, grant 안이라 차감하지 않았으면 False. 티켓이 없으면 NoTicket.
     """
     limits = limits_for(user_id)
@@ -255,15 +260,20 @@ def charge_play(user_id: str, song_id: int) -> bool:
             cur.execute("SELECT tickets, updated_at FROM user_ticket WHERE user_id = %s FOR UPDATE", (user_id,))
             row = cur.fetchone()
             cur.execute(
-                "SELECT expires_at FROM download_grant WHERE user_id = %s AND song_id = %s",
+                "SELECT expires_at, bytes_used FROM download_grant WHERE user_id = %s AND song_id = %s",
                 (user_id, song_id),
             )
             grant = cur.fetchone()
-            charged = grant is None or grant[0] <= now
+            charged = grant is None or grant[0] <= now or grant[1] + nbytes > size * PLAYS_PER_TICKET
             tickets = _current_tickets(row, limits, now)
-            if charged and tickets < 1:
+            if not charged:
+                cur.execute(
+                    "UPDATE download_grant SET bytes_used = bytes_used + %s WHERE user_id = %s AND song_id = %s",
+                    (nbytes, user_id, song_id),
+                )
+            elif tickets < 1:
                 retry_after = _state(tickets, limits, now).retry_after(now)
-            elif charged:
+            else:
                 cur.execute(
                     "UPDATE user_ticket SET tickets = %s, updated_at = %s WHERE user_id = %s",
                     (tickets - 1, now, user_id),
@@ -271,13 +281,15 @@ def charge_play(user_id: str, song_id: int) -> bool:
                 # 위에서 행 유무를 이미 봤으므로 UPDATE/INSERT 중 하나만 합니다(없는 행 DELETE의 gap lock으로 인한 데드락 방지).
                 if grant is None:
                     cur.execute(
-                        "INSERT INTO download_grant (user_id, song_id, charged_at, expires_at) VALUES (%s, %s, %s, %s)",
-                        (user_id, song_id, now, now + limits.grant_seconds),
+                        "INSERT INTO download_grant (user_id, song_id, charged_at, expires_at, bytes_used)"
+                        " VALUES (%s, %s, %s, %s, %s)",
+                        (user_id, song_id, now, now + limits.grant_seconds, nbytes),
                     )
                 else:
                     cur.execute(
-                        "UPDATE download_grant SET charged_at = %s, expires_at = %s WHERE user_id = %s AND song_id = %s",
-                        (now, now + limits.grant_seconds, user_id, song_id),
+                        "UPDATE download_grant SET charged_at = %s, expires_at = %s, bytes_used = %s"
+                        " WHERE user_id = %s AND song_id = %s",
+                        (now, now + limits.grant_seconds, nbytes, user_id, song_id),
                     )
             con.commit()
         except Exception:
@@ -286,6 +298,19 @@ def charge_play(user_id: str, song_id: int) -> bool:
     if retry_after is not None:
         raise NoTicket(retry_after)
     return charged
+
+
+def refund_play(user_id: str, song_id: int, nbytes: int) -> None:
+    """charge_play에서 셈한 바이트 중 보내지 못한 만큼을 되돌립니다(연결이 중간에 끊긴 경우)."""
+    if nbytes <= 0:
+        return
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute(
+            "UPDATE download_grant SET bytes_used = IF(bytes_used > %s, bytes_used - %s, 0)"
+            " WHERE user_id = %s AND song_id = %s",
+            (nbytes, nbytes, user_id, song_id),
+        )
+        con.commit()
 
 
 def refill_tickets(user_id: str) -> None:

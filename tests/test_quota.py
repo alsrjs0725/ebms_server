@@ -729,3 +729,75 @@ def test_backfill_file_kinds_resumes_after_restart(tmp_path, client, monkeypatch
     with db_module.connect() as con, con.cursor() as cur:
         assert db._setting(cur, db_module.FILE_KINDS_PROGRESS_SETTING) is None
         assert db._setting(cur, db_module.FILE_KINDS_SETTING) == str(db_module.FILE_KINDS_VERSION)
+
+
+# ---- 티켓당 받을 수 있는 양(#35) ----
+
+def song_size(song_id=1):
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT size FROM song WHERE id = %s", (song_id,))
+        return cur.fetchone()[0]
+
+
+def test_ticket_covers_three_downloads(tmp_path, client, monkeypatch):
+    key, _ = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    h = bearer(key)
+    for _ in range(quota.PLAYS_PER_TICKET):
+        assert client.get("/api/play/song/1", headers=h).status_code == 200
+    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 4
+    # 네 번째는 티켓을 다시 씁니다.
+    assert client.get("/api/play/song/1", headers=h).status_code == 200
+    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 3
+
+
+def test_ticket_counts_range_bytes(tmp_path, client, monkeypatch):
+    """이어받기·부분 요청은 받은 바이트만큼만 셉니다."""
+    key, _ = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    h = bearer(key)
+    half = song_size() // 2
+    ranges = [f"bytes=0-{half - 1}", f"bytes={half}-"] * quota.PLAYS_PER_TICKET
+    for rng in ranges:
+        assert client.get("/api/play/song/1", headers={**h, "Range": rng}).status_code == 206
+    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 4
+    assert client.get("/api/play/song/1", headers={**h, "Range": "bytes=0-0"}).status_code == 206
+    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 3
+
+
+def test_ticket_budget_exhausted_without_tickets(tmp_path, client, monkeypatch):
+    key, user_id = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    size = song_size()
+    for _ in range(quota.PLAYS_PER_TICKET):
+        quota.charge_play(user_id, 1, size, size)
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("UPDATE user_ticket SET tickets = 0")
+        con.commit()
+    try:
+        quota.charge_play(user_id, 1, 1, size)
+        assert False, "NoTicket expected"
+    except quota.NoTicket:
+        pass
+
+
+def test_unsent_bytes_are_refunded(tmp_path, client, monkeypatch):
+    """끊긴 다운로드는 보내지 못한 만큼을 되돌려 이어받기가 티켓을 더 쓰지 않습니다."""
+    from starlette.requests import Request
+
+    from ebms_server import downloads
+
+    _, user_id = client_login(client, monkeypatch)
+    add_songs(tmp_path, 1)
+    size = song_size()
+
+    def charge(nbytes, total):
+        quota.charge_play(user_id, 1, nbytes, total)
+        return lambda unsent: quota.refund_play(user_id, 1, unsent)
+
+    request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
+    for fail_at in (0, 1):  # 0: 본문 시작 전, 1: 첫 조각에서 끊김
+        _serve(downloads.blob_response(request, "song", 1, "1.zip", "x", before_send=charge), fail_at)
+        with db_module.connect() as con, con.cursor() as cur:
+            cur.execute("SELECT bytes_used FROM download_grant WHERE user_id = %s", (user_id,))
+            assert cur.fetchone()[0] == 0, fail_at
