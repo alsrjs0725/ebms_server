@@ -236,13 +236,30 @@ def bearer_token(request: Request) -> str | None:
     return token.strip()
 
 
+def api_key_session(request: Request) -> tuple[User, int] | None:
+    """`Bearer ebms_ak_...`면 (만든 관리자, 키 id). 감사 기록에 키 id를 남기도록 request.state에 둡니다."""
+    from . import api_keys  # api_keys가 이 모듈을 가져오므로 여기서 가져옵니다.
+
+    token = bearer_token(request)
+    if not token or not token.startswith(constant.API_KEY_PREFIX):
+        return None
+    session = api_keys.authenticate(token)
+    if session is not None:
+        request.state.api_key_id = session[1]
+    return session
+
+
 def optional_api_session(request: Request) -> tuple[User, int, str] | None:
     """API 요청의 (user, session id, 세션 종류). 클라이언트는 Bearer 세션키, 웹은 쿠키입니다.
+    관리자 API 키(Bearer ebms_ak_...)면 종류는 "api_key", id는 키 id입니다.
 
     Authorization 헤더가 있으면 그것만 봅니다(틀린 세션키를 쿠키로 덮지 않음).
     """
     if "authorization" in request.headers:
         token = bearer_token(request)
+        if token and token.startswith(constant.API_KEY_PREFIX):
+            session = api_key_session(request)
+            return (*session, "api_key") if session else None
         session = accounts.authenticate(token, "client") if token else None
         return (*session, "client") if session else None
     session = optional_session(request)

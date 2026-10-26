@@ -45,5 +45,9 @@ def record(request: Request, admin_id: str, action: str, target: str | list[str]
         target = ",".join(target)
     ip = request.client.host if request.client else ""
     parts = [f"admin={admin_id}", f"ip={ip}", f"action={action}", f"target={target or '-'}"]
+    # 관리자 API 키로 부른 요청이면 어느 키였는지 남깁니다.
+    api_key_id = getattr(request.state, "api_key_id", None)
+    if api_key_id is not None:
+        parts.append(f"api_key={api_key_id}")
     parts += [f"{key}={_value(value)}" for key, value in detail.items()]
     logger.info(" ".join(parts))

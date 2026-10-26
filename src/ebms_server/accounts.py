@@ -337,7 +337,7 @@ def consume_auth_code(code: str) -> tuple[str, str] | None:
 
 # user를 가리키는 테이블. FK ON DELETE CASCADE로도 지워지지만, 외래 키를 강제하지 않는 환경에서도
 # 남지 않도록 user보다 먼저 직접 지웁니다.
-USER_TABLES = ("user_identity", "session", "auth_code", "user_ticket", "download_grant", "pre_usage")
+USER_TABLES = ("user_identity", "session", "api_key", "auth_code", "user_ticket", "download_grant", "pre_usage")
 REJOIN_SALT_SETTING = "rejoin_salt"
 
 

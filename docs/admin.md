@@ -1,7 +1,9 @@
 # 관리자 페이지
 
-`EBMS_ADMIN_USER_IDS`에 계정 ID(UUID)를 넣은 사용자나 관리자 페이지에서 admin으로 지정된 사용자는 `/admin`을 쓸 수 있습니다(`/account`에 링크). `EBMS_ADMIN_USER_IDS`는 승격만 하고 강등은 하지 않으므로, 관리자를 내리려면 관리자 페이지에서 role을 바꿉니다. 관리자 API는 웹 세션 쿠키로만 쓸 수 있고, 로그인하지 않았으면 `401`, 관리자가 아니면 `403`입니다.
+`EBMS_ADMIN_USER_IDS`에 계정 ID(UUID)를 넣은 사용자나 관리자 페이지에서 admin으로 지정된 사용자는 `/admin`을 쓸 수 있습니다(`/account`에 링크). `EBMS_ADMIN_USER_IDS`는 승격만 하고 강등은 하지 않으므로, 관리자를 내리려면 관리자 페이지에서 role을 바꿉니다. 관리자 API는 웹 세션 쿠키나 관리자 API 키로 쓸 수 있고, 로그인하지 않았으면 `401`, 관리자가 아니면 `403`입니다.
 
+- API 키(`/admin/api-keys`): 실제 서버에서 구현 전에 API를 직접 불러 시험할 때 쓰는 키를 만들고 폐기합니다. 키(`ebms_ak_...`)는 만들 때 한 번만 보이고 DB에는 sha256만 남습니다(`api_key` 테이블). `Authorization: Bearer <키>`로 부르면 만든 관리자의 권한으로 관리자 API(`/api/admin/...`)와 일반 API를 쓸 수 있습니다(`/api/me`의 `session.kind`는 `api_key`). 유효기간은 1~365일(기본 30일)이고 써도 연장되지 않습니다. 만든 계정이 관리자가 아니게 되거나 정지되면 키도 바로 막힙니다. 키 만들기·목록·폐기(`GET·POST /api/admin/api-keys`, `DELETE /api/admin/api-keys/{id}`)와 계정 조작(로그인 수단 해제·로그아웃·탈퇴)은 웹 세션으로만 할 수 있습니다. 다른 관리자가 만든 키도 폐기할 수 있습니다. 키로 한 요청의 관리자 접속기록에는 `api_key=<키 id>`가 붙고, 만들기·폐기는 `api_key.create`·`api_key.revoke`로 남습니다. 만료·폐기 후 세션과 같은 기간(`EBMS_RETENTION_SESSION_DAYS`)이 지나면 지웁니다.
+  - 예: `curl -H "Authorization: Bearer ebms_ak_..." https://<서버>/api/admin/import/stages`
 - 전역 기본값 일괄 수정: 최대 티켓, 리필 시간, 같은 곡 재차감 없음 시간, 사전 다운로드 월 한도, 초과 후 속도. 처음 시작할 때 기본값을 넣고, 이후 바꾼 값은 재시작해도 유지됩니다.
 - 사용자 검색(닉네임·계정 ID), 사용자별 한도 덮어쓰기(비우면 전역 기본값), 티켓 즉시 충전, 정지·해제.
   - 사용자 목록·상세를 보거나 바꾸면 관리자 접속기록을 남깁니다: `var/log/audit.log`(1년 이상 보관)와 서버 로그(로거 `ebms_server.audit`). 한 줄에 관리자 id, 접속 IP, 행위(`user.search`·`user.view`·`user.update`·`user.refill`·`download.search`), 대상 사용자 id(검색이면 결과 전체), 검색어·바꾼 값이 들어갑니다. 안전성 확보조치 기준에 따라 월 1회 이상 로그 화면에서 이 로거로 걸러 점검합니다.

@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, audit, auth, constant, downloads, home, importer, notices, policies, preview, proxy, retention, staging, tables
+from . import admin, api_keys, audit, auth, constant, downloads, home, importer, notices, policies, preview, proxy, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -216,6 +216,7 @@ app.include_router(auth.router)
 app.include_router(downloads.router)
 app.include_router(proxy.router)
 app.include_router(admin.router)
+app.include_router(api_keys.router)
 app.include_router(notices.router)
 app.include_router(tables.router)
 app.include_router(policies.router)

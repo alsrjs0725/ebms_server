@@ -49,6 +49,18 @@ def purge_sessions(cur, con, now: int, days: int) -> int:
     )
 
 
+def purge_api_keys(cur, con, now: int, days: int) -> int:
+    """만료되거나 폐기된 지 days일이 지난 관리자 API 키를 지웁니다(세션과 같은 기간)."""
+    cutoff = now - days * DAY
+    return _delete_rows(
+        cur, con,
+        "SELECT id FROM api_key WHERE expires_at < %s OR revoked_at < %s",
+        (cutoff, cutoff),
+        "DELETE FROM api_key WHERE id = %s AND (expires_at < %s OR revoked_at < %s)",
+        (cutoff, cutoff),
+    )
+
+
 def purge_grants(cur, con, now: int, days: int) -> int:
     """차감 면제 기간이 끝나고 days일이 지난 곡별 다운로드 기록을 지웁니다.
     면제 기간이 끝난 기록은 다음 다운로드 때 어차피 다시 차감하므로 지워도 할당량 동작은 같습니다."""
@@ -131,6 +143,7 @@ def purge(now: int | None = None) -> dict[str, int]:
     jobs = [
         ("inactive_users", purge_inactive_users, constant.RETENTION_INACTIVE_USER_DAYS),
         ("sessions", purge_sessions, constant.RETENTION_SESSION_DAYS),
+        ("api_keys", purge_api_keys, constant.RETENTION_SESSION_DAYS),
         ("download_grants", purge_grants, constant.RETENTION_GRANT_DAYS),
         ("pre_usage", purge_pre_usage, constant.RETENTION_PRE_USAGE_MONTHS),
         ("download_log", purge_download_log, constant.RETENTION_DOWNLOAD_LOG_DAYS),

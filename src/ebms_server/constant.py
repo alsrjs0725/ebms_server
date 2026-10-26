@@ -106,6 +106,8 @@ ADMIN_USER_IDS = {
 PROXY_SECRET = os.environ.get("EBMS_PROXY_SECRET", "")
 SESSION_COOKIE = "ebms_session"
 # 웹 세션 유효기간. 쓸 때마다 연장됩니다.
+# 관리자 API 키(api_keys.py)의 접두어. 이 접두어로 시작하는 Bearer 토큰은 세션키가 아니라 API 키로 봅니다.
+API_KEY_PREFIX = "ebms_ak_"
 WEB_SESSION_SECONDS = 30 * 24 * 3600
 # OAuth 로그인 화면에 다녀오는 동안의 state 쿠키 유효기간
 OAUTH_STATE_SECONDS = 600

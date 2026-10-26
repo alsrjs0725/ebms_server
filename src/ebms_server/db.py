@@ -153,6 +153,24 @@ SCHEMA = [
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 관리자 테스트용 API 키(api_keys.py). 원문 대신 sha256만 저장하고, 만든 관리자의 권한으로 동작합니다.
+    """
+        CREATE TABLE IF NOT EXISTS api_key(
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            token_sha256 CHAR(64) NOT NULL,
+            prefix VARCHAR(16) NOT NULL,
+            user_id CHAR(36) NOT NULL,
+            name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            created_at BIGINT UNSIGNED NOT NULL,
+            last_used_at BIGINT UNSIGNED,
+            expires_at BIGINT UNSIGNED NOT NULL,
+            revoked_at BIGINT UNSIGNED,
+
+            PRIMARY KEY (id),
+            UNIQUE (token_sha256),
+            FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
     # 클라이언트 로그인용 1회용 코드. 세션키로 바꿀 때 PKCE(code_verifier)가 맞아야 합니다.
     """
         CREATE TABLE IF NOT EXISTS auth_code(
