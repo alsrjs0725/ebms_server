@@ -294,7 +294,7 @@ def test_import_tmp_slow(client, monkeypatch):
     assert rests == [False, False, False]
 
 
-def test_job_rest_and_speed_change(monkeypatch):
+def test_job_rest_and_speed_change(client, monkeypatch):
     monkeypatch.setattr(constant, "IMPORT_SLOW_REST_MAX", 5)
     batch = db_module.Database().batch()
     job = importer.Job("tmp", "var/tmp", slow=True)
