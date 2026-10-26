@@ -1,5 +1,6 @@
 """관리자 곡 임포트(zip 조각 업로드, var/tmp 가져오기) 테스트."""
 import io
+import json
 import os
 import threading
 import time
@@ -161,13 +162,16 @@ def test_upload_chunks(client, monkeypatch):
     admin_login(client, monkeypatch)
     upload_id = client.post("/api/admin/import/uploads", json={"filename": "a.zip", "size": 10}).json()["id"]
     url = f"/api/admin/import/uploads/{upload_id}"
-    assert client.put(url, params={"offset": 0}, content=b"12345").json()["received"] == 5
-    # 받은 크기와 다른 위치는 409와 현재 위치를 알려줍니다(재전송·이어 올리기).
-    r = client.put(url, params={"offset": 0}, content=b"12345")
-    assert r.status_code == 409 and "offset must be 5" in r.json()["detail"]
+    # 조각은 순서와 상관없이 제자리에 쓰고, 같은 구간을 다시 보내면 덮어씁니다.
+    assert client.put(url, params={"offset": 5}, content=b"67890").json()["received"] == 5
+    assert client.put(url, params={"offset": 5}, content=b"67890").json()["received"] == 5
     # 선언한 크기를 넘으면 400, 덜 받았으면 finish 409
     assert client.put(url, params={"offset": 5}, content=b"123456").status_code == 400
+    assert client.put(url, params={"offset": 11}, content=b"").status_code == 400
     assert client.post(f"{url}/finish").status_code == 409
+    assert client.put(url, params={"offset": 0}, content=b"12345").json()["received"] == 10
+    path = next(p for p in constant.IMPORT_DIR.iterdir() if p.suffix == ".upload")
+    assert path.read_bytes() == b"1234567890"
     assert client.delete(url).status_code == 200
     assert client.put(url, params={"offset": 5}, content=b"1").status_code == 404
     assert not any(constant.IMPORT_DIR.iterdir())
@@ -367,10 +371,34 @@ def test_upload_resumes_after_restart(client, monkeypatch):
     importer._uploads.clear()
     importer.recover()
     assert not stray.exists()
-    r = client.put(f"/api/admin/import/uploads/{upload_id}", params={"offset": 0}, content=data)
-    assert r.status_code == 409 and f"offset must be {half}" in r.text
+    # 받은 구간은 다시 시작해도 남아 있어 나머지만 보내면 됩니다.
+    assert client.post(f"/api/admin/import/uploads/{upload_id}/finish").status_code == 409
     assert client.put(f"/api/admin/import/uploads/{upload_id}", params={"offset": half}, content=data[half:]).status_code == 200
     job = wait(client, client.post(f"/api/admin/import/uploads/{upload_id}/finish").json())
     assert job["status"] == "done" and job["stage_id"]
     assert list(constant.IMPORT_DIR.iterdir()) == []
+
+
+def test_upload_parallel_chunks_out_of_order(client, monkeypatch):
+    """조각을 거꾸로(동시에) 보내도 제자리에 써서 원래 파일이 됩니다. 이전 버전의 받던 업로드(구간 없음)도 이어 받습니다."""
+    admin_login(client, monkeypatch)
+    data = make_zip({"s/a.bms": b"#TITLE A\n", "s/b.wav": os.urandom(5000)})
+    upload_id = client.post("/api/admin/import/uploads", json={"filename": "p.zip", "size": len(data)}).json()["id"]
+    url = f"/api/admin/import/uploads/{upload_id}"
+    step = 1000
+    for offset in reversed(range(0, len(data), step)):
+        assert client.put(url, params={"offset": offset}, content=data[offset:offset + step]).status_code == 200
+    job = wait(client, client.post(f"{url}/finish").json())
+    assert job["status"] == "done" and job["stage_id"]
+
+    upload_id = client.post("/api/admin/import/uploads", json={"filename": "q.zip", "size": len(data)}).json()["id"]
+    url = f"/api/admin/import/uploads/{upload_id}"
+    path = constant.IMPORT_DIR / f"{upload_id}.upload"
+    path.write_bytes(data[:step])
+    (constant.IMPORT_DIR / f"{upload_id}.json").write_text(json.dumps({"filename": "q.zip", "size": len(data)}))
+    importer._uploads.clear()
+    importer.recover()
+    assert client.put(url, params={"offset": step}, content=data[step:]).json()["received"] == len(data)
+    job = wait(client, client.post(f"{url}/finish").json())
+    assert job["status"] == "done"
 

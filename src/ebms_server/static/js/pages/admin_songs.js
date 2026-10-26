@@ -363,50 +363,86 @@ function progress(file, sent, index, count) {
     label.textContent = `${index + 1}/${count} ${file.name}: ${gb(sent)} / ${gb(file.size)}`;
 }
 
+// 조각을 이만큼 동시에 보냅니다. 서버는 조각을 제자리에 쓰므로 순서는 상관없고, 왕복 대기가 겹쳐 빨라집니다.
+const PARALLEL = 4;
+
 async function uploadFile(file, index, count) {
     const upload = await postJson("/api/admin/import/uploads", { filename: file.name, size: file.size });
     currentUpload = upload.id;
-    let offset = 0;
+    // 보낼 구간. 실패한 구간은 다시 넣고, 프록시가 413을 주면 그 구간을 반으로 나눕니다.
+    const queue = [];
+    for (let offset = 0; offset < file.size; offset += chunkSize) {
+        queue.push([offset, Math.min(offset + chunkSize, file.size)]);
+    }
+    let sent = 0;
     let failures = 0;
-    while (offset < file.size) {
-        if (cancelled) throw new Error("취소했습니다.");
-        const end = Math.min(offset + chunkSize, file.size);
+    let error = null;
+
+    async function send(start, end) {
         let res;
         try {
-            res = await fetch(`/api/admin/import/uploads/${upload.id}?offset=${offset}`, {
+            res = await fetch(`/api/admin/import/uploads/${upload.id}?offset=${start}`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/octet-stream" },
-                body: file.slice(offset, end),
+                body: file.slice(start, end),
             });
         } catch (e) {
-            // 연결이 끊기면 잠시 뒤 받은 곳부터 다시 보냅니다. 큰 요청을 프록시가 끊는 경우도 있어 조각을 줄입니다.
+            // 연결이 끊기면 잠시 뒤 그 구간을 다시 보냅니다. 큰 요청을 프록시가 끊는 경우도 있어 조각을 줄입니다.
             chunkSize = Math.max(MIN_CHUNK, chunkSize / 2);
             if (++failures > MAX_FAILURES) throw new Error("연결이 계속 끊깁니다. 다시 시도하세요.");
             await sleep(1000 * Math.min(30, 2 ** failures));
-            continue;
+            queue.push(...split(start, end));
+            return;
         }
-        if (res.status === 413 && chunkSize > MIN_CHUNK) {
-            chunkSize = Math.max(MIN_CHUNK, chunkSize / 2);
-            continue;
-        }
-        if (res.status === 409) {
-            // 서버가 받은 크기에 맞춰 이어서 보냅니다.
-            const m = /offset must be (\d+)/.exec(await detail(res));
-            if (!m) throw new Error("업로드 위치가 맞지 않습니다.");
-            offset = Number(m[1]);
-            continue;
+        if (res.status === 413 && end - start > MIN_CHUNK) {
+            chunkSize = Math.max(MIN_CHUNK, Math.min(chunkSize, (end - start) / 2));
+            queue.push(...split(start, end));
+            return;
         }
         if (!res.ok) {
             if (res.status >= 500 && ++failures <= MAX_FAILURES) {
                 await sleep(1000 * Math.min(30, 2 ** failures));
-                continue;
+                queue.push([start, end]);
+                return;
             }
             throw new Error(res.status === 413 ? "프록시가 업로드를 막습니다. 요청 크기 제한을 1MB 이상으로 올리세요." : await detail(res));
         }
         failures = 0;
-        offset = (await res.json()).received;
-        progress(file, offset, index, count);
+        await res.json();
+        sent += end - start;
+        progress(file, sent, index, count);
     }
+
+    function split(start, end) {
+        const out = [];
+        for (let s = start; s < end; s += chunkSize) out.push([s, Math.min(s + chunkSize, end)]);
+        return out;
+    }
+
+    async function worker() {
+        while (!error) {
+            if (cancelled) { error = new Error("취소했습니다."); break; }
+            const range = queue.shift();
+            if (!range) {
+                // 다른 조각이 실패해 다시 들어올 수 있으므로 모두 끝날 때까지 기다립니다.
+                if (active === 0) break;
+                await sleep(100);
+                continue;
+            }
+            active++;
+            try {
+                await send(...range);
+            } catch (e) {
+                error = e;
+            } finally {
+                active--;
+            }
+        }
+    }
+
+    let active = 0;
+    await Promise.all(Array.from({ length: PARALLEL }, worker));
+    if (error) throw error;
     currentUpload = null;
     return upload.id;
 }
