@@ -11,7 +11,7 @@ import pymysql
 import pytest
 from fastapi.testclient import TestClient
 
-from ebms_server import constant, db as db_module, store
+from ebms_server import constant, db as db_module, preview, store
 from ebms_server.db import Database
 
 from test_auth import oauth
@@ -704,3 +704,125 @@ def test_read_ahead_close_stops_reading_and_closes_source():
     assert closed.wait(2)
     with pytest.raises(StopIteration):
         next(ahead)
+
+
+def song_member_cases(database):
+    """곡 1의 매니페스트 항목과 실제 내용."""
+    files = database.get_song_files(1)
+    with zipfile.ZipFile(io.BytesIO(database.get_song_data(1))) as zf:
+        return [(entry, zf.read(entry["path"])) for entry in files]
+
+
+@pytest.mark.parametrize("storage", ["store", "song_part", "song.data"])
+def test_read_song_member_from_each_storage(tmp_path, database, storage):
+    """곡 zip 전체를 읽지 않고 항목 하나만 풀어 읽습니다. 저장소 파일, 조각(song_part), 옛 song.data 모두."""
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n" * 200, "b.bmp": os.urandom(3000)}))
+    cases = song_member_cases(database)
+    if storage != "store":
+        raw = to_legacy("song", 1)
+        if storage == "song.data":
+            with db_module.connect() as con, con.cursor() as cur:
+                cur.execute("DELETE FROM song_part WHERE song_id = 1")
+                cur.execute("UPDATE song SET data = %s WHERE id = 1", (raw,))
+                con.commit()
+    methods = {entry["method"] for entry, _ in cases}
+    assert zipfile.ZIP_DEFLATED in methods
+    with db_module.connect() as con, con.cursor() as cur:
+        for entry, data in cases:
+            assert database._read_song_member(cur, 1, entry) == data, entry["path"]
+            # data_offset이 없는 옛 매니페스트는 local file header를 읽어 자리를 찾습니다.
+            old = {k: v for k, v in entry.items() if k != "data_offset"}
+            assert database._read_song_member(cur, 1, old) == data, entry["path"]
+        assert database._read_song_range(cur, 1, 0, 0) == b""
+
+
+def test_read_song_member_rejects_mismatch(tmp_path, database):
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))
+    entry, _ = next(c for c in song_member_cases(database) if c[0]["path"] == "a.bms")
+    with db_module.connect() as con, con.cursor() as cur:
+        # 매니페스트와 내용이 다르면(곡 zip이 바뀜) 엉뚱한 바이트를 돌려주지 않습니다.
+        with pytest.raises(ValueError, match="does not match"):
+            database._read_song_member(cur, 1, {**entry, "crc32": "00000000"})
+        with pytest.raises(ValueError, match="does not match"):
+            database._read_song_member(cur, 1, {**entry, "size": entry["size"] + 1})
+        with pytest.raises(ValueError, match="unsupported compression"):
+            database._read_song_member(cur, 1, {**entry, "method": zipfile.ZIP_LZMA})
+        old = {k: v for k, v in entry.items() if k != "data_offset"}
+        with pytest.raises(ValueError, match="bad local file header"):
+            database._read_song_member(cur, 1, {**old, "offset": old["offset"] + 1})
+
+
+def preview_rows():
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT song_id, path, note FROM song_preview ORDER BY song_id")
+        return cur.fetchall()
+
+
+def test_render_previews_records_failures_per_song(tmp_path, database, monkeypatch, caplog):
+    for name in ("a", "b", "c"):
+        database.insert_song(make_song(tmp_path, name, {f"{name}.bms": f"#TITLE {name}\n".encode()}))
+
+    def fake_render(files, read):
+        paths = {f["path"] for f in files}
+        if "a.bms" in paths:
+            raise RuntimeError("bad chart")
+        if "b.bms" in paths:
+            raise KeyError("x")
+        assert read(next(f for f in files if f["path"] == "c.bms")) == b"#TITLE c\n"
+        return "preview_ebms.ogg", b"OggS fake"
+
+    monkeypatch.setattr(preview, "render", fake_render)
+    # 한 곡이 실패해도 다른 곡은 만들고, 실패한 곡은 이유를 남겨 시작할 때마다 다시 만들지 않습니다.
+    assert database.render_previews() == 1
+    assert preview_rows() == ((1, None, "error: bad chart"), (2, None, "error: KeyError"), (3, "preview_ebms.ogg", ""))
+    assert database.get_preview(3, "preview_ebms.ogg")[1] == b"OggS fake"
+    assert "Song[2] failed" in caplog.text
+    assert database.render_previews() == 0
+
+
+def test_render_previews_stops_without_ffmpeg(tmp_path, database, monkeypatch, caplog):
+    for name in ("a", "b"):
+        database.insert_song(make_song(tmp_path, name, {f"{name}.bms": b"#TITLE\n"}))
+    calls = []
+
+    def no_ffmpeg(files, read):
+        calls.append(1)
+        raise RuntimeError("ffmpeg not found")
+
+    monkeypatch.setattr(preview, "render", no_ffmpeg)
+    # ffmpeg가 없으면 곡마다 시도하지 않고 멈추며, 아무것도 남기지 않아 ffmpeg를 깐 뒤 다시 만듭니다.
+    assert database.render_previews() == 0
+    assert calls == [1]
+    assert preview_rows() == ()
+    assert "ffmpeg not found. Previews are not rendered." in caplog.text
+
+
+def test_render_previews_skips_song_changed_while_rendering(tmp_path, database, monkeypatch):
+    database.insert_song(make_song(tmp_path, "a", {"a.bms": b"#TITLE\n"}))
+
+    def render_while_replaced(files, read):
+        with db_module.connect() as con, con.cursor() as cur:
+            cur.execute("UPDATE song SET sha256 = %s WHERE id = 1", ("f" * 64,))
+            con.commit()
+        return "preview_ebms.ogg", b"OggS stale"
+
+    monkeypatch.setattr(preview, "render", render_while_replaced)
+    # 렌더링하는 동안 곡이 바뀌었으면 넣지 않고 다음에 다시 만듭니다.
+    assert database.render_previews() == 0
+    assert preview_rows() == ()
+
+
+@pytest.mark.parametrize("backfill, column", [("backfill_chart_md5", "md5"), ("backfill_chart_meta", "title_key")])
+def test_chart_backfill_retries_after_broken_chunk(tmp_path, database, monkeypatch, backfill, column):
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(f"UPDATE chart SET {column} = NULL")
+        con.commit()
+    real = database.get_chart_chunk_data
+    monkeypatch.setattr(database, "get_chart_chunk_data", lambda chunk_no: b"not a zip")
+    # 깨진 청크가 있으면 못 찾은 차트를 ''로 덮지 않아 다음 시작 때 다시 채웁니다.
+    assert getattr(database, backfill)() == 0
+    assert count(f"SELECT COUNT(*) FROM chart WHERE {column} IS NULL") == 1
+    monkeypatch.setattr(database, "get_chart_chunk_data", real)
+    assert getattr(database, backfill)() == 1
+    assert count(f"SELECT COUNT(*) FROM chart WHERE {column} IS NULL") == 0
