@@ -849,7 +849,8 @@ class ChartInUseError(ValueError):
 
 class BlobReader:
     """곡 zip·청크를 나눠 읽습니다. 저장소 파일(path)이 있으면 파일을 열어 두고 읽고, 없으면(옮기기 전) DB BLOB을
-    매 chunk 읽기마다 단기 연결로 읽습니다. 파일은 만들 때 열어 두므로 그 뒤 새 판으로 바뀌어 옛 파일이 지워져도 끝까지 읽습니다."""
+    매 chunk 읽기마다 단기 연결로 읽습니다. 파일은 만들 때 열어 두므로 그 뒤 새 판으로 바뀌어 옛 파일이 지워져도 끝까지 읽습니다.
+    DB BLOB을 읽는 도중 마이그레이션이 같은 내용을 저장소 파일로 옮기면(조각이 지워짐) 그 파일을 열어 이어 읽습니다."""
 
     def __init__(self, table: str, row_id: int, size: int, sha256: str, path: str | None = None):
         self.table = table
@@ -859,10 +860,27 @@ class BlobReader:
         self.path = path
         self._fd = os.open(store.full_path(path), os.O_RDONLY) if path else None
 
+    def _open_moved_file(self) -> None:
+        """읽던 DB BLOB이 사라졌을 때 옮겨진 저장소 파일을 엽니다. 내용(sha256)이 바뀌었으면 이어 읽지 않고 실패합니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute(f"SELECT path, sha256 FROM {self.table} WHERE id = %s", (self.row_id,))
+            row = cur.fetchone()
+        if row is None or row[0] is None or row[1] != self.sha256:
+            raise RuntimeError(f"{self.table} {self.row_id} changed while reading")
+        self.path = row[0]
+        self._fd = os.open(store.full_path(self.path), os.O_RDONLY)
+
     def read(self, start: int, length: int) -> bytes:
         """start부터 length 바이트를 읽습니다."""
-        if self._fd is not None:
-            return os.pread(self._fd, length, start)
+        if self._fd is None:
+            data = self._read_db(start, length)
+            if data is not None:
+                return data
+            self._open_moved_file()
+        return os.pread(self._fd, length, start)
+
+    def _read_db(self, start: int, length: int) -> bytes | None:
+        """DB BLOB에서 읽습니다. 옮겨져 없으면 None."""
         if self.table == "song":
             start_seq = start // constant.BLOB_READ_SIZE
             end_seq = (start + length - 1) // constant.BLOB_READ_SIZE
@@ -878,17 +896,29 @@ class BlobReader:
                     return buf[offset_in_buf : offset_in_buf + length]
                 # song_part에 없는 경우(마이그레이션 전) song.data fallback
                 cur.execute("SELECT SUBSTRING(data, %s, %s) FROM song WHERE id = %s", (start + 1, length, self.row_id))
-                return cur.fetchone()[0]
+                row = cur.fetchone()
+                return row[0] if row else None
         else:
             raise ValueError(self.table)
 
     def iter_range(self, start: int, end: int) -> Iterator[bytes]:
         """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
         step = constant.BLOB_READ_SIZE
+        pos = start
+        if self._fd is None:
+            for piece in self._iter_db(start, end):
+                if piece is None:
+                    self._open_moved_file()
+                    break
+                pos += len(piece)
+                yield piece
         if self._fd is not None:
-            for pos in range(start, end + 1, step):
-                yield os.pread(self._fd, min(step, end + 1 - pos), pos)
-            return
+            for p in range(pos, end + 1, step):
+                yield os.pread(self._fd, min(step, end + 1 - p), p)
+
+    def _iter_db(self, start: int, end: int) -> Iterator[bytes | None]:
+        """DB BLOB의 [start, end]를 나눠 읽습니다. 그 사이 옮겨져 다음 조각이 없으면 None을 내고 멈춥니다."""
+        step = constant.BLOB_READ_SIZE
         if self.table == "song":
             start_seq = start // step
             end_seq = end // step
@@ -907,12 +937,14 @@ class BlobReader:
                             (self.row_id, seq),
                         )
                         row = cur.fetchone()
-                    if row is not None:
-                        part_data = row[0]
-                        chunk_start = seq * step
-                        s = max(0, start - chunk_start)
-                        e = min(len(part_data), end + 1 - chunk_start)
-                        yield part_data[s:e]
+                    if row is None:
+                        yield None
+                        return
+                    part_data = row[0]
+                    chunk_start = seq * step
+                    s = max(0, start - chunk_start)
+                    e = min(len(part_data), end + 1 - chunk_start)
+                    yield part_data[s:e]
             else:
                 for pos in range(start + 1, end + 2, step):
                     with connect() as con, con.cursor() as cur:
@@ -921,8 +953,10 @@ class BlobReader:
                             (pos, min(step, end + 2 - pos), self.row_id),
                         )
                         row = cur.fetchone()
-                    if row is not None:
-                        yield row[0]
+                    if row is None or row[0] is None:
+                        yield None
+                        return
+                    yield row[0]
         elif self.table == "pre_chunk":
             for seq in range(start // step, end // step + 1):
                 with connect() as con, con.cursor() as cur:
@@ -931,22 +965,26 @@ class BlobReader:
                         (self.row_id, seq),
                     )
                     row = cur.fetchone()
-                if row is not None:
-                    chunk_start = seq * step
-                    yield row[0][max(0, start - chunk_start) : end + 1 - chunk_start]
+                if row is None:
+                    yield None
+                    return
+                chunk_start = seq * step
+                yield row[0][max(0, start - chunk_start) : end + 1 - chunk_start]
         elif self.table == "chart_chunk":
             # SUBSTRING도 InnoDB가 BLOB 전체를 읽은 뒤 자르므로 step마다 나눠 읽으면 64MB 청크 하나에 4GB를 읽습니다.
-            # 차트 청크는 BYTE_PER_CHUNK 이하라 한 번에 읽고 나눠 보냅니다.
+            # 차트 청크는 BYTE_PER_CHUNK 이하라 한 번에 읽고 나눠 보냅니다. 옮기면 data를 빈 값으로 둡니다.
             with connect() as con, con.cursor() as cur:
                 cur.execute(
                     "SELECT SUBSTRING(data, %s, %s) FROM chart_chunk WHERE id = %s",
                     (start + 1, end - start + 1, self.row_id),
                 )
                 row = cur.fetchone()
-            if row is not None:
-                data = row[0]
-                for pos in range(0, len(data), step):
-                    yield data[pos : pos + step]
+            if row is None or not row[0]:
+                yield None
+                return
+            data = row[0]
+            for pos in range(0, len(data), step):
+                yield data[pos : pos + step]
         else:
             raise ValueError(self.table)
 
