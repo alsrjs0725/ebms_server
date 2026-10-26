@@ -135,3 +135,40 @@ def test_admin_api_error_shows_cause(client, monkeypatch):
     assert r.status_code == 500
     assert r.json()["detail"] == "서버 오류(FileNotFoundError): [Errno 2] No such file or directory: '/app/var/import'"
     assert quiet.get("/api/version").status_code == 200
+
+
+def test_work_dir(monkeypatch, cache_on):
+    assert cache.work_dir() == constant.CACHE_DIR / "work"
+    assert (constant.CACHE_DIR / "work").is_dir()
+    monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 0)
+    assert cache.work_dir() == constant.TMP_DIR
+
+
+def test_unusable_cache_falls_back(monkeypatch, cache_on, tmp_path, caplog):
+    """캐시 폴더를 만들 수 없으면(디스크가 빠짐 등) 경고만 남기고 var 쪽을 씁니다."""
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_bytes(b"")
+    monkeypatch.setattr(constant, "CACHE_DIR", blocker)
+    assert cache.work_dir() == constant.TMP_DIR
+    fallback = tmp_path / "var_staged"
+    assert cache.place("staged", fallback, "s1", 10) == fallback / "s1"
+    assert fallback.is_dir()
+    assert not cache._reserved
+    assert caplog.text.count("cache: unavailable") == 2
+
+
+def test_usage_counts_reservations(cache_on):
+    # 캐시 폴더가 아직 없으면 예약만 셉니다.
+    path = cache.place("staged", constant.STAGED_DIR, "s1", 4096)
+    try:
+        assert path == constant.CACHE_DIR / "staged" / "s1"
+        assert cache.usage() == 4096
+        # 예약한 자리에 쓴 만큼은 예약에서 빼서 두 번 세지 않습니다.
+        path.mkdir()
+        (path / "f").write_bytes(b"x" * 4096)
+        assert cache.usage() == cache._du(constant.CACHE_DIR) + max(0, 4096 - cache._du(path))
+    finally:
+        cache.release(path)
+    assert not cache._reserved
+    assert cache._du(path / "f", apparent=True) == 4096
+    assert cache._du(path, apparent=True) == 4096

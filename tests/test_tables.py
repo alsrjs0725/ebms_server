@@ -1,6 +1,7 @@
 """난이도표 읽기(beatoraja 방식), 관리자 등록, 사전 청크 태그 테스트."""
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -199,3 +200,151 @@ def test_backfill_chart_md5(client, monkeypatch):
         cur.execute("SELECT id, md5 FROM chart ORDER BY id")
         assert dict(cur.fetchall()) == {sha256(A): md5(A), sha256(B): md5(B), "e" * 64: ""}
     assert database.backfill_chart_md5() == 0
+
+
+class FakeResponse:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n):
+        return self.body[:n]
+
+
+def test_http_get(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(req, timeout):
+        seen["ua"], seen["timeout"] = req.get_header("User-agent"), timeout
+        return FakeResponse(b"body")
+
+    monkeypatch.setattr(tables.urllib.request, "urlopen", fake_urlopen)
+    assert tables.http_get("https://t.example/") == b"body"
+    # User-Agent가 없으면 403을 주는 사이트가 있습니다.
+    assert seen == {"ua": "ebms-server (difficulty table)", "timeout": constant.TABLE_FETCH_TIMEOUT}
+
+
+def test_http_get_rejects_too_large(monkeypatch):
+    monkeypatch.setattr(constant, "TABLE_MAX_BYTES", 4)
+    monkeypatch.setattr(tables.urllib.request, "urlopen", lambda req, timeout: FakeResponse(b"12345"))
+    with pytest.raises(tables.TableError, match="4 바이트보다 큽니다"):
+        tables.http_get("https://t.example/")
+    monkeypatch.setattr(tables.urllib.request, "urlopen", lambda req, timeout: FakeResponse(b"1234"))
+    assert tables.http_get("https://t.example/") == b"1234"
+
+
+@pytest.mark.parametrize(
+    "error, message",
+    [
+        (lambda url: tables.urllib.error.HTTPError(url, 503, "busy", {}, None), "HTTP 503"),
+        (lambda url: tables.urllib.error.URLError("name not resolved"), "name not resolved"),
+        (lambda url: TimeoutError("timed out"), "timed out"),
+    ],
+)
+def test_http_get_errors_become_table_error(monkeypatch, error, message):
+    def fake_urlopen(req, timeout):
+        raise error(req.full_url)
+
+    monkeypatch.setattr(tables.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(tables.TableError, match=message):
+        tables.http_get("https://t.example/")
+
+
+@pytest.mark.parametrize(
+    "header, data, message",
+    [
+        ({"name": "x", "symbol": "x"}, None, "data_url이 없습니다"),
+        ({"name": "x", "symbol": "x", "data_url": ["", "  "]}, None, "data_url이 없습니다"),
+        ({"name": "x", "symbol": "x", "data_url": "d.json"}, {"not": "a list"}, "배열이 아닙니다"),
+    ],
+)
+def test_parse_table_without_data(header, data, message):
+    pages = {"https://t.example/h.json": header}
+    if data is not None:
+        pages["https://t.example/d.json"] = data
+    with pytest.raises(tables.TableError, match=message):
+        tables.parse_table("https://t.example/h.json", fake_web(pages))
+
+
+def test_parse_table_skips_bad_rows_and_trims_fields():
+    get = fake_web({
+        "https://t.example/h.json": {
+            "name": "N" * 300, "symbol": "S" * 100,
+            # data_url 목록의 문자열이 아닌 값, 사전이 아닌 규칙은 무시합니다.
+            "data_url": ["d.json", 3], "data_rule": ["not a dict"],
+        },
+        "https://t.example/d.json": [
+            # 길이는 길지만 16진수가 아닌 해시는 뺍니다.
+            {"md5": "z" * 32, "level": "1"},
+            {"md5": md5(A), "sha256": sha256(A), "level": "L" * 100},
+            # 같은 차트를 sha256으로 다시 실어도 처음 것만
+            {"sha256": sha256(A), "level": "2"},
+        ],
+    })
+    table = tables.parse_table("https://t.example/h.json", get)
+    assert len(table["name"]) == 255 and len(table["symbol"]) == 64
+    assert table["charts"] == [(md5(A), sha256(A), "L" * 64)]
+
+
+def test_add_table_rejects_other_schemes(client, monkeypatch):
+    with pytest.raises(tables.TableError, match="http"):
+        tables.add_table("ftp://t.example/table.json")
+    admin_login(client, monkeypatch)
+    r = client.post("/api/admin/tables", json={"url": "javascript:alert(1)"})
+    assert r.status_code == 400
+
+
+def test_tables_page_needs_login(client):
+    r = client.get("/admin/tables", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/login")
+
+
+def test_refresh_all_continues_after_failure(client, monkeypatch, caplog):
+    pages = {
+        "https://t.example/a.json": {"name": "A", "symbol": "a", "data_url": "da.json"},
+        "https://t.example/da.json": [{"md5": md5(A), "level": "1"}],
+        "https://t.example/b.json": {"name": "B", "symbol": "b", "data_url": "db.json"},
+        "https://t.example/db.json": [{"md5": md5(B), "level": "1"}],
+    }
+    first = tables.add_table("https://t.example/a.json", fake_web(pages))
+    second = tables.add_table("https://t.example/b.json", fake_web(pages))
+    pages["https://t.example/db.json"].append({"md5": md5(C), "level": "2"})
+
+    refreshed = []
+    real_refresh = tables.refresh_table
+
+    def flaky_refresh(table_id, get=None):
+        refreshed.append(table_id)
+        if table_id == first["id"]:
+            raise RuntimeError("db hiccup")
+        return real_refresh(table_id, get)
+
+    monkeypatch.setattr(tables, "refresh_table", flaky_refresh)
+    tables.refresh_all(fake_web(pages))
+    # 한 표가 실패해도 다음 표는 다시 읽습니다.
+    assert refreshed == [first["id"], second["id"]]
+    assert tables.get_table(second["id"])["charts"] == 2
+    assert tables.get_table(first["id"])["charts"] == 1
+    assert f"difficulty table {first['id']}: refresh failed" in caplog.text
+
+
+def test_start(monkeypatch):
+    monkeypatch.setattr(constant, "TABLE_REFRESH_HOURS", 0)
+    assert tables.start() is None
+
+    calls = []
+    monkeypatch.setattr(tables, "refresh_all", lambda: calls.append(1))
+    monkeypatch.setattr(constant, "TABLE_REFRESH_HOURS", 1)
+    stop = tables.start()
+    [thread] = [t for t in threading.enumerate() if t.name == "difficulty_tables"]
+    stop.set()
+    thread.join(5)
+    # 등록할 때 이미 읽었으므로 시작 직후에는 읽지 않고, 멈추면 스레드가 끝납니다.
+    assert not thread.is_alive()
+    assert calls == []

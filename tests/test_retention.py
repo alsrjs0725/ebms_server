@@ -1,4 +1,7 @@
 """개인정보 보유기간 정리 작업 테스트 (#99)."""
+import logging
+import threading
+
 from ebms_server import accounts, constant, db as db_module, quota, retention
 from ebms_server.accounts import Profile
 
@@ -111,3 +114,59 @@ def test_purge_inactive_users(client, monkeypatch):
 def test_start_disabled(monkeypatch):
     monkeypatch.setattr(constant, "RETENTION_INTERVAL_HOURS", 0)
     assert retention.start() is None
+
+
+def test_failing_job_does_not_stop_others(client, monkeypatch, caplog):
+    monkeypatch.setattr(constant, "RETENTION_SESSION_DAYS", 30)
+    monkeypatch.setattr(constant, "RETENTION_GRANT_DAYS", 0)
+    uid = new_user("u1")
+    execute("INSERT INTO download_grant (user_id, song_id, charged_at, expires_at) VALUES (%s, 1, 0, %s)", (uid, NOW - 60))
+
+    def broken(*args):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(retention, "purge_sessions", broken)
+    monkeypatch.setattr(retention, "lift_expired_bans", broken)
+    result = retention.purge(NOW)
+    # 실패한 항목만 빠지고 나머지 항목은 그대로 지웁니다.
+    assert "sessions" not in result and "expired_bans" not in result
+    assert result["download_grants"] == 1
+    assert "rejoin_blocks" in result
+    assert rows("SELECT * FROM download_grant") == ()
+    assert "retention purge failed: sessions" in caplog.text
+    assert "retention purge failed: expired_bans" in caplog.text
+
+
+def test_loop_logs_and_keeps_running_until_stopped(monkeypatch, caplog):
+    stop = threading.Event()
+    results = iter([{"sessions": 2}, RuntimeError("boom"), {"sessions": 0}])
+
+    def fake_purge():
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        if not result["sessions"]:
+            stop.set()
+        return result
+
+    monkeypatch.setattr(retention, "purge", fake_purge)
+    with caplog.at_level(logging.INFO, logger=retention.logger.name):
+        retention._loop(stop, 0)
+    messages = [r.getMessage() for r in caplog.records]
+    # 지운 것이 있을 때만 남기고, 실패해도 다음 주기에 다시 돕니다.
+    assert messages == ["retention purge: {'sessions': 2}", "retention purge failed"]
+
+
+def test_start_runs_loop_in_thread(monkeypatch):
+    monkeypatch.setattr(constant, "RETENTION_INTERVAL_HOURS", 2)
+    seen = {}
+    ran = threading.Event()
+
+    def fake_loop(stop, interval):
+        seen["stop"], seen["interval"] = stop, interval
+        ran.set()
+
+    monkeypatch.setattr(retention, "_loop", fake_loop)
+    stop = retention.start()
+    assert ran.wait(5)
+    assert seen == {"stop": stop, "interval": 2 * 3600}
