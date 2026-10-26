@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pymysql
 
-from . import charset, constant, preview
+from . import charset, constant, preview, store
 
 SCHEMA = [
     """
@@ -369,6 +369,10 @@ MISSING_COLUMNS = [
     ("user", "terms_version", "INT UNSIGNED"),
     ("user", "privacy_version", "INT UNSIGNED"),
     ("user", "agreed_at", "BIGINT UNSIGNED"),
+    # 저장소 파일의 상대 경로(store.py, #152). NULL이면 아직 DB BLOB(song_part, chart_chunk.data, pre_chunk_part)에 있습니다.
+    ("song", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("chart_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    ("pre_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
 ]
 # 이전 버전에서 만든 테이블에 없는 인덱스 (테이블, 인덱스 이름, 컬럼)
 MISSING_INDEXES = [
@@ -409,6 +413,10 @@ FILE_KINDS_PROGRESS_SETTING = "file_kinds_progress"
 # 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
 CHART_CHUNK_SETTING = "chart_chunk_charts"
 PRE_CHUNK_SETTING = "pre_chunk_songs"
+# DB BLOB을 저장소 파일로 다 옮기고 BLOB 테이블의 공간을 돌려받은 테이블(쉼표로 이음). migrate_to_store가 다시 비우지 않게 합니다.
+STORE_RECLAIMED_SETTING = "store_reclaimed"
+# migrate_to_store가 옮기는 순서. 작은 테이블부터 옮기고 비워, 큰 테이블(곡)을 옮길 때 쓸 공간을 먼저 확보합니다.
+STORE_TABLES = ("pre_chunk", "chart_chunk", "song")
 # 차트 청크를 다시 묶는 중일 때 옛 청크의 마지막 번호와 단계(copy: 새 청크를 만드는 중, delete: 옛 청크를 지우는 중)
 CHART_RECHUNK_SETTING = "chart_rechunk_old_max"
 CHART_RECHUNK_PHASE_SETTING = "chart_rechunk_phase"
@@ -801,16 +809,21 @@ class ChartInUseError(ValueError):
 
 
 class BlobReader:
-    """BLOB을 나눠 읽습니다. 전송 중에 연결을 유지하지 않고 매 chunk 읽기마다 단기 연결을 씁니다."""
+    """곡 zip·청크를 나눠 읽습니다. 저장소 파일(path)이 있으면 파일을 열어 두고 읽고, 없으면(옮기기 전) DB BLOB을
+    매 chunk 읽기마다 단기 연결로 읽습니다. 파일은 만들 때 열어 두므로 그 뒤 새 판으로 바뀌어 옛 파일이 지워져도 끝까지 읽습니다."""
 
-    def __init__(self, table: str, row_id: int, size: int, sha256: str):
+    def __init__(self, table: str, row_id: int, size: int, sha256: str, path: str | None = None):
         self.table = table
         self.row_id = row_id
         self.size = size
         self.sha256 = sha256
+        self.path = path
+        self._fd = os.open(store.full_path(path), os.O_RDONLY) if path else None
 
     def read(self, start: int, length: int) -> bytes:
         """start부터 length 바이트를 읽습니다."""
+        if self._fd is not None:
+            return os.pread(self._fd, length, start)
         if self.table == "song":
             start_seq = start // constant.BLOB_READ_SIZE
             end_seq = (start + length - 1) // constant.BLOB_READ_SIZE
@@ -833,6 +846,10 @@ class BlobReader:
     def iter_range(self, start: int, end: int) -> Iterator[bytes]:
         """[start, end] 바이트(양끝 포함)를 BLOB_READ_SIZE 단위로 읽습니다."""
         step = constant.BLOB_READ_SIZE
+        if self._fd is not None:
+            for pos in range(start, end + 1, step):
+                yield os.pread(self._fd, min(step, end + 1 - pos), pos)
+            return
         if self.table == "song":
             start_seq = start // step
             end_seq = end // step
@@ -895,7 +912,12 @@ class BlobReader:
             raise ValueError(self.table)
 
     def close(self) -> None:
-        pass
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __del__(self):
+        self.close()
 
 
 class ConnectionPool:
@@ -1102,9 +1124,6 @@ class Database:
                 cur.execute("INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (name, str(value)))
             con.commit()
 
-    def _fits_packet(self, size: int) -> bool:
-        return size + constant.PACKET_OVERHEAD <= self.max_allowed_packet
-
     def _append_charts_to_chunk(self, cur, charts: list[tuple[str, bytes]]) -> None:
         """마지막 chart chunk에 chart (항목 이름, 내용)들을 추가합니다. 청크마다 CHARTS_PER_CHUNK개까지 넣고,
         넘치거나 청크가 BYTE_PER_CHUNK를 넘으면 다음 번호의 새 청크에 이어 넣습니다."""
@@ -1114,8 +1133,7 @@ class Database:
             chunk_no, data = 0, b""
         else:
             chunk_no = row[0]
-            cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
-            data = cur.fetchone()[0]
+            data = self._chart_chunk_data(cur, chunk_no)
         count = _zip_count(data)
 
         pending = list(charts)
@@ -1132,17 +1150,31 @@ class Database:
             self._write_chart_chunk(cur, chunk_no, data)
 
     def _write_chart_chunk(self, cur, chunk_no: int, data: bytes) -> None:
-        if not self._fits_packet(len(data)):
-            raise RuntimeError(
-                f"chart chunk {chunk_no} ({len(data)} bytes) exceeds max_allowed_packet({self.max_allowed_packet})"
-            )
+        """차트 청크를 저장소 파일로 쓰고 행을 그 파일로 바꿉니다. 옛 파일(또는 data)은 비웁니다."""
+        sha256 = hashlib.sha256(data).hexdigest()
+        path = store.write(store.chart_chunk_path(chunk_no, sha256), data)
         cur.execute(
             """
-            INSERT INTO chart_chunk (id, size, sha256, data) VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), data = VALUES(data)
+            INSERT INTO chart_chunk (id, size, sha256, data, path) VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), data = VALUES(data), path = VALUES(path)
             """,
-            (chunk_no, len(data), hashlib.sha256(data).hexdigest(), data),
+            (chunk_no, len(data), sha256, b"", path),
         )
+
+    def _chart_chunk_data(self, cur, chunk_no: int) -> bytes | None:
+        """차트 청크 내용. 없는 청크면 None."""
+        cur.execute("SELECT path FROM chart_chunk WHERE id = %s", (chunk_no,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        if row[0]:
+            return store.read(row[0])
+        cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
+        return cur.fetchone()[0]
+
+    def get_chart_chunk_data(self, chunk_no: int) -> bytes | None:
+        with connect() as con, con.cursor() as cur:
+            return self._chart_chunk_data(cur, chunk_no)
 
     def _setting(self, cur, name: str) -> str | None:
         cur.execute("SELECT value FROM setting WHERE name = %s", (name,))
@@ -1236,9 +1268,7 @@ class Database:
 
         progress = _Progress(self.logger, "rechunk_charts(copy, old chunks)", len(old_ids))
         for i, old in enumerate(old_ids, 1):
-            with connect() as con, con.cursor() as cur:
-                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (old,))
-                data = cur.fetchone()[0]
+            data = self.get_chart_chunk_data(old)
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 for info in zf.infolist():
                     content = zf.read(info)
@@ -1427,6 +1457,10 @@ class Database:
         """곡 zip의 start부터 length 바이트. 같은 트랜잭션에서 넣은 곡도 읽도록 cur를 씁니다."""
         if length <= 0:
             return b""
+        cur.execute("SELECT path FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        if row is not None and row[0]:
+            return store.read_range(row[0], start, length)
         step = constant.BLOB_READ_SIZE
         start_seq, end_seq = start // step, (start + length - 1) // step
         cur.execute(
@@ -1494,19 +1528,15 @@ class Database:
                     zf.writestr(info, bytes(cur.fetchone()[0]))
         data = buf.getvalue()
 
+        sha256 = hashlib.sha256(data).hexdigest()
+        path = store.write(store.pre_chunk_path(chunk_no, sha256), data)
         cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
-        step = constant.BLOB_READ_SIZE
-        for seq, pos in enumerate(range(0, len(data), step)):
-            cur.execute(
-                "INSERT INTO pre_chunk_part (chunk_id, seq, data) VALUES (%s, %s, %s)",
-                (chunk_no, seq, data[pos : pos + step]),
-            )
         cur.execute(
             """
-            INSERT INTO pre_chunk (id, size, sha256) VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256)
+            INSERT INTO pre_chunk (id, size, sha256, path) VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), path = VALUES(path)
             """,
-            (chunk_no, len(data), hashlib.sha256(data).hexdigest()),
+            (chunk_no, len(data), sha256, path),
         )
 
     def backfill_pre_chunks(self) -> int:
@@ -1580,14 +1610,12 @@ class Database:
         progress = _Progress(self.logger, "backfill_chart_md5(chart chunks)", len(chunk_ids))
         for n, chunk_no in enumerate(chunk_ids):
             progress.update(n)
-            with connect() as con, con.cursor() as cur:
-                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
-                row = cur.fetchone()
-            if row is None:
+            data = self.get_chart_chunk_data(chunk_no)
+            if data is None:
                 continue
             found = []
             try:
-                with zipfile.ZipFile(io.BytesIO(row[0])) as zf:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         sha256 = info.filename.rsplit(".", 1)[0]
                         if sha256 in missing:
@@ -1635,14 +1663,12 @@ class Database:
         progress = _Progress(self.logger, "backfill_chart_meta(chart chunks)", len(chunk_ids))
         for n, chunk_no in enumerate(chunk_ids):
             progress.update(n)
-            with connect() as con, con.cursor() as cur:
-                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
-                row = cur.fetchone()
-            if row is None:
+            data = self.get_chart_chunk_data(chunk_no)
+            if data is None:
                 continue
             found = []
             try:
-                with zipfile.ZipFile(io.BytesIO(row[0])) as zf:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for info in zf.infolist():
                         sha256 = info.filename.rsplit(".", 1)[0]
                         if sha256 in missing:
@@ -1776,11 +1802,17 @@ class Database:
         return new_charts
 
     def get_song_data(self, song_id: int) -> bytes | None:
-        """곡 id의 전체 zip data를 반환합니다. song_part 또는 song.data에서 읽어옵니다."""
+        """곡 id의 전체 zip data를 반환합니다. 저장소 파일, 없으면(옮기기 전) song_part 또는 song.data에서 읽어옵니다."""
         with connect() as con, con.cursor() as cur:
             return self._get_song_data_with_cur(cur, song_id)
 
     def _get_song_data_with_cur(self, cur, song_id: int) -> bytes | None:
+        cur.execute("SELECT path FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        if row[0]:
+            return store.read(row[0])
         cur.execute("SELECT data FROM song_part WHERE song_id = %s ORDER BY seq", (song_id,))
         rows = cur.fetchall()
         if rows:
@@ -1796,30 +1828,25 @@ class Database:
 
         서버 시작 때 실행하므로 곡마다 예외를 잡아 로그를 남기고 건너뜁니다(손상된 zip 하나가 시작을 막지 않게, #45).
         BACKFILL_BATCH_SONGS곡마다 커밋하고, 건너뛴 곡은 다음 시작 때 다시 시도합니다."""
-        # 1) 기존 song.data BLOB을 song_part로 마이그레이션(곡마다 커밋)
+        # 1) 아주 오래된 song.data BLOB은 song_part를 거치지 않고 저장소 파일로 옮깁니다(곡마다 커밋).
+        #    song_part에 있는 곡은 migrate_to_store가 서버를 켠 채로 천천히 옮깁니다.
         with connect() as con, con.cursor() as cur:
-            cur.execute("SELECT id FROM song WHERE data IS NOT NULL ORDER BY id")
+            cur.execute("SELECT id FROM song WHERE data IS NOT NULL AND path IS NULL ORDER BY id")
             legacy_ids = [row[0] for row in cur.fetchall()]
         if legacy_ids:
-            self.logger.info(f"backfill_manifest: Moving {len(legacy_ids)} songs to song_part.")
-        progress = _Progress(self.logger, "backfill_manifest(song_part)", len(legacy_ids))
+            self.logger.info(f"backfill_manifest: Moving {len(legacy_ids)} songs to the store.")
+        progress = _Progress(self.logger, "backfill_manifest(store)", len(legacy_ids))
         for n, song_id in enumerate(legacy_ids, 1):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
                     cur.execute("SELECT data FROM song WHERE id = %s AND data IS NOT NULL", (song_id,))
                     row = cur.fetchone()
                     if row is not None:
-                        step = constant.BLOB_READ_SIZE
-                        for seq, pos in enumerate(range(0, len(row[0]), step)):
-                            cur.execute(
-                                "INSERT IGNORE INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
-                                (song_id, seq, row[0][pos : pos + step]),
-                            )
-                        cur.execute("UPDATE song SET data = NULL WHERE id = %s", (song_id,))
+                        self._put_song_data(cur, song_id, row[0])
                     con.commit()
                 except Exception:
                     con.rollback()
-                    self.logger.exception(f"backfill_manifest: Skipped moving song[{song_id}] data to song_part")
+                    self.logger.exception(f"backfill_manifest: Skipped moving song[{song_id}] data to the store")
             progress.update(n)
 
         # 2) 매니페스트 항목·차트 파일명 채우기
@@ -1995,8 +2022,8 @@ class Database:
             try:
                 for n, chunk_no in enumerate(chunk_ids, 1):
                     progress.update(n - 1)
-                    cur.execute("SELECT data FROM chart_chunk WHERE id = %s FOR UPDATE", (chunk_no,))
-                    old = cur.fetchone()[0]
+                    cur.execute("SELECT id FROM chart_chunk WHERE id = %s FOR UPDATE", (chunk_no,))
+                    old = self._chart_chunk_data(cur, chunk_no)
                     buf = io.BytesIO()
                     renamed = False
                     with zipfile.ZipFile(io.BytesIO(old)) as src, \
@@ -2010,11 +2037,7 @@ class Database:
                             dst.writestr(zipfile.ZipInfo(name, date_time=info.date_time), content)
                     if not renamed:
                         continue
-                    data = buf.getvalue()
-                    cur.execute(
-                        "UPDATE chart_chunk SET size = %s, sha256 = %s, data = %s WHERE id = %s",
-                        (len(data), hashlib.sha256(data).hexdigest(), data, chunk_no),
-                    )
+                    self._write_chart_chunk(cur, chunk_no, buf.getvalue())
                     changed += 1
                 con.commit()
             except Exception:
@@ -2098,13 +2121,6 @@ class Database:
     def _insert_new_song(self, root: pathlib.Path, cur) -> tuple[int | None, int]:
         """곡 zip을 넣고 (song_id, zip 크기)를 반환합니다. 패킷 한도를 넘으면 (None, 0)."""
         data = self.create_zip(root)
-        if not self._fits_packet(len(data)):
-            self.logger.error(
-                f"insert_song failed: song zip ({len(data)} bytes) exceeds "
-                f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
-            )
-            return None, 0
-
         cur.execute(
             "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
             (
@@ -2116,7 +2132,7 @@ class Database:
             ),
         )
         song_id = cur.lastrowid
-        self._insert_song_parts(cur, song_id, data)
+        self._put_song_data(cur, song_id, data)
         self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
         return song_id, len(data)
 
@@ -2131,14 +2147,12 @@ class Database:
         current = cur.fetchone()[0]
         return deleted + 1 if current is None or current < deleted else None
 
-    def _insert_song_parts(self, cur, song_id: int, data: bytes) -> None:
-        step = constant.BLOB_READ_SIZE
-        for seq, pos in enumerate(range(0, len(data), step)):
-            part = data[pos : pos + step]
-            cur.execute(
-                "INSERT INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)",
-                (song_id, seq, part),
-            )
+    def _put_song_data(self, cur, song_id: int, data: bytes) -> None:
+        """곡 zip을 저장소 파일로 쓰고 song.path를 그 파일로 바꿉니다. DB에 남은 옛 BLOB(song.data, song_part)은 지웁니다.
+        song 행의 size·sha256은 호출한 쪽이 맞춥니다."""
+        path = store.write(store.song_path(song_id, hashlib.sha256(data).hexdigest()), data)
+        cur.execute("UPDATE song SET path = %s, data = NULL WHERE id = %s", (path, song_id))
+        cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
 
     def _merge_into_song(self, root: pathlib.Path, song_id: int, cur) -> tuple[int, list[str], list[str]] | None:
         """새 폴더에서 기존 곡 zip에 없는 파일을 그 곡 zip에 더합니다(겹치는 차트로 같은 곡이라고 본 경우).
@@ -2179,19 +2193,11 @@ class Database:
             for arcname, content in new_files:
                 zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
         data = buf.getvalue()
-        if not self._fits_packet(len(data)):
-            self.logger.error(
-                f"insert_song failed: merged song zip ({len(data)} bytes) exceeds "
-                f"max_allowed_packet({self.max_allowed_packet})[{str(root)}]"
-            )
-            return None
-
         cur.execute(
-            "UPDATE song SET size = %s, sha256 = %s, files = %s, data = NULL WHERE id = %s",
+            "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = %s",
             (len(data), hashlib.sha256(data).hexdigest(), json.dumps(zip_entries(data)), song_id),
         )
-        cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
-        self._insert_song_parts(cur, song_id, data)
+        self._put_song_data(cur, song_id, data)
         added = sorted(arcname for arcname, _ in new_files)
         self.logger.info(f"insert_song: Merged {len(added)} files into song[{song_id}, {len(data)} bytes]")
         return len(data), added, conflicts
@@ -2367,8 +2373,7 @@ class Database:
             # 차트 청크 항목 이름은 sha256 + 확장자. 최근 청크부터 찾습니다.
             cur.execute("SELECT id FROM chart_chunk ORDER BY id DESC")
             for (chunk_no,) in cur.fetchall():
-                cur.execute("SELECT data FROM chart_chunk WHERE id = %s", (chunk_no,))
-                with zipfile.ZipFile(io.BytesIO(cur.fetchone()[0])) as zf:
+                with zipfile.ZipFile(io.BytesIO(self._chart_chunk_data(cur, chunk_no))) as zf:
                     for name in zf.namelist():
                         chart_id = name.split(".", 1)[0]
                         if chart_id in wanted:
@@ -2490,7 +2495,7 @@ class Database:
                         "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
                         (song_id, size, sha256, folder, json.dumps(zip_entries(data))),
                     )
-                    self._insert_song_parts(cur, song_id, data)
+                    self._put_song_data(cur, song_id, data)
                     for chart_id, chart_size, _ in charts:
                         cur.execute(
                             "UPDATE chart SET song_id = %s WHERE id = %s AND size = %s", (song_id, chart_id, chart_size)
@@ -2523,6 +2528,157 @@ class Database:
             row = cur.fetchone()
         return None if row is None else row[0]
 
+    def store_gc(self) -> int:
+        """아무 행도 가리키지 않는 저장소 파일(지운 곡, 바뀌기 전 판, 커밋하지 못한 파일·임시 파일)을 지웁니다. 지운 수를 반환합니다.
+        쓰기 잠금을 잡고 보므로 이 프로세스에서 커밋 전인 파일은 없고(잠금 밖에서 쓴 파일은 store.hold),
+        최근 STORE_GC_GRACE_SECONDS 안에 쓴 파일은 건드리지 않습니다. 받는 중인 다운로드는 열어 둔 파일로 끝까지 받습니다."""
+        candidates = store.files(store.cutoff())
+        if not candidates:
+            return 0
+        with self._write_lock, connect() as con, con.cursor() as cur:
+            used = set()
+            for table in STORE_TABLES:
+                cur.execute(f"SELECT path FROM {table} WHERE path IS NOT NULL")
+                used.update(row[0] for row in cur.fetchall())
+            held = store.held()
+            removed = store.remove(rel for rel in candidates if rel not in used and rel not in held)
+        if removed:
+            self.logger.info(f"store_gc: Removed {removed} unused files.")
+        return removed
+
+    def _blob_data(self, cur, table: str, row_id: int) -> bytes | None:
+        """아직 DB BLOB에 있는 곡 zip·청크의 내용."""
+        if table == "song":
+            return self._get_song_data_with_cur(cur, row_id)
+        if table == "chart_chunk":
+            return self._chart_chunk_data(cur, row_id)
+        cur.execute("SELECT data FROM pre_chunk_part WHERE chunk_id = %s ORDER BY seq", (row_id,))
+        return b"".join(row[0] for row in cur.fetchall())
+
+    def _move_to_store(self, table: str, row_id: int) -> bool:
+        """DB BLOB에 있는 행 하나를 저장소 파일로 옮깁니다. 옮겼으면 True, 그 사이 바뀌었거나 없어졌으면 False.
+        읽기와 파일 쓰기는 쓰기 잠금 밖에서 하고, 행을 파일로 바꾸고 BLOB을 지우는 것만 잠금 안에서 커밋합니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute(f"SELECT size, sha256 FROM {table} WHERE id = %s AND path IS NULL", (row_id,))
+            row = cur.fetchone()
+            if row is None:
+                return False
+            size, sha256 = row
+            data = self._blob_data(cur, table, row_id)
+        if data is None:
+            raise ValueError(f"{table} {row_id}: data not found")
+        if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
+            # 옮기기 전부터 깨진 데이터입니다. 받는 쪽이 지금과 같은 오류를 보도록 그대로 옮깁니다.
+            self.logger.warning(f"migrate_to_store: {table} {row_id} does not match its size/sha256. Moved as is.")
+        rel = {"song": store.song_path, "chart_chunk": store.chart_chunk_path, "pre_chunk": store.pre_chunk_path}[table](
+            row_id, sha256
+        )
+        with store.hold(rel):
+            store.write(rel, data)
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute(f"SELECT sha256 FROM {table} WHERE id = %s AND path IS NULL FOR UPDATE", (row_id,))
+                    row = cur.fetchone()
+                    if row is None or row[0] != sha256:
+                        con.rollback()
+                        return False
+                    cur.execute(f"UPDATE {table} SET path = %s WHERE id = %s", (rel, row_id))
+                    if table == "song":
+                        cur.execute("UPDATE song SET data = NULL WHERE id = %s", (row_id,))
+                        cur.execute("DELETE FROM song_part WHERE song_id = %s", (row_id,))
+                    elif table == "chart_chunk":
+                        cur.execute("UPDATE chart_chunk SET data = %s WHERE id = %s", (b"", row_id))
+                    else:
+                        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (row_id,))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        return True
+
+    def _wait_for_store_room(self, size: int, stop: threading.Event) -> bool:
+        """임포트가 쓰기 잠금을 잡고 있지 않고 저장소 디스크에 size + STORE_MIN_FREE_BYTES가 남을 때까지 기다립니다.
+        stop이 켜지면 False."""
+        warned = False
+        while not stop.is_set():
+            if self._write_lock.locked():
+                stop.wait(5)
+                continue
+            free = store.free_bytes()
+            if free >= size + constant.STORE_MIN_FREE_BYTES:
+                return True
+            if not warned:
+                self.logger.warning(
+                    f"migrate_to_store: Paused. {free} bytes free on the store disk; needs {size} + "
+                    f"EBMS_STORE_MIN_FREE({constant.STORE_MIN_FREE_BYTES}). Checking again every {constant.STORE_MIGRATE_WAIT}s."
+                )
+                warned = True
+            stop.wait(constant.STORE_MIGRATE_WAIT)
+        return False
+
+    def migrate_to_store(self, stop: threading.Event | None = None) -> int:
+        """DB BLOB에 남은 사전 청크·차트 청크·곡 zip을 저장소 파일로 하나씩 옮깁니다(#152). 옮긴 수를 반환합니다.
+
+        서버를 켠 채로 천천히 하도록 하나마다 일한 시간 x STORE_MIGRATE_REST_RATIO 만큼 쉬고, 임포트가 쓰기 잠금을
+        잡고 있으면 기다립니다. 작은 테이블부터 옮기고 테이블 하나를 다 옮기면 그 BLOB을 비워 디스크 공간을 돌려받습니다
+        (_reclaim_blob_space). 하나씩 커밋하므로 도중에 꺼져도 다음 시작 때 남은 것부터 이어서 합니다."""
+        stop = stop or threading.Event()
+        moved = 0
+        for table in STORE_TABLES:
+            with connect() as con, con.cursor() as cur:
+                cur.execute(f"SELECT id, size FROM {table} WHERE path IS NULL ORDER BY id")
+                pending = cur.fetchall()
+            if pending:
+                total = sum(size for _, size in pending)
+                self.logger.info(f"migrate_to_store: Moving {len(pending)} {table} rows ({total} bytes) to the store.")
+            progress = _Progress(self.logger, f"migrate_to_store({table})", len(pending))
+            failed = 0
+            for n, (row_id, size) in enumerate(pending, 1):
+                if not self._wait_for_store_room(size, stop):
+                    return moved
+                started = time.monotonic()
+                try:
+                    moved += self._move_to_store(table, row_id)
+                except Exception:
+                    failed += 1
+                    self.logger.exception(f"migrate_to_store: Skipped {table} {row_id}")
+                progress.update(n)
+                stop.wait(max(constant.STORE_MIGRATE_REST_MIN, (time.monotonic() - started) * constant.STORE_MIGRATE_REST_RATIO))
+            if failed:
+                self.logger.warning(f"migrate_to_store: {failed} {table} rows were not moved. Retrying on next start.")
+                continue
+            try:
+                self._reclaim_blob_space(table)
+            except Exception:
+                self.logger.exception(f"migrate_to_store: Failed to reclaim space of {table}")
+        return moved
+
+    def _reclaim_blob_space(self, table: str) -> None:
+        """table의 모든 행이 저장소 파일로 옮겨졌으면 BLOB이 쓰던 InnoDB 공간을 디스크에 돌려줍니다(테이블마다 한 번).
+        조각 테이블(pre_chunk_part, song_part)은 TRUNCATE로 바로 비우고, 행이 남는 테이블(chart_chunk, song)은
+        BLOB을 비운 뒤라 남은 작은 행만 복사하는 OPTIMIZE로 줄입니다."""
+        with self._write_lock, connect() as con, con.cursor() as cur:
+            done = set(filter(None, (self._setting(cur, STORE_RECLAIMED_SETTING) or "").split(",")))
+            if table in done:
+                return
+            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE path IS NULL")
+            if cur.fetchone()[0]:
+                return
+            con.commit()
+            self.logger.info(f"migrate_to_store: Reclaiming disk space of {table} BLOBs.")
+            if table == "pre_chunk":
+                cur.execute("TRUNCATE TABLE pre_chunk_part")
+            elif table == "chart_chunk":
+                cur.execute("OPTIMIZE TABLE chart_chunk")
+                cur.fetchall()
+            else:
+                cur.execute("TRUNCATE TABLE song_part")
+                cur.execute("OPTIMIZE TABLE song")
+                cur.fetchall()
+            self._set_setting(cur, STORE_RECLAIMED_SETTING, ",".join(sorted(done | {table})))
+            con.commit()
+        self.logger.info(f"migrate_to_store: Reclaimed disk space of {table} BLOBs.")
+
     def open_blob(self, table: str, row_id: int) -> BlobReader | None:
         """song / chart_chunk / pre_chunk 테이블의 BLOB 메타데이터를 단기 연결로 조회해 BlobReader를 반환합니다.
 
@@ -2533,18 +2689,20 @@ class Database:
         """
         if table not in ("song", "chart_chunk", "pre_chunk"):
             raise ValueError(table)
-        with connect() as con, con.cursor() as cur:
-            if table == "song":
-                cur.execute("SELECT size, sha256 FROM song WHERE id = %s", (row_id,))
-            elif table == "chart_chunk":
+        # 파일을 여는 사이에 새 판으로 바뀌어 옛 파일이 지워졌으면 한 번 더 조회합니다.
+        for attempt in range(2):
+            with connect() as con, con.cursor() as cur:
                 # LENGTH(data)는 InnoDB가 BLOB 전체를 읽어야 하므로 저장해 둔 size를 씁니다.
-                cur.execute("SELECT size, sha256 FROM chart_chunk WHERE id = %s", (row_id,))
-            elif table == "pre_chunk":
-                cur.execute("SELECT size, sha256 FROM pre_chunk WHERE id = %s", (row_id,))
-            row = cur.fetchone()
-        if row is None:
-            return None
-        return BlobReader(table, row_id, row[0], row[1])
+                cur.execute(f"SELECT size, sha256, path FROM {table} WHERE id = %s", (row_id,))
+                row = cur.fetchone()
+            if row is None:
+                return None
+            try:
+                return BlobReader(table, row_id, row[0], row[1], row[2])
+            except FileNotFoundError:
+                if attempt:
+                    raise
+        return None
 
 
 class SongBatch:

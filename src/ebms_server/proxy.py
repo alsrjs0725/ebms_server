@@ -112,6 +112,8 @@ def authorize(request: Request) -> Response:
             download_log.record(user.id, row_id, download_log.failure_result(status, detail))
             return _deny(status, detail)
         return _deny(404, "File not found")
+    # 권한만 묻는 요청이라 열어 둔 파일은 바로 닫습니다.
+    blob.close()
     etag = f'"{blob.sha256}"'
     headers = {"X-Ebms-Sha256": blob.sha256, "X-Ebms-Limit-Rate": "0", "X-Ebms-User": user.id}
 

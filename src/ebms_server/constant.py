@@ -34,6 +34,20 @@ def parse_size(text: str) -> int:
 # 0이면 끄고 모두 var/ 아래를 씁니다. 한도를 넘는 업로드·묶음은 var/(HDD)에 둡니다.
 CACHE_DIR = pathlib.Path(os.environ.get("EBMS_CACHE_DIR", BASE_DIR / "cache"))
 CACHE_MAX_BYTES = parse_size(os.environ.get("EBMS_CACHE_MAX_BYTES", "0"))
+# 곡 zip·차트 청크·사전 청크 파일을 두는 폴더(store.py, #152). DB에는 경로·크기·sha256만 둡니다.
+STORE_DIR = pathlib.Path(os.environ.get("EBMS_STORE_DIR", BASE_DIR / "var" / "store"))
+# 아무 행도 가리키지 않는 저장소 파일을 지우는 주기(시간)와, 지우지 않고 두는 최근 파일의 나이(초).
+# gc는 쓰기 잠금을 잡고 보므로 이 프로세스의 커밋 전 파일은 따로 지키고, 나이 기준은 다른 프로세스(migrate 스크립트)를 위한 여유입니다.
+STORE_GC_HOURS = float(os.environ.get("EBMS_STORE_GC_HOURS", "1"))
+STORE_GC_GRACE_SECONDS = 600
+# DB BLOB에 남은 기존 데이터를 저장소 파일로 옮기는 백그라운드 작업(Database.migrate_to_store).
+# 한 곡(청크)씩 옮기고 일한 시간 x STORE_MIGRATE_REST_RATIO 만큼 쉬어 디스크를 서비스에 양보합니다(3이면 약 25%).
+STORE_MIGRATE_ENABLED = os.environ.get("EBMS_STORE_MIGRATE", "1") not in ("0", "false", "no", "")
+STORE_MIGRATE_REST_RATIO = float(os.environ.get("EBMS_STORE_MIGRATE_REST_RATIO", "3"))
+STORE_MIGRATE_REST_MIN = 0.2
+# 저장소 디스크의 남은 공간이 옮길 크기 + 이 값보다 작으면 마이그레이션을 멈추고 STORE_MIGRATE_WAIT초 뒤 다시 봅니다.
+STORE_MIN_FREE_BYTES = parse_size(os.environ.get("EBMS_STORE_MIN_FREE", "20G"))
+STORE_MIGRATE_WAIT = 600
 # HTTP 접근 로그(var/log/access.log, 접속 IP·경로)를 날마다 돌려 남기는 일수. 처리방침의 보유기간과 맞춥니다.
 ACCESS_LOG_DAYS = 30
 # 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.

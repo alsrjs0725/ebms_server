@@ -4,13 +4,14 @@ import hashlib
 import io
 import json
 import os
+import threading
 import zipfile
 
 import pymysql
 import pytest
 from fastapi.testclient import TestClient
 
-from ebms_server import constant, db as db_module
+from ebms_server import constant, db as db_module, store
 from ebms_server.db import Database
 
 from test_auth import oauth
@@ -117,16 +118,6 @@ def test_chunk_rollover(tmp_path, client, monkeypatch):
 def test_not_found(client):
     assert client.get("/api/play/song/99").status_code == 404
     assert client.get("/api/pre/chart/99").status_code == 404
-
-
-def test_song_too_large_is_skipped(tmp_path, database, monkeypatch):
-    monkeypatch.setattr(database, "max_allowed_packet", constant.PACKET_OVERHEAD + 10)
-    song = make_song(tmp_path, "big", {"a.bms": b"#X"})
-    database.insert_song(song, remove=True)
-    assert song.exists()  # 실패 시 원본은 지우지 않습니다.
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM song")
-        assert cur.fetchone()[0] == 0
 
 
 def test_same_chart_name_in_different_songs(tmp_path, client):
@@ -291,42 +282,155 @@ def test_add_missing_columns(database):
         assert cur.fetchall() == ()
 
 
-def test_song_part_chunking_and_migration(tmp_path, client, database):
+def to_legacy(table, row_id):
+    """저장소로 옮기기 전(DB BLOB) 행으로 되돌립니다. 저장소 파일은 지웁니다."""
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(f"SELECT path FROM {table} WHERE id = %s", (row_id,))
+        rel = cur.fetchone()[0]
+        data = store.read(rel)
+        step = constant.BLOB_READ_SIZE
+        if table == "song":
+            for seq, pos in enumerate(range(0, len(data), step)):
+                cur.execute("INSERT INTO song_part (song_id, seq, data) VALUES (%s, %s, %s)", (row_id, seq, data[pos : pos + step]))
+        elif table == "chart_chunk":
+            cur.execute("UPDATE chart_chunk SET data = %s WHERE id = %s", (data, row_id))
+        else:
+            for seq, pos in enumerate(range(0, len(data), step)):
+                cur.execute("INSERT INTO pre_chunk_part (chunk_id, seq, data) VALUES (%s, %s, %s)", (row_id, seq, data[pos : pos + step]))
+        cur.execute(f"UPDATE {table} SET path = NULL WHERE id = %s", (row_id,))
+        con.commit()
+    store.full_path(rel).unlink()
+    return data
+
+
+def count(sql):
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetchone()[0]
+
+
+def test_song_is_stored_as_file(tmp_path, client, database):
     song = make_song(tmp_path, "s_part", {"a.bms": b"#TITLE\n#BANNER banner.bmp\n", "banner.bmp": os.urandom(2000)})
     database.insert_song(song)
-
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT data FROM song WHERE id = 1")
-        song_data = cur.fetchone()[0]
-        assert song_data is None  # song.data should be NULL
+        cur.execute("SELECT data, path, sha256 FROM song WHERE id = 1")
+        data, rel, sha256 = cur.fetchone()
+    assert data is None
+    assert rel == store.song_path(1, sha256)
+    assert hashlib.sha256(store.read(rel)).hexdigest() == sha256
+    assert count("SELECT COUNT(*) FROM song_part") == 0
+    assert count("SELECT COUNT(*) FROM pre_chunk_part") == 0
+    assert count("SELECT COUNT(*) FROM chart_chunk WHERE path IS NULL") == 0
 
-        cur.execute("SELECT COUNT(*) FROM song_part WHERE song_id = 1")
-        part_count = cur.fetchone()[0]
-        assert part_count > 0  # Parts exist in song_part
-
-    # Test downloading pre-file using data_offset
     res = client.get("/api/pre/song/1/file?path=banner.bmp")
-    assert res.status_code == 200
-    assert len(res.content) == 2000
+    assert res.status_code == 200 and len(res.content) == 2000
+    res = client.get("/api/play/song/1", headers={"Range": "bytes=10-19"})
+    assert res.status_code == 206 and res.content == store.read(rel)[10:20]
 
-    # Test migration of old song.data row to song_part
-    raw_zip = database.get_song_data(1)
+
+def test_migrate_to_store(tmp_path, client, database, monkeypatch):
+    """DB BLOB에 남은 곡·청크를 저장소 파일로 옮기고, 다 옮긴 테이블의 BLOB을 비웁니다."""
+    monkeypatch.setattr(constant, "STORE_MIGRATE_REST_MIN", 0)
+    monkeypatch.setattr(constant, "STORE_MIN_FREE_BYTES", 0)
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n#BANNER b.bmp\n", "b.bmp": os.urandom(3000)}))
+    database.insert_song(make_song(tmp_path, "s2", {"b.bms": b"#TITLE B\n"}))
+    raw = {1: to_legacy("song", 1), 2: to_legacy("song", 2)}
+    chart = to_legacy("chart_chunk", 0)
+    pre = to_legacy("pre_chunk", 0)
+    # 아주 오래된 song.data 행
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("DELETE FROM song_part WHERE song_id = 1")
-        cur.execute("UPDATE song SET data = %s WHERE id = 1", (raw_zip,))
+        cur.execute("DELETE FROM song_part WHERE song_id = 2")
+        cur.execute("UPDATE song SET data = %s WHERE id = 2", (raw[2],))
         con.commit()
 
-    database.backfill_manifest()
+    # 옮기기 전에도 DB BLOB에서 받습니다.
+    assert client.get("/api/play/song/1").content == raw[1]
+    assert client.get("/api/play/song/2").content == raw[2]
+    assert client.get("/api/pre/chart/0").content == chart
+    assert client.get("/api/pre/asset/0").content == pre
+    assert database.get_chart_chunk_data(0) == chart
 
+    assert database.migrate_to_store() == 4
+    for table in ("song", "chart_chunk", "pre_chunk"):
+        assert count(f"SELECT COUNT(*) FROM {table} WHERE path IS NULL") == 0
+    assert count("SELECT COUNT(*) FROM song_part") == 0
+    assert count("SELECT COUNT(*) FROM pre_chunk_part") == 0
+    assert count("SELECT COUNT(*) FROM song WHERE data IS NOT NULL") == 0
+    assert count("SELECT LENGTH(data) FROM chart_chunk WHERE id = 0") == 0
+    assert setting(db_module.STORE_RECLAIMED_SETTING) == "chart_chunk,pre_chunk,song"
+    assert client.get("/api/play/song/1").content == raw[1]
+    assert client.get("/api/play/song/2").content == raw[2]
+    assert client.get("/api/pre/chart/0").content == chart
+    assert client.get("/api/pre/asset/0").content == pre
+    # 다시 돌려도 할 일이 없습니다.
+    assert database.migrate_to_store() == 0
+
+
+def setting(name):
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT data FROM song WHERE id = 1")
-        assert cur.fetchone()[0] is None
-        cur.execute("SELECT COUNT(*) FROM song_part WHERE song_id = 1")
-        assert cur.fetchone()[0] == part_count
+        cur.execute("SELECT value FROM setting WHERE name = %s", (name,))
+        row = cur.fetchone()
+    return row[0] if row else None
 
-    res_play = client.get("/api/play/song/1")
-    assert res_play.status_code == 200
-    assert res_play.content == raw_zip
+
+def test_migrate_to_store_waits_for_disk_space(tmp_path, database, monkeypatch):
+    """저장소 디스크가 모자라면 옮기지 않고 기다립니다(stop으로 멈춤)."""
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))
+    to_legacy("song", 1)
+    monkeypatch.setattr(constant, "STORE_MIN_FREE_BYTES", 10 ** 18)
+    stop = threading.Event()
+    monkeypatch.setattr(constant, "STORE_MIGRATE_WAIT", 0)
+    calls = []
+
+    def free_bytes():
+        calls.append(1)
+        if len(calls) >= 3:
+            stop.set()
+        return 0
+
+    monkeypatch.setattr(store, "free_bytes", free_bytes)
+    assert database.migrate_to_store(stop) == 0
+    assert count("SELECT COUNT(*) FROM song WHERE path IS NULL") == 1
+    assert count("SELECT COUNT(*) FROM song_part") > 0
+
+
+def test_store_gc(tmp_path, database, monkeypatch):
+    """아무 행도 가리키지 않는 파일(바뀌기 전 판, 지운 곡, 임시 파일)만 지웁니다. 최근 파일·hold한 파일은 둡니다."""
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))
+    database.insert_song(make_song(tmp_path, "s2", {"b.bms": b"#TITLE B\n"}))
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT path FROM song ORDER BY id")
+        used = [row[0] for row in cur.fetchall()]
+    old = store.write(store.song_path(1, "0" * 64), b"old")
+    held = store.write(store.song_path(2, "1" * 64), b"held")
+    (store.full_path(old).parent / f"x{store.TMP_MARK}abc").write_bytes(b"tmp")
+
+    # 방금 쓴 파일은 지우지 않습니다.
+    assert database.store_gc() == 0
+    monkeypatch.setattr(constant, "STORE_GC_GRACE_SECONDS", -10)
+    with store.hold(held):
+        # old, 임시 파일, 두 번째 곡을 넣을 때 바뀐 차트 청크의 옛 판
+        assert database.store_gc() == 3
+        assert store.full_path(held).exists()
+    assert not store.full_path(old).exists()
+    assert not list(store.full_path(old).parent.glob(f"*{store.TMP_MARK}*"))
+    with db_module.connect() as con, con.cursor() as cur:
+        for table in ("song", "chart_chunk", "pre_chunk"):
+            cur.execute(f"SELECT path FROM {table}")
+            used += [row[0] for row in cur.fetchall()]
+    assert all(store.full_path(rel).exists() for rel in used)
+    assert database.store_gc() == 1
+    assert not store.full_path(held).exists()
+
+
+def test_open_blob_keeps_reading_replaced_file(tmp_path, database, monkeypatch):
+    """받는 중에 새 판으로 바뀌어 옛 파일이 지워져도 열어 둔 파일로 끝까지 읽습니다."""
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))
+    blob = database.open_blob("song", 1)
+    data = store.read(blob.path)
+    store.full_path(blob.path).unlink()
+    assert b"".join(blob.iter_range(0, blob.size - 1)) == data
+    blob.close()
 
 
 def test_backfill_manifest_skips_broken_song(tmp_path, database, monkeypatch, caplog):
@@ -337,7 +441,8 @@ def test_backfill_manifest_skips_broken_song(tmp_path, database, monkeypatch, ca
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("UPDATE song SET files = NULL")
         cur.execute("UPDATE chart SET filename = ''")
-        cur.execute("UPDATE song_part SET data = %s WHERE song_id = 2", (b"broken" * 10,))
+        cur.execute("SELECT path FROM song WHERE id = 2")
+        store.full_path(cur.fetchone()[0]).write_bytes(b"broken" * 10)
         con.commit()
 
     Database._instance = None
@@ -368,12 +473,10 @@ def test_blob_reader_does_not_hold_db_connection(tmp_path, client, database):
 
 
 def test_chart_chunk_range_reads_blob_once(tmp_path, client, database, monkeypatch):
-    """차트 청크는 범위를 한 번에 읽어 BLOB_READ_SIZE 조각으로 나눠 보냅니다."""
+    """옮기기 전 차트 청크는 범위를 한 번에 읽어 BLOB_READ_SIZE 조각으로 나눠 보냅니다."""
     monkeypatch.setattr(constant, "BLOB_READ_SIZE", 7)
     Database().insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE " + os.urandom(100).hex().encode()}))
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT data FROM chart_chunk WHERE id = 0")
-        data = cur.fetchone()[0]
+    data = to_legacy("chart_chunk", 0)
     blob = Database().open_blob("chart_chunk", 0)
     assert blob.size == len(data)
 

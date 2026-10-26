@@ -247,8 +247,8 @@ def test_import_tmp_skips_symlinks(client, monkeypatch, tmp_path):
     with zipfile.ZipFile(io.BytesIO(db_module.Database().get_song_data(1))) as zf:
         assert sorted(zf.namelist()) == ["a.bms", "real.wav"]
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT data FROM chart_chunk")
-        assert all(secret not in row[0] for row in cur.fetchall())
+        cur.execute("SELECT id FROM chart_chunk")
+        assert all(secret not in db_module.Database().get_chart_chunk_data(row[0]) for row in cur.fetchall())
         cur.execute("SELECT COUNT(*) FROM chart")
         assert cur.fetchone()[0] == 1
     # 링크 대상은 지우지 않습니다.

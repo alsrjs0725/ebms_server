@@ -53,7 +53,8 @@ def rows(sql):
 
 def chunk_names():
     names = []
-    for (data,) in rows("SELECT data FROM chart_chunk ORDER BY id"):
+    for (chunk_id,) in rows("SELECT id FROM chart_chunk ORDER BY id"):
+        data = Database().get_chart_chunk_data(chunk_id)
         names += zipfile.ZipFile(io.BytesIO(data)).namelist()
     return names
 
@@ -254,14 +255,3 @@ def test_overlapping_chart_within_same_batch(database, tmp_path):
     assert {f["path"] for f in manifest_entry(1)["files"]} == {"a.bms", "x.wav", "y.wav"}
 
 
-def test_merge_too_large_is_skipped(database, monkeypatch):
-    a = b"#TITLE A\n"
-    put_song(constant.TMP_DIR / "g" / "s1", {"a.bms": a})
-    importer.import_tmp()
-    before = song_zip(1)
-    monkeypatch.setattr(database, "max_allowed_packet", constant.PACKET_OVERHEAD + len(Database().get_song_data(1)) + 100)
-    pkg = put_song(constant.TMP_DIR / "g" / "big", {"a.bms": a, "big.wav": os.urandom(10_000)})
-    songs = importer.import_tmp()
-    assert songs[0]["error"]
-    assert song_zip(1) == before
-    assert pkg.exists()

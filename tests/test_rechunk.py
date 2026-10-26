@@ -25,8 +25,8 @@ def import_pack(tmp_path, n, prefix):
 
 def chunk_sizes():
     return {
-        chunk_id: len(zipfile.ZipFile(io.BytesIO(data)).namelist())
-        for chunk_id, data in rows("SELECT id, data FROM chart_chunk ORDER BY id")
+        chunk_id: len(zipfile.ZipFile(io.BytesIO(db_module.Database().get_chart_chunk_data(chunk_id))).namelist())
+        for (chunk_id,) in rows("SELECT id FROM chart_chunk ORDER BY id")
     }
 
 
@@ -61,8 +61,8 @@ def test_rechunk_charts(database, tmp_path, monkeypatch):
     assert setting(db_module.CHART_CHUNK_SETTING) == "3"
     assert setting(db_module.CHART_RECHUNK_SETTING) is None
     # md5도 함께 채웁니다.
-    for (data,) in rows("SELECT data FROM chart_chunk"):
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+    for (chunk_id,) in rows("SELECT id FROM chart_chunk"):
+        with zipfile.ZipFile(io.BytesIO(db_module.Database().get_chart_chunk_data(chunk_id))) as zf:
             for info in zf.infolist():
                 sha256 = info.filename.rsplit(".", 1)[0]
                 [(md5,)] = rows(f"SELECT md5 FROM chart WHERE id = '{sha256}'")
@@ -122,8 +122,6 @@ def test_pre_chunks_rebuilt_when_size_changes(database, tmp_path, monkeypatch):
     assert database.backfill_pre_chunks() == 1
     assert [r[0] for r in rows("SELECT id FROM pre_chunk ORDER BY id")] == [0]
     assert setting(db_module.PRE_CHUNK_SETTING) == "32"
-    # 옛 번호(1, 2)의 조각은 지웁니다.
-    assert {r[0] for r in rows("SELECT DISTINCT chunk_id FROM pre_chunk_part")} == {0}
     blob = database.open_blob("pre_chunk", 0)
     data = b"".join(blob.iter_range(0, blob.size - 1))
     blob.close()
