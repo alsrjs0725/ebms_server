@@ -210,12 +210,14 @@ SCHEMA = [
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 티켓을 쓴 곡. expires_at 전에는 같은 곡을 다시 받아도 차감하지 않습니다.
+    # bytes_used는 이 티켓으로 받은 바이트 합계이고, 곡 크기 × quota.PLAYS_PER_TICKET를 넘으면 티켓을 다시 씁니다.
     """
         CREATE TABLE IF NOT EXISTS download_grant(
             user_id CHAR(36) NOT NULL,
             song_id INT UNSIGNED NOT NULL,
             charged_at BIGINT UNSIGNED NOT NULL,
             expires_at BIGINT UNSIGNED NOT NULL,
+            bytes_used BIGINT UNSIGNED NOT NULL DEFAULT 0,
 
             PRIMARY KEY (user_id, song_id),
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
@@ -391,6 +393,8 @@ MISSING_COLUMNS = [
     ("song", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("chart_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("pre_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    # 티켓 하나로 받은 바이트(#35). 이전 행은 0부터 셉니다.
+    ("download_grant", "bytes_used", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
 ]
 # 이전 버전에서 만든 테이블에 없는 인덱스 (테이블, 인덱스 이름, 컬럼)
 MISSING_INDEXES = [

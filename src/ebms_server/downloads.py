@@ -1,12 +1,13 @@
 """다운로드 API. 사전(/api/pre/*)과 플레이(/api/play/*) 두 갈래로, 둘 다 로그인이 필요합니다.
 
 - 사전: 차트 청크, 매니페스트, 사전 청크(곡들의 배너·스테이지파일·프리뷰 등 묶음), 곡의 사전 파일 하나. 이번 달 사용량에 더하고 한도를 넘으면 감속.
-- 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안 같은 곡은 재차감 없음), 티켓이 없으면 429.
+- 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안, 곡 크기 × 3 바이트까지 같은 곡은 재차감 없음), 티켓이 없으면 429.
 
 캐싱 리버스 프록시(proxy.py) 뒤에서는 차트 청크·사전 청크·곡 zip의 인증·차감을 /api/proxy/authz가 하고,
 이 경로들은 프록시의 캐시 채우기 요청(사용자 없음)에 본문만 내려줍니다.
 """
 import gzip
+import logging
 import mimetypes
 import queue
 import re
@@ -19,6 +20,7 @@ from typing import Annotated
 
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
@@ -81,12 +83,13 @@ class ReleasingStreamingResponse(StreamingResponse):
 
     Starlette는 본문을 시작하기 전에 연결이 끊기면 본문 이터레이터를 한 번도 돌리지 않아
     제너레이터의 finally에 맡긴 정리가 실행되지 않습니다. 그래서 정리를 응답 수명에 묶습니다.
-    on_close는 멱등이어야 합니다(본문 쪽 finally에서도 부를 수 있음).
+    on_close는 멱등이어야 합니다(본문 쪽 finally에서도 부를 수 있음). on_finish는 본문까지 닫은 뒤 한 번 기다립니다.
     """
 
-    def __init__(self, content, *, on_close: Callable[[], None], **kwargs):
+    def __init__(self, content, *, on_close: Callable[[], None], on_finish=None, **kwargs):
         super().__init__(content, **kwargs)
         self._on_close = on_close
+        self._on_finish = on_finish
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -96,10 +99,14 @@ class ReleasingStreamingResponse(StreamingResponse):
                 self._on_close()
             finally:
                 # 중간에 멈춘 본문(사용량 기록 등)을 바로 마무리합니다. 취소 중이어도 끝까지 닫습니다.
-                aclose = getattr(self.body_iterator, "aclose", None)
-                if aclose is not None:
-                    with anyio.CancelScope(shield=True):
-                        await aclose()
+                with anyio.CancelScope(shield=True):
+                    try:
+                        aclose = getattr(self.body_iterator, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
+                    finally:
+                        if self._on_finish is not None:
+                            await self._on_finish()
 
 
 class ReadAhead:
@@ -194,14 +201,15 @@ def blob_response(
     detail: str,
     *,
     user_id: str | None = None,
-    before_send: Callable[[], None] | None = None,
+    before_send: Callable[[int, int], Callable[[int], None] | None] | None = None,
     meter_user: str | None = None,
     expect_sha256: str | None = None,
 ) -> Response:
     """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다.
 
     user_id: 동시 다운로드 수를 제한할 사용자 ID.
-    before_send: 본문(200/206)을 보내기로 정한 뒤 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
+    before_send: 본문(200/206)을 보내기로 정한 뒤 (보낼 바이트 수, 전체 크기)로 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
+        함수를 돌려주면 응답이 끝날 때 보내지 못한 바이트 수로 부릅니다(0이면 부르지 않음).
     meter_user: 주면 보낸 바이트를 그 사용자의 사전 다운로드 사용량에 더하고 한도를 넘으면 감속합니다.
     expect_sha256: 주면 내용의 sha256이 다를 때 409를 냅니다(프록시가 옛 키로 새 내용을 캐시하지 않도록).
     """
@@ -244,13 +252,6 @@ def blob_response(
                     headers={**headers, "Content-Range": f"bytes */{blob.size}"},
                 )
 
-        if before_send is not None:
-            try:
-                before_send()
-            except BaseException:
-                blob.close()
-                raise
-
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         if rng is None:
             start, end, status = 0, blob.size - 1, 200
@@ -259,6 +260,14 @@ def blob_response(
             status = 206
             headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
         headers["Content-Length"] = str(end - start + 1)
+
+        settle = None
+        if before_send is not None:
+            try:
+                settle = before_send(end - start + 1, blob.size)
+            except BaseException:
+                blob.close()
+                raise
         gen = ReadAhead(blob.iter_range(start, end))
 
         @_once
@@ -270,6 +279,9 @@ def blob_response(
                 blob.close()
                 release()
 
+        # 보내지 못한 바이트. 본문을 시작하기 전에 끊겨도 응답이 끝날 때 settle에 넘깁니다.
+        unsent = [end - start + 1]
+
         if meter_user is not None:
             body = quota.metered(meter_user, gen, close=cleanup)
         else:
@@ -277,12 +289,20 @@ def blob_response(
                 try:
                     while (chunk := await quota.next_download_chunk(gen)) is not None:
                         yield chunk
+                        unsent[0] -= len(chunk)
                 finally:
                     cleanup()
             body = wrapped_body()
 
+        async def finish():
+            if settle is not None and unsent[0] > 0:
+                try:
+                    await run_in_threadpool(settle, unsent[0])
+                except Exception:
+                    logging.getLogger(__name__).exception(f"settle failed: {unsent[0]} bytes")
+
         return ReleasingStreamingResponse(
-            body, on_close=cleanup, status_code=status, media_type="application/zip", headers=headers
+            body, on_close=cleanup, on_finish=finish, status_code=status, media_type="application/zip", headers=headers
         )
     except BaseException:
         release()
@@ -479,15 +499,17 @@ def play_song(song_id: int, request: Request, user: Annotated[User | None, Depen
 
     resumed = download_log.is_resume(request)
 
-    def charge() -> None:
+    def charge(nbytes: int, size: int):
         try:
-            charged = quota.charge_play(user.id, song_id)
+            charged = quota.charge_play(user.id, song_id, nbytes, size)
         except quota.NoTicket as e:
             download_log.record(user.id, song_id, "no_ticket", resumed)
             raise HTTPException(
                 status_code=429, detail="no download ticket", headers={"Retry-After": str(e.retry_after)}
             )
         download_log.record(user.id, song_id, "charged" if charged else "free", resumed)
+        # 끊겨서 받지 못한 만큼은 티켓의 받은 바이트에서 뺍니다.
+        return lambda unsent: quota.refund_play(user.id, song_id, unsent)
 
     try:
         return blob_response(
