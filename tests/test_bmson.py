@@ -44,10 +44,10 @@ def chart_rows():
 
 def chunk_names():
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT data FROM chart_chunk ORDER BY id")
+        cur.execute("SELECT id FROM chart_chunk ORDER BY id")
         names = []
-        for (data,) in cur.fetchall():
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for (chunk_id,) in cur.fetchall():
+            with zipfile.ZipFile(io.BytesIO(db_module.Database().get_chart_chunk_data(chunk_id))) as zf:
                 names += zf.namelist()
         return sorted(names)
 

@@ -85,7 +85,7 @@ def test_delete_song(client, monkeypatch):
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM chart_chunk")
         chunks = cur.fetchone()[0]
-        cur.execute("SELECT LENGTH(data) FROM chart_chunk ORDER BY id DESC LIMIT 1")
+        cur.execute("SELECT size FROM chart_chunk ORDER BY id DESC LIMIT 1")
         chunk_size = cur.fetchone()[0]
 
     r = client.request("DELETE", "/api/admin/songs/1", json={"reason": "  저작권 요청  "})
@@ -104,7 +104,7 @@ def test_delete_song(client, monkeypatch):
         assert cur.fetchone()[0] is None
         cur.execute("SELECT COUNT(*) FROM chart_chunk")
         assert cur.fetchone()[0] == chunks
-        cur.execute("SELECT LENGTH(data) FROM chart_chunk ORDER BY id DESC LIMIT 1")
+        cur.execute("SELECT size FROM chart_chunk ORDER BY id DESC LIMIT 1")
         assert cur.fetchone()[0] == chunk_size
     assert [s["song_id"] for s in manifest_songs()] == [2]
 
@@ -188,8 +188,7 @@ def test_unuse_chart_missing_from_song_zip(client, monkeypatch):
             "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = 1",
             (len(data), hashlib.sha256(data).hexdigest(), json.dumps(db_module.zip_entries(data))),
         )
-        cur.execute("DELETE FROM song_part WHERE song_id = 1")
-        database._insert_song_parts(cur, 1, data)
+        database._put_song_data(cur, 1, data)
         con.commit()
     sha_a = hashlib.sha256(b"#TITLE A\n").hexdigest()
 

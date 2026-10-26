@@ -1,9 +1,10 @@
 """곡 임포트. 폴더 트리에서 차트 파일이 있는 폴더를 곡 하나로 보고 DB에 등록합니다.
 
 - 관리자 페이지의 "var/tmp 가져오기"는(서버 시작 시에는 하지 않음) `var/tmp/`의 곡 폴더와 zip·rar를 대기 묶음(staging.py)으로 옮깁니다.
-- 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 `var/import/`에 이어 붙이고(프록시의 요청 크기 제한을 피함),
-  다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다. 관리자가 검토하고 commit하면 그때 등록합니다.
-  받는 중인 업로드는 `{id}.json`에 이름·크기를 적어 두므로 서버를 다시 시작해도 받은 곳부터 이어 받습니다.
+- 관리자 페이지는 zip(또는 rar 분할 압축의 볼륨들)을 조각으로 나눠 여러 개를 동시에 `var/import/`의 제자리(offset)에 쓰고
+  (프록시의 요청 크기 제한을 피하고 왕복 대기를 겹침), 다 받으면 백그라운드 작업으로 곡을 대기 묶음에 풉니다.
+  관리자가 검토하고 commit하면 그때 등록합니다.
+  받는 중인 업로드는 `{id}.json`에 이름·크기·받은 구간을 적어 두므로 서버를 다시 시작해도 받은 구간은 다시 받지 않습니다.
   임포트 캐시(cache.py)에 자리가 있으면 `var/import/` 대신 `cache/import/`에 받습니다.
   작업 상태는 메모리에만 두고, 풀거나 commit하던 묶음은 서버를 다시 시작하면 staging.recover가 이어서 합니다.
 - import_tree·import_tmp·import_zip은 검토 없이 바로 등록합니다(스크립트·테스트용).
@@ -322,10 +323,39 @@ def start_upload(filename: str, size: int) -> dict:
             raise UploadError(507, f"서버 디스크 공간이 부족합니다(남은 공간 {free / 1024 ** 3:.1f}GB, 필요 {(size + DISK_MARGIN) / 1024 ** 3:.1f}GB).")
     path.touch()
     meta = path.parent / f"{upload_id}.json"
-    meta.write_text(json.dumps({"filename": filename, "size": size}, ensure_ascii=False), "utf-8")
+    upload = {"filename": filename, "size": size, "path": path, "meta": meta, "ranges": []}
+    _save_meta(upload)
     with _lock:
-        _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta}
+        _uploads[upload_id] = upload
     return {"id": upload_id, "received": 0, "size": size}
+
+
+def _save_meta(upload: dict) -> None:
+    """이름·크기·받은 구간을 `{id}.json`에 씁니다(임시 파일로 써서 바꿈)."""
+    meta = upload["meta"]
+    tmp = meta.with_name(meta.name + ".tmp")
+    tmp.write_text(
+        json.dumps(
+            {"filename": upload["filename"], "size": upload["size"], "ranges": upload["ranges"]}, ensure_ascii=False
+        ),
+        "utf-8",
+    )
+    os.replace(tmp, meta)
+
+
+def _merge_range(ranges: list[list[int]], start: int, end: int) -> list[list[int]]:
+    """정렬된 [start, end) 구간 목록에 구간을 더해 겹치거나 맞닿은 구간을 합칩니다."""
+    out: list[list[int]] = []
+    for a, b in sorted([*ranges, [start, end]]):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _received(upload: dict) -> int:
+    return sum(b - a for a, b in upload["ranges"])
 
 
 def _upload(upload_id: str) -> dict:
@@ -378,12 +408,17 @@ def _recover_uploads(root: pathlib.Path) -> None:
         try:
             info = json.loads(meta.read_text("utf-8"))
             filename, size = str(info["filename"]), int(info["size"])
+            ranges = info.get("ranges")
+            if ranges is None:
+                # 구간을 적지 않던 이전 버전은 앞에서부터 이어 붙였습니다.
+                ranges = [[0, path.stat().st_size]] if path.is_file() and path.stat().st_size else []
+            ranges = [[int(a), int(b)] for a, b in ranges]
         except (OSError, ValueError, KeyError, TypeError):
             continue
         if not path.is_file() or path.stat().st_size > size or time.time() - _mtime(path) > UPLOAD_KEEP_SECONDS:
             continue
         with _lock:
-            _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta}
+            _uploads[upload_id] = {"filename": filename, "size": size, "path": path, "meta": meta, "ranges": ranges}
         keep.update((meta.name, path.name))
     for child in root.iterdir():
         if child.name in keep:
@@ -396,18 +431,52 @@ def _recover_uploads(root: pathlib.Path) -> None:
         logger.info(f"import: kept {len(keep) // 2} unfinished uploads")
 
 
-def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
-    """offset 위치에 조각을 씁니다. offset은 지금까지 받은 크기와 같아야 합니다(다르면 409와 현재 크기)."""
-    upload = _upload(upload_id)
-    with _lock:
-        received = upload["path"].stat().st_size
-        if offset != received:
-            raise UploadError(409, f"offset must be {received}")
-        if received + len(data) > upload["size"]:
+class ChunkWriter:
+    """업로드의 offset 위치에 조각을 받는 대로 씁니다(본문을 다 모으지 않음). 다 쓰면 finish가 그 구간을 받은 것으로 적습니다.
+    같은 업로드의 조각 여러 개를 동시에 써도 되고, 같은 구간을 다시 보내면 덮어씁니다. 도중에 끊기면 abort하고 그 구간은
+    받지 않은 것으로 남습니다."""
+
+    def __init__(self, upload_id: str, offset: int):
+        self.upload_id = upload_id
+        self.upload = _upload(upload_id)
+        if offset < 0 or offset > self.upload["size"]:
+            raise UploadError(400, "offset out of range")
+        self.offset = self.pos = offset
+        self._fd = os.open(self.upload["path"], os.O_WRONLY)
+
+    def write(self, data: bytes) -> None:
+        if self.pos + len(data) > self.upload["size"]:
+            self.abort()
             raise UploadError(400, "chunk exceeds declared size")
-        with open(upload["path"], "ab") as f:
-            f.write(data)
-    return {"id": upload_id, "received": received + len(data), "size": upload["size"]}
+        view = memoryview(data)
+        while view:
+            n = os.pwrite(self._fd, view, self.pos)
+            self.pos += n
+            view = view[n:]
+
+    def abort(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def finish(self) -> dict:
+        self.abort()
+        upload = self.upload
+        with _lock:
+            if _uploads.get(self.upload_id) is not upload:
+                raise UploadError(404, "upload not found")
+            if self.pos > self.offset:
+                upload["ranges"] = _merge_range(upload["ranges"], self.offset, self.pos)
+                _save_meta(upload)
+            received = _received(upload)
+        return {"id": self.upload_id, "received": received, "size": upload["size"]}
+
+
+def write_chunk(upload_id: str, offset: int, data: bytes) -> dict:
+    """offset 위치에 조각 하나를 씁니다(ChunkWriter를 한 번에 씀)."""
+    writer = ChunkWriter(upload_id, offset)
+    writer.write(data)
+    return writer.finish()
 
 
 def _staged_free() -> int:
@@ -428,8 +497,10 @@ def finish_uploads(upload_ids: list[str]) -> Job:
         raise UploadError(400, "upload ids required")
     uploads = [_upload(i) for i in upload_ids]
     for upload in uploads:
-        received = upload["path"].stat().st_size
-        if received != upload["size"]:
+        with _lock:
+            complete = upload["size"] == 0 or upload["ranges"] == [[0, upload["size"]]]
+            received = _received(upload)
+        if not complete:
             raise UploadError(409, f"upload incomplete ({received}/{upload['size']} bytes)")
     names = [pathlib.PurePath(u["filename"].replace("\\", "/")).name for u in uploads]
     volumes = rar.volume_sets(names)

@@ -10,6 +10,7 @@ API(`/api/admin/...`)는 관리자 API 키(api_keys.py)로도 부를 수 있습�
 
 사용자 정보를 보거나 바꾸면 audit.record로 관리자 접속기록을 남깁니다.
 """
+import asyncio
 import json
 import logging
 import mimetypes
@@ -541,11 +542,37 @@ def start_upload(body: UploadStart, admin: Annotated[User, Depends(web_admin)]):
     return _upload_call(importer.start_upload, body.filename, body.size)
 
 
+# 업로드 조각을 받는 대로 디스크에 쓰는 단위. 쓰는 동안 다음 단위를 받습니다.
+UPLOAD_WRITE_BYTES = 4 * 1024 * 1024
+
+
 @router.put("/api/admin/import/uploads/{upload_id}")
 async def put_chunk(upload_id: str, offset: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
-    """본문(바이트)을 offset 위치에 이어 씁니다. offset이 받은 크기와 다르면 409."""
-    data = await request.body()
-    return await run_in_threadpool(_upload_call, importer.write_chunk, upload_id, offset, data)
+    """본문(바이트)을 offset 위치에 씁니다. 본문을 다 모으지 않고 받는 대로 쓰고, 한 단위를 쓰는 동안 다음 단위를 받습니다.
+    조각은 순서와 상관없이 여러 개를 동시에 보내도 됩니다. 응답의 received는 지금까지 받은 바이트 수입니다."""
+    writer = await run_in_threadpool(_upload_call, importer.ChunkWriter, upload_id, offset)
+    pending = None
+    try:
+        buf = bytearray()
+        async for part in request.stream():
+            buf += part
+            if len(buf) >= UPLOAD_WRITE_BYTES:
+                if pending is not None:
+                    await pending
+                pending = asyncio.ensure_future(run_in_threadpool(_upload_call, writer.write, bytes(buf)))
+                buf.clear()
+        if pending is not None:
+            await pending
+            pending = None
+        if buf:
+            await run_in_threadpool(_upload_call, writer.write, bytes(buf))
+        return await run_in_threadpool(_upload_call, writer.finish)
+    except BaseException:
+        if pending is not None:
+            # 쓰던 단위가 끝난 뒤 닫습니다(쓰는 중에 닫지 않도록).
+            await asyncio.gather(pending, return_exceptions=True)
+        writer.abort()
+        raise
 
 
 @router.delete("/api/admin/import/uploads/{upload_id}")

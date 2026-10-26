@@ -101,6 +101,22 @@ def backfill_pre_chunks() -> None:
         logging.getLogger(__name__).exception("backfill_chart_meta failed")
     # 미리듣기 음원이 없는 곡의 미리듣기를 만든다. 곡마다 키음을 풀어 섞으므로 오래 걸린다.
     preview.kick()
+    # DB BLOB에 남은 곡·청크를 저장소 파일로 천천히 옮긴다(#152). 디스크를 서비스에 양보하며 하나씩 옮긴다.
+    if constant.STORE_MIGRATE_ENABLED:
+        try:
+            Database().migrate_to_store()
+        except Exception:
+            logging.getLogger(__name__).exception("migrate_to_store failed")
+
+
+def store_gc_loop(stop: threading.Event) -> None:
+    """아무 행도 가리키지 않는 저장소 파일을 시작 직후 한 번, 이후 STORE_GC_HOURS마다 지운다."""
+    while not stop.is_set():
+        try:
+            Database().store_gc()
+        except Exception:
+            logging.getLogger(__name__).exception("store_gc failed")
+        stop.wait(constant.STORE_GC_HOURS * 3600)
 
 
 def insecure_public_url(url: str) -> bool:
@@ -166,6 +182,9 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("DB is loaded.")
     # 이전 버전에서 넣은 곡의 사전 청크는 시간이 걸리므로 뒤에서 만든다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받는다.
     threading.Thread(target=backfill_pre_chunks, name="backfill_pre_chunks", daemon=True).start()
+    store_stop = threading.Event()
+    if constant.STORE_GC_HOURS > 0:
+        threading.Thread(target=store_gc_loop, args=(store_stop,), name="store_gc", daemon=True).start()
     if not constant.SECRET_KEY:
         logging.getLogger(__name__).warning("EBMS_SECRET_KEY is not set. Using a random key until restart.")
     if insecure_public_url(constant.PUBLIC_URL):
@@ -187,6 +206,7 @@ async def lifespan(app: FastAPI):
     # 등록한 난이도표를 주기적으로 다시 읽는다(새로 실린 곡)
     tables_stop = tables.start()
     yield
+    store_stop.set()
     if retention_stop is not None:
         retention_stop.set()
     if tables_stop is not None:

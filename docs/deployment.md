@@ -8,8 +8,8 @@
 | 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 금지 | 기본은 호스트의 `127.0.0.1`에만 바인딩(`EBMS_BIND_ADDR`). 같은 호스트의 리버스 프록시만 접근 |
 | 3306/tcp | MySQL | 불필요 | 호스트에 바인딩하지 않음. compose 내부 네트워크에서 `ebms` 컨테이너만 접근 |
 
-- 곡/차트 데이터는 MySQL(`mysql-data` 볼륨)에 BLOB으로 저장되며, 테이블은 서버가 시작할 때 자동 생성됩니다.
-- 서버 로그와 임포트 폴더(`var/log`, `var/tmp`, 검토 대기 `var/staged`)는 `ebms-var` 볼륨에 유지됩니다.
+- 곡 zip·차트 청크·사전 청크는 파일로 `var/store/`(`EBMS_STORE_DIR`)에 두고, MySQL(`mysql-data` 볼륨)에는 경로·크기·sha256 같은 메타데이터만 둡니다(#152). 테이블은 서버가 시작할 때 자동 생성됩니다. 백업할 때는 DB와 `var/store/`를 함께 백업합니다.
+- 서버 로그, 임포트 폴더(`var/log`, `var/tmp`, 검토 대기 `var/staged`), 저장소(`var/store`)는 `ebms-var` 볼륨에 유지됩니다.
 
 ### 로그 보관
 
@@ -88,7 +88,7 @@ EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
 
 ### SSD를 작업 공간으로 쓰기
 
-곡은 모두 MySQL에 들어가므로 데이터는 큰 디스크(HDD)에 두고, 작은 SSD는 임포트 중간 작업과 MySQL 쓰기 로그에만 씁니다. SMR HDD에서는 압축 풀기·commit이 디스크를 다투어 곡 하나에 몇 분씩 걸릴 수 있습니다.
+곡은 모두 저장소(`var/store`)에 들어가므로 데이터는 큰 디스크(HDD)에 두고, 작은 SSD는 임포트 중간 작업과 MySQL 쓰기 로그에만 씁니다. SMR HDD에서는 압축 풀기·commit이 디스크를 다투어 곡 하나에 몇 분씩 걸릴 수 있습니다.
 
 ```bash
 # /opt/ebms/release.env
@@ -179,6 +179,21 @@ EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
 ```bash
 docker compose exec ebms python -m ebms_server.migrate
 ```
+
+### DB BLOB을 저장소 파일로 옮기기 (#152)
+
+이전 버전은 곡 zip·청크를 MySQL BLOB(`song_part`, `chart_chunk.data`, `pre_chunk_part`)에 두었습니다. 이 버전으로 올리면 서버가 켜진 채로 백그라운드에서 하나씩 저장소 파일로 옮깁니다. 옮기기 전 것은 그대로 DB에서 받으므로 서비스는 멈추지 않습니다.
+
+- **속도**: 하나 옮길 때마다 일한 시간의 `EBMS_STORE_MIGRATE_REST_RATIO`배(기본 3, 디스크 사용 약 25%)만큼 쉬고, 곡 임포트가 쓰기 잠금을 잡고 있으면 기다립니다. `EBMS_STORE_MIGRATE=0`이면 옮기지 않습니다.
+- **순서와 공간 회수**: 사전 청크 → 차트 청크 → 곡 순서로 옮기고, 테이블 하나를 다 옮기면 그 BLOB 공간을 디스크에 돌려줍니다(`pre_chunk_part`·`song_part`는 `TRUNCATE`, `chart_chunk`·`song`은 BLOB을 비운 뒤라 빠르게 끝나는 `OPTIMIZE`). InnoDB는 행을 지워도 파일을 줄이지 않으므로 그 전까지는 공간이 돌아오지 않습니다. 곡 수십 개마다 `OPTIMIZE`하는 것은 남은 테이블 전체를 매번 다시 쓰고 복사본 공간도 필요해서 하지 않습니다.
+- **필요한 여유 공간**: 가장 큰 테이블(보통 `song_part`) 크기 + `EBMS_STORE_MIN_FREE`(기본 20G). 모자라면 옮기기를 멈추고 10분마다 다시 확인합니다(로그 `migrate_to_store: Paused`). 크기는 다음으로 확인합니다.
+
+  ```sql
+  SELECT table_name, ROUND((data_length + index_length) / 1024 / 1024 / 1024, 1) AS gb
+  FROM information_schema.tables WHERE table_schema = 'ebms' ORDER BY gb DESC;
+  ```
+- **진행도**: 로그의 `migrate_to_store(song): 1234/56789 (2%, ...)`. 도중에 꺼져도 다음 시작 때 남은 것부터 이어서 합니다.
+- **정리**: 아무 행도 가리키지 않는 저장소 파일(지운 곡, 바뀌기 전 청크, 커밋하지 못한 파일)은 `EBMS_STORE_GC_HOURS`(기본 1)마다 지웁니다.
 
 ### 청크 크기 변경
 

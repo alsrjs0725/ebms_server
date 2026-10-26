@@ -51,6 +51,10 @@ class SQLiteCursor:
             return
 
         sql = re.sub(r"FOR UPDATE", "", sql, flags=re.IGNORECASE)
+        if sql.lstrip().upper().startswith("OPTIMIZE TABLE"):
+            self._cur.execute("SELECT 1")
+            return
+        sql = re.sub(r"^\s*TRUNCATE TABLE", "DELETE FROM", sql, flags=re.IGNORECASE)
         if "START TRANSACTION" in sql or "BEGIN" in sql:
             return
 
@@ -157,6 +161,7 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     # 임포트 캐시는 기본으로 끄고, test_cache가 켭니다.
     monkeypatch.setattr(constant, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(constant, "CACHE_MAX_BYTES", 0)
+    monkeypatch.setattr(constant, "STORE_DIR", tmp_path / "store")
     # 미리듣기는 뒤 스레드에서 만들므로 테스트에서는 끄고, test_preview가 직접 부릅니다.
     monkeypatch.setattr(constant, "PREVIEW_ENABLED", False)
     original_connect = db_module.connect
