@@ -4,6 +4,7 @@ import io
 import json
 import os
 import threading
+import time
 import zipfile
 
 import anyio
@@ -453,6 +454,9 @@ def test_admin_user_list_batches_queries(tmp_path, client, monkeypatch):
     quota.charge_play(users[1].id, 1)
     quota.add_pre_usage(users[2].id, 1234)
     quota.set_overrides(users[3].id, {"max_tickets": 9})
+    # 목록과 기대값을 만드는 사이에 초가 바뀌면 next_refill_in이 1 달라지므로 시각을 고정합니다.
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
     expected = {user.id: admin.get_user_detail(user.id) for user in users}
 
     connects = []
