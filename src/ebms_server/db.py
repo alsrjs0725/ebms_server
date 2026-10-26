@@ -431,10 +431,11 @@ FILE_KINDS_VERSION = 3
 FILE_KINDS_SETTING = "file_kinds_version"
 # backfill_file_kinds가 어디까지 판정했는지("버전:마지막 곡 번호"). 도중에 꺼지면 다음 시작 때 그 뒤부터 이어서 합니다.
 FILE_KINDS_PROGRESS_SETTING = "file_kinds_progress"
-# 지금 차트 청크·사전 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK)를 저장하는 setting 이름.
-# 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
+# 지금 차트 청크·사전 청크·매니페스트 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK, SONGS_PER_MANIFEST_CHUNK)를
+# 저장하는 setting 이름. 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
 CHART_CHUNK_SETTING = "chart_chunk_charts"
 PRE_CHUNK_SETTING = "pre_chunk_songs"
+MANIFEST_CHUNK_SETTING = "manifest_chunk_songs"
 # DB BLOB을 저장소 파일로 다 옮기고 BLOB 테이블의 공간을 돌려받은 테이블(쉼표로 이음). migrate_to_store가 다시 비우지 않게 합니다.
 STORE_RECLAIMED_SETTING = "store_reclaimed"
 # migrate_to_store가 옮기는 순서. 작은 테이블부터 옮기고 비워, 큰 테이블(곡)을 옮길 때 쓸 공간을 먼저 확보합니다.
@@ -1438,6 +1439,46 @@ class Database:
             """,
             (chunk_no, hashlib.sha256(body).hexdigest(), data),
         )
+
+    def rechunk_manifest(self) -> int:
+        """매니페스트 청크의 크기(MANIFEST_CHUNK_SETTING)가 SONGS_PER_MANIFEST_CHUNK와 다르면 모든 매니페스트 청크를
+        새 크기로 다시 만들고, 새 크기에 없는 번호의 청크를 지웁니다. 만든 청크 수를 반환합니다.
+
+        청크마다 따로 커밋합니다. 그 사이에 동기화한 클라이언트는 곡 일부를 잠시 못 볼 수 있지만, 다 만든 뒤 다음
+        동기화에서 바로잡힙니다. 크기는 다 만든 뒤에 저장하므로 도중에 꺼지면 다음 시작 때 처음부터 다시 만듭니다.
+        끝날 때까지 쓰기 잠금을 잡으므로 그동안 임포트는 기다립니다."""
+        with connect() as con, con.cursor() as cur:
+            if self._setting(cur, MANIFEST_CHUNK_SETTING) == str(constant.SONGS_PER_MANIFEST_CHUNK):
+                return 0
+        with self._write_lock:
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT id FROM song")
+                wanted = sorted({row[0] // constant.SONGS_PER_MANIFEST_CHUNK for row in cur.fetchall()})
+                cur.execute("SELECT id FROM manifest_chunk")
+                stale = sorted({row[0] for row in cur.fetchall()} - set(wanted))
+            if wanted:
+                self.logger.info(
+                    f"rechunk_manifest: Rebuilding {len(wanted)} manifest chunks "
+                    f"with {constant.SONGS_PER_MANIFEST_CHUNK} songs."
+                )
+            progress = _Progress(self.logger, "rechunk_manifest", len(wanted))
+            for i, chunk_no in enumerate(wanted, 1):
+                with connect() as con, con.cursor() as cur:
+                    try:
+                        self._rebuild_manifest_chunk(cur, chunk_no)
+                        con.commit()
+                    except Exception:
+                        con.rollback()
+                        raise
+                progress.update(i)
+            with connect() as con, con.cursor() as cur:
+                for chunk_no in stale:
+                    cur.execute("DELETE FROM manifest_chunk WHERE id = %s", (chunk_no,))
+                self._set_setting(cur, MANIFEST_CHUNK_SETTING, str(constant.SONGS_PER_MANIFEST_CHUNK))
+                con.commit()
+        if wanted or stale:
+            self.logger.info(f"rechunk_manifest: Built {len(wanted)} manifest chunks, dropped {len(stale)}.")
+        return len(wanted)
 
     def _previews(self, cur, lo: int, hi: int) -> dict[int, dict]:
         """song id가 [lo, hi)인 곡 중 지금 판의 미리듣기가 있는 곡. 곡 zip이 바뀌었는지는 song_sha256으로 봅니다."""

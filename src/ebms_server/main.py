@@ -80,6 +80,11 @@ def backfill_pre_chunks() -> None:
         Database().rechunk_charts()
     except Exception:
         logging.getLogger(__name__).exception("rechunk_charts failed")
+    # 매니페스트 청크 크기(SONGS_PER_MANIFEST_CHUNK)가 바뀌었으면 매니페스트 청크를 모두 다시 만든다.
+    try:
+        Database().rechunk_manifest()
+    except Exception:
+        logging.getLogger(__name__).exception("rechunk_manifest failed")
     # .bmson처럼 나중에 차트 확장자에 더한 파일을 기존 곡에서 차트로 등록한다. 등록 전에는 곡 zip에서만 받는다.
     try:
         Database().backfill_chart_formats()
