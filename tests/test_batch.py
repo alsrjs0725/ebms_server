@@ -60,6 +60,7 @@ def chunk_names():
 
 
 def test_chunks_once_per_batch(database, tmp_path, monkeypatch):
+    monkeypatch.setattr(constant, "IMPORT_BATCH_SONGS", 500)
     appends = spy(monkeypatch, "_append_charts_to_chunk")
     manifests = spy(monkeypatch, "_rebuild_manifest_chunk")
     pres = spy(monkeypatch, "_rebuild_pre_chunk")

@@ -56,13 +56,13 @@ UNUSED_DIR = BASE_DIR / "var" / "unused"
 # 바꾸면 서버 시작 뒤 기존 차트 청크를 이 크기로 다시 묶습니다(Database.rechunk_charts).
 CHARTS_PER_CHUNK = 100
 BYTE_PER_CHUNK = 64 * 1024 * 1024
-# 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 기준(곡 zip 크기 합, 곡 수). 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
-IMPORT_BATCH_BYTES = 1024 * 1024 * 1024
-IMPORT_BATCH_SONGS = 500
+# 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 곡 수. 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
+# 곡 zip은 add 때 바로 저장소 파일로 쓰고 트랜잭션에는 행만 들어가므로 크기 기준은 두지 않습니다.
+# 커밋마다 마지막 차트 청크를 다시 쓰므로 너무 작게 잡지 않습니다.
+IMPORT_BATCH_SONGS = 20
 # 저속 임포트(관리자 페이지 "천천히"): 작은 배치로 자주 커밋해 쓰기 잠금과 MySQL 쓰기 폭주를 줄이고,
 # 커밋마다 일한 시간 x IMPORT_SLOW_REST_RATIO 만큼(최대 IMPORT_SLOW_REST_MAX초) 쉬어 디스크를 서비스에 양보합니다.
-IMPORT_SLOW_BATCH_BYTES = 128 * 1024 * 1024
-IMPORT_SLOW_BATCH_SONGS = 50
+IMPORT_SLOW_BATCH_SONGS = 5
 IMPORT_SLOW_REST_RATIO = 1.0
 IMPORT_SLOW_REST_MAX = 60
 # 서버 시작 시 기존 곡을 다시 처리(매니페스트·pre/play 판정 채우기)할 때 커밋하는 곡 수
