@@ -10,9 +10,11 @@
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
 - 겹치는 차트가 없는 곡은 비슷한 기존 곡(similar)을 찾습니다(BeMusicSeeker의 차분 도입처 추정과 같은 기준).
-  차트가 쓰는 키음(#WAV)이 곡 안에 다 있으면 따로 선 곡으로 보고 새 곡입니다. 없는 키음이 있으면(차분) #TITLE·#ARTIST·#BPM·#GENRE 중
-  하나 이상 같고, 없는 키음을 하나 이상 가지고 있고, 곡과 합쳐 키음 충족률이 SIMILAR_SOUNDS 이상인 기존 곡이 후보입니다.
-  충족률이 SIMILAR_AUTO_SOUNDS 이상이고 항목이 SIMILAR_MIN_FIELDS개 이상 같은 곡이 맨 앞에 하나뿐이면 auto는 그 곡에 추가합니다.
+  없는 키음(#WAV)이 있으면(차분) #TITLE·#ARTIST·#BPM·#GENRE 중 하나 이상 같고, 없는 키음을 하나 이상 가지고 있고,
+  곡과 합쳐 키음 충족률이 SIMILAR_SOUNDS 이상인 기존 곡이 후보입니다. 충족률이 SIMILAR_AUTO_SOUNDS 이상이고
+  항목이 SIMILAR_MIN_FIELDS개 이상 같은 곡이 맨 앞에 하나뿐이면 auto는 그 곡에 추가합니다.
+  키음이 곡 안에 다 있으면(따로 선 곡) 항목이 하나 이상 같고 그 키음을 혼자 SIMILAR_SOUNDS 이상 가진 기존 곡을
+  중복 의심 후보로 보여주기만 하고(complete), auto는 새 곡입니다(같은 곡을 채보만 고쳐 다시 올린 경우).
   키음이 없는 차트뿐인 곡은 항목만으로 판정합니다(SIMILAR_MIN_FIELDS개 이상 같은 곡이 후보, 가장 많이 겹치는 곡이 하나면 auto).
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
@@ -392,12 +394,12 @@ def _unit_sounds(stage: dict, unit: dict) -> tuple[list[frozenset[str]], set[str
     return sorted(sounds, key=sorted), own
 
 
-def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tuple[list[int], dict[str, list[str]], dict[str, float], int | None]:
+def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tuple[list[int], dict[str, list[str]], dict[str, float], int | None, bool]:
     """겹치는 차트가 없는 곡과 비슷한 기존 곡(모듈 설명의 기준).
-    (후보 곡 번호(충족률 높은 순, 많이 겹치는 순), {곡 번호: 같은 항목}, {곡 번호: 키음 충족률}(키음이 있을 때만), auto로 추가할 곡 번호)."""
+    (후보 곡 번호(충족률 높은 순, 많이 겹치는 순), {곡 번호: 같은 항목}, {곡 번호: 키음 충족률}(키음이 있을 때만), auto로 추가할 곡 번호, 키음이 곡 안에 다 있는지).
+    키음이 곡 안에 다 있으면 충족률은 기존 곡 혼자 가진 비율이고 auto는 없습니다."""
     missing = [sound for sound in sounds if not sound & own]
-    if sounds and not missing:
-        return [], {}, {}, None
+    complete = bool(sounds) and not missing
     mine = {field: {chart["keys"][field] for chart in unit["charts"] if chart["keys"].get(field)} for field in META_HEADERS}
     # 후보: 이름이나 작곡가가 같거나, BPM과 장르가 같은 차트의 곡
     where, args = [], []
@@ -410,11 +412,11 @@ def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tu
             where.append("(bpm_key = %s AND genre_key = %s)")
             args.extend((bpm, genre))
     if not where:
-        return [], {}, {}, None
+        return [], {}, {}, None, complete
     cur.execute(f"SELECT DISTINCT song_id FROM chart WHERE song_id IS NOT NULL AND ({' OR '.join(where)})", tuple(args))
     ids = sorted(row[0] for row in cur.fetchall())
     if not ids:
-        return [], {}, {}, None
+        return [], {}, {}, None, complete
     marks = ", ".join(["%s"] * len(ids))
     cur.execute(f"SELECT song_id, title_key, artist_key, bpm_key, genre_key FROM chart WHERE song_id IN ({marks})", tuple(ids))
     theirs: dict[int, dict[str, set[str]]] = {}
@@ -428,8 +430,10 @@ def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tu
         cur.execute(f"SELECT id, files FROM song WHERE id IN ({marks})", tuple(ids))
         for song_id, files in cur.fetchall():
             stems = _sound_stems(entry["path"] for entry in json.loads(files)) if files else set()
+            if complete:
+                rates[song_id] = sum(1 for sound in sounds if sound & stems) / len(sounds)
             # 없는 키음을 하나도 안 가진 곡은 후보가 아님(BeMusicSeeker: 후보 자신에 맞는 키음이 1개 이상)
-            if any(sound & stems for sound in missing):
+            elif any(sound & stems for sound in missing):
                 rates[song_id] = sum(1 for sound in sounds if sound & (own | stems)) / len(sounds)
     matches = {}
     for song_id, song in theirs.items():
@@ -439,10 +443,10 @@ def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tu
     rank = lambda song_id: (-rates.get(song_id, 0.0), -len(matches[song_id]))
     songs = sorted(matches, key=lambda i: (*rank(i), i))[:SIMILAR_LIMIT]
     top = [i for i in songs if rank(i) == rank(songs[0])] if songs else []
-    merge = top[0] if len(top) == 1 and len(matches[top[0]]) >= SIMILAR_MIN_FIELDS and (
+    merge = top[0] if not complete and len(top) == 1 and len(matches[top[0]]) >= SIMILAR_MIN_FIELDS and (
         not sounds or rates[top[0]] >= SIMILAR_AUTO_SOUNDS) else None
     rated = {str(i): round(rates[i], 3) for i in songs} if sounds else {}
-    return songs, {str(i): matches[i] for i in songs}, rated, merge
+    return songs, {str(i): matches[i] for i in songs}, rated, merge, complete
 
 
 def _fill_meta(stage: dict, unit: dict) -> None:
@@ -484,17 +488,17 @@ def _analyze(stage: dict) -> None:
                 if chart["song_id"] is not None and chart["song_id"] not in songs:
                     songs.append(chart["song_id"])
             songs.sort()
-            merge, matches, sounds = None, {}, {}
+            merge, matches, sounds, complete = None, {}, {}, False
             if deleted is not None:
                 kind = "unused"
             elif not songs:
-                songs, matches, sounds, merge = _similar(cur, unit, *_unit_sounds(stage, unit))
+                songs, matches, sounds, merge, complete = _similar(cur, unit, *_unit_sounds(stage, unit))
                 kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds}
+            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds, "complete": complete}
 
 
 def analyze(stage_id: str) -> dict:

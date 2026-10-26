@@ -931,7 +931,8 @@ function suggestionCell(stage, unit) {
         const div = document.createElement("div");
         div.className = "small";
         const top = String(s.songs[0]);
-        const why = s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
+        const why = s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
+            : s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
             : (s.matches[top] || []).length < 2 ? "맨 앞 곡과 같은 항목이 하나뿐" : "맨 앞 곡이 여럿";
         div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 비슷함)` : `자동: 새 곡 (${why})`;
         td.append(div);
