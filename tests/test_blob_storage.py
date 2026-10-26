@@ -433,6 +433,68 @@ def test_open_blob_keeps_reading_replaced_file(tmp_path, database, monkeypatch):
     blob.close()
 
 
+@pytest.mark.parametrize("table, row_id", [("song", 1), ("song", "legacy"), ("pre_chunk", 0), ("chart_chunk", 0)])
+def test_blob_reader_continues_after_migration(tmp_path, database, monkeypatch, table, row_id):
+    """옮기기 전 BLOB을 받는 도중 마이그레이션이 그 행을 저장소 파일로 옮겨도 파일에서 이어 끝까지 읽습니다."""
+    monkeypatch.setattr(constant, "BLOB_READ_SIZE", 1000)
+    monkeypatch.setattr(constant, "STORE_MIGRATE_REST_MIN", 0)
+    monkeypatch.setattr(constant, "STORE_MIN_FREE_BYTES", 0)
+    chart = b"#TITLE A\n#BANNER b.bmp\n#COMMENT " + os.urandom(3000).hex().encode() + b"\n"
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": chart, "b.bmp": os.urandom(5000)}))
+    if row_id == "legacy":
+        # 아주 오래된 song.data 행
+        row_id = 1
+        data = to_legacy("song", 1)
+        with db_module.connect() as con, con.cursor() as cur:
+            cur.execute("DELETE FROM song_part WHERE song_id = 1")
+            cur.execute("UPDATE song SET data = %s WHERE id = 1", (data,))
+            con.commit()
+    else:
+        data = to_legacy(table, row_id)
+    blob = database.open_blob(table, row_id)
+    assert blob.path is None
+    pieces = blob.iter_range(0, blob.size - 1)
+    if table == "chart_chunk":
+        # 차트 청크는 첫 조각에서 범위를 한 번에 읽으므로 읽기 전에 옮겨진 경우만 있습니다.
+        assert database.migrate_to_store() >= 1
+        first = next(pieces)
+    else:
+        first = next(pieces)
+        assert database.migrate_to_store() >= 1
+    assert first + b"".join(pieces) == data
+    assert blob.path is not None
+    blob.close()
+
+
+def test_blob_reader_fails_when_content_changed(tmp_path, database, monkeypatch):
+    """읽던 BLOB이 사라지고 다른 내용으로 바뀌었으면 이어 붙이지 않고 실패합니다."""
+    monkeypatch.setattr(constant, "BLOB_READ_SIZE", 1000)
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n", "b.bmp": os.urandom(5000)}))
+    to_legacy("song", 1)
+    blob = database.open_blob("song", 1)
+    pieces = blob.iter_range(0, blob.size - 1)
+    next(pieces)
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM song_part WHERE song_id = 1")
+        cur.execute("UPDATE song SET sha256 = %s, path = %s WHERE id = 1", ("0" * 64, "x"))
+        con.commit()
+    with pytest.raises(RuntimeError):
+        b"".join(pieces)
+
+
+def test_blob_reader_read_after_migration(tmp_path, database, monkeypatch):
+    """read()도 옮겨진 뒤에는 저장소 파일에서 읽습니다."""
+    monkeypatch.setattr(constant, "STORE_MIGRATE_REST_MIN", 0)
+    monkeypatch.setattr(constant, "STORE_MIN_FREE_BYTES", 0)
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n", "b.bmp": os.urandom(5000)}))
+    data = to_legacy("song", 1)
+    blob = database.open_blob("song", 1)
+    assert blob.read(0, 10) == data[:10]
+    database.migrate_to_store()
+    assert blob.read(100, 50) == data[100:150]
+    blob.close()
+
+
 def test_backfill_manifest_skips_broken_song(tmp_path, database, monkeypatch, caplog):
     """손상된 곡 zip 하나가 있어도 시작(backfill)이 실패하지 않고 나머지 곡은 채웁니다 (#45)"""
     monkeypatch.setattr(constant, "BACKFILL_BATCH_SONGS", 2)
