@@ -1,6 +1,8 @@
-"""청크 크기(차트 CHARTS_PER_CHUNK개, 사전 SONGS_PER_PRE_CHUNK곡)와 크기를 바꿨을 때 기존 청크를 다시 묶는 것을 테스트합니다."""
+"""청크 크기(차트 CHARTS_PER_CHUNK개, 사전 SONGS_PER_PRE_CHUNK곡, 매니페스트 SONGS_PER_MANIFEST_CHUNK곡)를 바꿨을 때 기존 청크를 다시 묶는 것을 테스트합니다."""
+import gzip
 import hashlib
 import io
+import json
 import zipfile
 
 import pytest
@@ -128,3 +130,29 @@ def test_pre_chunks_rebuilt_when_size_changes(database, tmp_path, monkeypatch):
     names = zipfile.ZipFile(io.BytesIO(data)).namelist()
     assert sorted(int(n.split("/")[0]) for n in names) == list(range(1, 11))
     assert database.backfill_pre_chunks() == 0
+
+
+def manifest_song_ids():
+    return {
+        chunk_id: [s["song_id"] for s in json.loads(gzip.decompress(db_module.Database().get_manifest_chunk(chunk_id)))]
+        for chunk_id in db_module.Database().get_manifest_hash()
+    }
+
+
+def test_manifest_rechunked_when_size_changes(database, tmp_path, monkeypatch):
+    monkeypatch.setattr(constant, "SONGS_PER_MANIFEST_CHUNK", 1000)
+    assert database.rechunk_manifest() == 0
+    assert setting(db_module.MANIFEST_CHUNK_SETTING) == "1000"
+    import_pack(tmp_path, 7, "a")
+    assert manifest_song_ids() == {0: [1, 2, 3, 4, 5, 6, 7]}
+
+    monkeypatch.setattr(constant, "SONGS_PER_MANIFEST_CHUNK", 3)
+    assert database.rechunk_manifest() == 3
+    assert manifest_song_ids() == {0: [1, 2], 1: [3, 4, 5], 2: [6, 7]}
+    assert setting(db_module.MANIFEST_CHUNK_SETTING) == "3"
+    assert database.rechunk_manifest() == 0
+
+    # 다시 키우면 남는 번호의 청크는 지웁니다.
+    monkeypatch.setattr(constant, "SONGS_PER_MANIFEST_CHUNK", 5)
+    assert database.rechunk_manifest() == 2
+    assert manifest_song_ids() == {0: [1, 2, 3, 4], 1: [5, 6, 7]}

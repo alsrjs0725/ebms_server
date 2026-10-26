@@ -69,7 +69,7 @@ def test_chunks_once_per_batch(database, tmp_path, monkeypatch):
 
     songs = importer.import_zip(path, "pack.zip")
     assert len(songs) == 40 and not any("error" in s for s in songs)
-    # 차트 청크는 한 번만 읽고 쓰고, 매니페스트(1000곡)·사전(8곡) 청크는 영향받은 것만 한 번씩
+    # 차트 청크는 한 번만 읽고 쓰고, 매니페스트(100곡)·사전(8곡) 청크는 영향받은 것만 한 번씩
     assert appends == [40]
     assert manifests == [0]
     assert pres == [0, 1, 2, 3, 4, 5]

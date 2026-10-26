@@ -71,7 +71,9 @@ BACKFILL_BATCH_SONGS = 100
 BACKFILL_PROGRESS_SECONDS = 10
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
-SONGS_PER_MANIFEST_CHUNK = 1000
+# 곡 하나가 바뀌어도 청크를 통째로 다시 만들고 클라이언트가 다시 받으므로 작게 둡니다(곡당 파일 목록이 커서 100곡에 gzip 약 2MB).
+# 바꾸면 서버 시작 뒤 매니페스트 청크를 모두 다시 만듭니다(Database.rechunk_manifest).
+SONGS_PER_MANIFEST_CHUNK = 100
 # 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_PRE_CHUNK
 # 난이도표를 고른 클라이언트가 표에 없는 곡을 덜 받도록 작게 둡니다. 바꾸면 서버 시작 뒤 사전 청크를 모두 다시 만듭니다.
 SONGS_PER_PRE_CHUNK = 8
