@@ -315,17 +315,15 @@ def upload_new(client, name, data):
     commit_stage(client, sid)
 
 
-def test_similar_songs_for_small_units(client, monkeypatch):
+def test_similar_songs_by_fields(client, monkeypatch):
+    """키음이 없는 채보뿐인 곡은 항목만으로 판정합니다."""
     admin_login(client, monkeypatch)
     upload_new(client, "base.zip", make_zip({"b/a.bms": b"#TITLE Song [NORMAL]\n#ARTIST Comp / obj:x\n#BPM 150.00\n#GENRE Techno\n", "b/k.wav": b"k"}))
     upload_new(client, "other.zip", make_zip({"o/o.bms": b"#TITLE Song\n#ARTIST Someone\n#BPM 150\n"}))
     upload_new(client, "third.zip", make_zip({"t/t.bms": b"#TITLE Else\n#ARTIST Nobody\n#BPM 150\n#GENRE TECHNO\n"}))
-    many = {f"big/{i}.wav": b"w" for i in range(staging.SIMILAR_FILES)}
     job = stage(client, "pack.zip", make_zip({
         # 이름·작곡가·BPM·장르 다 같은 곡(1)이 가장 많이 겹침 → auto는 1에 추가
         "small/x.bms": b"#TITLE SONG [ANOTHER]\n#ARTIST comp\n#BPM 150\n#GENRE techno\n", "small/k2.wav": b"k2",
-        # 파일이 많으면 겹치는 차트로만 판정
-        "big/x.bms": b"#TITLE Song (HYPER)\n#ARTIST Comp\n", **many,
         # 이름·BPM 같은 곡(1, 2)이 둘 → 후보만, auto는 새 곡
         "tie/x.bms": b"#TITLE Song\n#ARTIST Other\n#BPM 150\n",
         # BPM·장르만 같아도 후보(1, 3)
@@ -339,7 +337,6 @@ def test_similar_songs_for_small_units(client, monkeypatch):
         "kind": "similar", "songs": [1, 2, 3], "deleted": None, "merge": 1,
         "matches": {"1": ["title", "artist", "bpm", "genre"], "2": ["title", "bpm"], "3": ["bpm", "genre"]}, "sounds": {},
     }
-    assert got["pack/big"]["suggestion"]["kind"] == "new"
     tie = got["pack/tie"]["suggestion"]
     assert tie["kind"] == "similar" and tie["songs"] == [1, 2] and tie["merge"] is None
     genre = got["pack/genre"]["suggestion"]
@@ -357,7 +354,7 @@ def test_similar_songs_for_small_units(client, monkeypatch):
 
     commit_stage(client, sid)
     assert song_files(1) == ["a.bms", "k.wav", "k2.wav", "x.bms"]
-    assert [r[0] for r in song_rows()] == [1, 2, 3, 4, 5, 6, 7]
+    assert [r[0] for r in song_rows()] == [1, 2, 3, 4, 5, 6]
 
 
 def test_similar_songs_by_sounds(client, monkeypatch):
@@ -369,24 +366,32 @@ def test_similar_songs_by_sounds(client, monkeypatch):
     upload_new(client, "other.zip", make_zip({
         "o/o.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 hat.wav\n", "o/hat.wav": b"h",
     }))
+    many = {f"complete/{i}.wav": b"w" for i in range(60)}
     job = stage(client, "pack.zip", make_zip({
-        # 이름이 달라 항목은 작곡가 하나만 같지만 없는 키음(kick, 확장자 무관)이 모두 1에만 있음 → 후보, auto는 1
+        # 없는 키음(kick, 확장자 무관)이 1에만 있고 1과 합쳐 100%, 항목 3개 같음 → auto는 1 (2는 kick이 없어 후보 아님)
+        "full/x.bms": b"#TITLE Song [HARD]\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n",
+        # 이름이 달라 같은 항목이 작곡가 하나뿐 → 후보만, auto는 새 곡
         "renamed/x.bms": b"#TITLE Renamed\n#ARTIST Comp\n#WAV01 kick.ogg\n#WAV02 own.wav\n", "renamed/own.wav": b"o",
-        # 항목은 1, 2와 똑같이 겹치지만 snare는 1에 sound/snare.wav로만 있어(경로가 다름) 1도 50% → 후보만, auto는 새 곡
+        # 5개 중 곡에 3개, 1에 kick → 80% → 후보만
+        "most/x.bms": b"#TITLE Song\n#ARTIST Comp\n#WAV01 kick.wav\n#WAV02 snare.wav\n#WAV03 a.wav\n#WAV04 b.wav\n#WAV05 c.wav\n",
+        "most/a.wav": b"a", "most/b.wav": b"b", "most/c.wav": b"c",
+        # snare는 1에 sound/snare.wav로만 있어(경로가 다름) 1과 합쳐도 50% → 후보 아님
         "short/x.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#PLAYLEVEL 3\n#WAV01 kick.wav\n#WAV02 snare.wav\n",
-        # 같은 항목이 하나이고 키음도 없으면 후보가 아님
-        "none/x.bms": b"#TITLE Other\n#ARTIST Comp\n#WAV01 nothing.wav\n",
+        # 키음이 곡 안에 다 있으면 따로 선 곡 → 항목이 같아도 새 곡(파일 수와 무관)
+        "complete/x.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 0.wav\n", **many,
+        "tiny/x.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 t.wav\n", "tiny/t.wav": b"t",
     }))
     got = units(client, job["stage_id"])
-    assert got["pack/renamed"]["suggestion"] == {
+    assert got["pack/full"]["suggestion"] == {
         "kind": "similar", "songs": [1], "deleted": None, "merge": 1,
-        "matches": {"1": ["artist"]}, "sounds": {"1": 1.0},
+        "matches": {"1": ["title", "artist", "bpm"]}, "sounds": {"1": 1.0},
     }
-    short = got["pack/short"]["suggestion"]
-    assert short["kind"] == "similar" and short["songs"] == [1, 2] and short["merge"] is None
-    assert short["sounds"] == {"1": 0.5, "2": 0.0}
-    assert got["pack/none"]["suggestion"]["kind"] == "new"
-
+    renamed = got["pack/renamed"]["suggestion"]
+    assert (renamed["songs"], renamed["matches"], renamed["sounds"], renamed["merge"]) == ([1], {"1": ["artist"]}, {"1": 1.0}, None)
+    most = got["pack/most"]["suggestion"]
+    assert (most["kind"], most["songs"], most["sounds"], most["merge"]) == ("similar", [1], {"1": 0.8}, None)
+    for folder in ("pack/short", "pack/complete", "pack/tiny"):
+        assert got[folder]["suggestion"]["kind"] == "new", folder
 
 def test_analyze_fills_meta_of_old_units_and_backfill(client, monkeypatch):
     admin_login(client, monkeypatch)

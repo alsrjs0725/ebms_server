@@ -927,13 +927,13 @@ function suggestionCell(stage, unit) {
         td.append(div);
     }
     if (s.kind === "similar") {
-        // 겹치는 채보는 없고 이름·작곡가·BPM·장르가 같거나 키음이 있는 곡만 있을 때 "자동"이 하는 일
+        // 겹치는 채보는 없고 키음·이름·작곡가·BPM·장르가 비슷한 곡만 있을 때 "자동"이 하는 일
         const div = document.createElement("div");
         div.className = "small";
-        const top = s.songs[0];
-        const short = !s.merge && s.sounds && top !== undefined && s.sounds[String(top)] < 1;
-        div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 많이 겹침)`
-            : short ? "자동: 새 곡 (가장 많이 겹치는 곡에 없는 키음이 있음)" : "자동: 새 곡 (가장 많이 겹치는 곡이 여럿)";
+        const top = String(s.songs[0]);
+        const why = s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
+            : (s.matches[top] || []).length < 2 ? "맨 앞 곡과 같은 항목이 하나뿐" : "맨 앞 곡이 여럿";
+        div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 비슷함)` : `자동: 새 곡 (${why})`;
         td.append(div);
     }
     return td;
