@@ -38,7 +38,7 @@ def make_song(root, name="song", bmson=BMSON):
 
 def chart_rows():
     with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT song_id, filename, md5, title_key, artist_key, bpm_key, genre_key FROM chart ORDER BY filename")
+        cur.execute("SELECT song_id, filename, md5, title_key, artist_key, bpm_key, genre_key FROM chart ORDER BY filename, song_id")
         return cur.fetchall()
 
 

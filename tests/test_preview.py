@@ -154,7 +154,7 @@ def render(song_dir):
 
 
 @needs_ffmpeg
-def test_render(tmp_path):
+def test_render(tmp_path, client):
     path, ogg = render(make_song(tmp_path))
     assert path == preview.PREVIEW_NAME
     assert ogg.startswith(b"OggS")
@@ -163,7 +163,7 @@ def test_render(tmp_path):
 
 
 @needs_ffmpeg
-def test_render_skips_song_with_preview(tmp_path):
+def test_render_skips_song_with_preview(tmp_path, client):
     assert render(make_song(tmp_path, extra={"preview.ogg": tone()})) is None
 
 

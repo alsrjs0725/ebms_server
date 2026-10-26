@@ -406,6 +406,7 @@ def test_analyze_fills_meta_of_old_units_and_backfill(client, monkeypatch):
     # 이전 버전에서 넣은 차트: 키가 없음
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("UPDATE chart SET title_key = NULL, artist_key = NULL, bpm_key = NULL, genre_key = NULL")
+        con.commit()
     assert db_module.Database().backfill_chart_meta() == 1
     assert db_module.Database().backfill_chart_meta() == 0
     job = stage(client, "pack.zip", make_zip({"s/x.bms": b"#TITLE Song [HARD]\n#ARTIST Comp\n"}))
