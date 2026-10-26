@@ -87,9 +87,9 @@ class Job:
     def apply_limits(self, batch) -> None:
         """다음 곡을 넣기 전에 배치의 커밋 기준을 지금 속도에 맞춥니다."""
         if self._slow:
-            batch.max_bytes, batch.max_songs = constant.IMPORT_SLOW_BATCH_BYTES, constant.IMPORT_SLOW_BATCH_SONGS
+            batch.max_songs = constant.IMPORT_SLOW_BATCH_SONGS
         else:
-            batch.max_bytes, batch.max_songs = constant.IMPORT_BATCH_BYTES, constant.IMPORT_BATCH_SONGS
+            batch.max_songs = constant.IMPORT_BATCH_SONGS
 
     def rest(self, batch) -> None:
         """천천히 모드에서 배치를 막 커밋했으면(쓰기 잠금을 놓은 상태) 일한 시간에 비례해 쉽니다."""

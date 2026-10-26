@@ -299,7 +299,7 @@ def test_job_rest_and_speed_change(monkeypatch):
     batch = db_module.Database().batch()
     job = importer.Job("tmp", "var/tmp", slow=True)
     job.apply_limits(batch)
-    assert (batch.max_bytes, batch.max_songs) == (constant.IMPORT_SLOW_BATCH_BYTES, constant.IMPORT_SLOW_BATCH_SONGS)
+    assert batch.max_songs == constant.IMPORT_SLOW_BATCH_SONGS
 
     # 쉬는 중에 보통 속도로 바꾸면 바로 이어서 진행합니다.
     job._work_since -= 100
@@ -309,7 +309,7 @@ def test_job_rest_and_speed_change(monkeypatch):
     assert time.monotonic() - started < 2
     assert not job.slow and not job.json()["resting"]
     job.apply_limits(batch)
-    assert (batch.max_bytes, batch.max_songs) == (constant.IMPORT_BATCH_BYTES, constant.IMPORT_BATCH_SONGS)
+    assert batch.max_songs == constant.IMPORT_BATCH_SONGS
 
 
 def test_set_job_speed(client, monkeypatch):
