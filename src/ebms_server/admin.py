@@ -1,4 +1,5 @@
 """관리자 페이지와 API. 웹 세션 쿠키로 로그인한 admin만 쓸 수 있습니다.
+API(`/api/admin/...`)는 관리자 API 키(api_keys.py)로도 부를 수 있습니다.
 
 - 전역 기본값(티켓 수·리필 시간·재차감 유효시간, 사전 다운로드 월 한도·초과 후 속도) 일괄 수정
 - 사용자 검색, 사용자별 한도 덮어쓰기(NULL이면 전역 기본값), 티켓 즉시 충전, 정지·해제
@@ -38,7 +39,15 @@ DELETE_LOCK_TIMEOUT = 10
 REASON_MAX = 1000
 
 
-def web_admin(session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)]) -> User:
+def web_admin(request: Request) -> User:
+    """웹 세션 쿠키로 로그인한 관리자, 또는 관리자 API 키(Bearer ebms_ak_...).
+
+    Authorization 헤더가 있으면 API 키만 봅니다. 클라이언트 세션키로는 관리자 API를 쓰지 못합니다.
+    """
+    if "authorization" in request.headers:
+        session = auth.api_key_session(request)
+    else:
+        session = auth.optional_session(request)
     if session is None:
         raise HTTPException(status_code=401, detail="login required")
     if not session[0].is_admin:
