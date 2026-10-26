@@ -2679,6 +2679,11 @@ class Database:
                     if row is None or row[0] != sha256:
                         con.rollback()
                         return False
+                    # write가 같은 이름의 옛 파일(커밋 전에 꺼진 이전 실행이 남긴 것)을 보고 건너뛰었다면, hold 전에
+                    # held를 본 store_gc가 그 파일을 지웠을 수 있습니다. 잠금 안에서는 gc가 돌지 않으므로 여기서 확인합니다(#158).
+                    path = store.full_path(rel)
+                    if not path.is_file() or path.stat().st_size != len(data):
+                        store.write(rel, data)
                     cur.execute(f"UPDATE {table} SET path = %s WHERE id = %s", (rel, row_id))
                     if table == "song":
                         cur.execute("UPDATE song SET data = NULL WHERE id = %s", (row_id,))
