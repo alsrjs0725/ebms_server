@@ -11,6 +11,8 @@
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
 - 파일이 SIMILAR_FILES개 미만인 곡(차분·추가 채보로 보이는 곡)은 겹치는 차트가 없으면 #TITLE·#ARTIST·#BPM·#GENRE 중
   2개 이상 같은 기존 곡을 비슷한 곡(similar) 후보로 찾고, 가장 많이 겹치는 곡이 하나면 auto는 그 곡에 추가합니다.
+  곡에 없는 키음이 있으면 기존 곡에 그 키음이 얼마나 있는지(음원 충족률)도 봅니다. 항목이 하나만 같아도 충족률이
+  SIMILAR_SOUNDS 이상이면 후보이고, auto로 추가하려면 가장 많이 겹치는 곡의 충족률이 SIMILAR_SOUNDS 이상이어야 합니다.
   파일이 그보다 많은 곡은 겹치는 차트로만 판정합니다.
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
@@ -30,7 +32,7 @@ import uuid
 import zipfile
 
 from . import cache, constant, db, importer, rar, sevenzip
-from .db import META_HEADERS, Database, _chart_refs, chart_meta, meta_keys, song_dir_entries
+from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,9 @@ SIMILAR_FILES = 50
 SIMILAR_MIN_FIELDS = 2
 # 비슷한 곡 후보 최대 수
 SIMILAR_LIMIT = 10
+# 음원 충족률: 곡에 없는 키음(#WAV) 중 기존 곡에 있는 비율. 이 값 이상이면 항목이 하나만 같아도 후보로 두고,
+# auto로 추가하려면 가장 많이 겹치는 곡이 이 값을 넘어야 합니다(곡에 없는 키음이 없으면 따지지 않음).
+SIMILAR_SOUNDS = 1.0
 # rar·7z는 풀린 크기를 미리 알 수 없어 압축 파일 크기의 이 배수로 추정합니다(캐시에 둘지 정할 때).
 EXTRACT_RATIO = 2
 
@@ -349,11 +354,53 @@ def _make_unit(unit_id: str, pack: pathlib.Path, name: str, folder: str) -> dict
     }
 
 
-def _similar(cur, unit: dict) -> tuple[list[int], dict[str, list[str]], int | None]:
+def _unit_entries(stage: dict, unit: dict) -> list[tuple[str, int]]:
+    """곡 안 파일 [(경로, 크기)] (폴더 제외)."""
+    pack = _pack_path(stage, unit)
+    if pack.is_file():
+        with zipfile.ZipFile(pack) as zf:
+            return [(i.filename, i.file_size) for i in zf.infolist() if not i.is_dir()]
+    root = _unit_dir(stage, unit)
+    entries = []
+    for path in root.rglob("*") if root.is_dir() else []:
+        if path.is_symlink() or not path.is_file():
+            continue
+        entries.append((path.relative_to(root).as_posix(), path.stat().st_size))
+    return entries
+
+
+def _sound_stems(paths) -> set[str]:
+    """오디오 파일의 소문자 확장자 뺀 경로."""
+    stems = set()
+    for path in paths:
+        stem, ext = posixpath.splitext(path.lower())
+        if ext in constant.AUDIO_FORMAT:
+            stems.add(stem)
+    return stems
+
+
+def _missing_sounds(stage: dict, unit: dict) -> list[frozenset[str]]:
+    """곡의 차트가 쓰는 키음 중 곡 안에 없는 것(chart_sounds 형식)."""
+    own = _sound_stems(path for path, _ in _unit_entries(stage, unit))
+    missing = set()
+    for chart in unit["charts"]:
+        try:
+            content = _read(stage, unit, chart["path"])
+        except (OSError, KeyError, zipfile.BadZipFile):
+            continue
+        for sound in chart_sounds(content, posixpath.dirname(chart["path"])):
+            if not sound & own:
+                missing.add(sound)
+    return sorted(missing, key=sorted)
+
+
+def _similar(cur, unit: dict, missing: list[frozenset[str]]) -> tuple[list[int], dict[str, list[str]], dict[str, float], int | None]:
     """파일이 적고 겹치는 차트가 없는 곡과 META_HEADERS 중 SIMILAR_MIN_FIELDS개 이상 같은 기존 곡.
-    (후보 곡 번호(많이 겹치는 순), {곡 번호: 같은 항목}, auto로 추가할 곡 번호(가장 많이 겹치는 곡이 하나일 때))."""
+    missing(곡에 없는 키음)이 있으면 기존 곡의 음원 충족률을 같이 보고, 충족률이 SIMILAR_SOUNDS 이상이면 항목이 하나만 같아도 후보입니다.
+    (후보 곡 번호(충족한 곡, 많이 겹치는 곡, 충족률 높은 곡 순), {곡 번호: 같은 항목}, {곡 번호: 충족률}(missing이 있을 때만),
+    auto로 추가할 곡 번호(가장 앞선 곡이 하나이고 missing이 없거나 충족률이 SIMILAR_SOUNDS 이상일 때))."""
     if unit["files"] >= SIMILAR_FILES:
-        return [], {}, None
+        return [], {}, {}, None
     mine = {field: {chart["keys"][field] for chart in unit["charts"] if chart["keys"].get(field)} for field in META_HEADERS}
     # 후보: 이름이나 작곡가가 같거나, BPM과 장르가 같은 차트의 곡. 두 항목이 같으려면 이 중 하나는 맞아야 합니다.
     where, args = [], []
@@ -366,30 +413,37 @@ def _similar(cur, unit: dict) -> tuple[list[int], dict[str, list[str]], int | No
             where.append("(bpm_key = %s AND genre_key = %s)")
             args.extend((bpm, genre))
     if not where:
-        return [], {}, None
+        return [], {}, {}, None
     cur.execute(f"SELECT DISTINCT song_id FROM chart WHERE song_id IS NOT NULL AND ({' OR '.join(where)})", tuple(args))
     ids = sorted(row[0] for row in cur.fetchall())
     if not ids:
-        return [], {}, None
-    cur.execute(
-        f"SELECT song_id, title_key, artist_key, bpm_key, genre_key FROM chart WHERE song_id IN ({', '.join(['%s'] * len(ids))})",
-        tuple(ids),
-    )
+        return [], {}, {}, None
+    marks = ", ".join(["%s"] * len(ids))
+    cur.execute(f"SELECT song_id, title_key, artist_key, bpm_key, genre_key FROM chart WHERE song_id IN ({marks})", tuple(ids))
     theirs: dict[int, dict[str, set[str]]] = {}
     for song_id, *keys in cur.fetchall():
         song = theirs.setdefault(song_id, {field: set() for field in META_HEADERS})
         for field, key in zip(META_HEADERS, keys):
             if key:
                 song[field].add(key)
+    rates: dict[int, float] = {}
+    if missing:
+        cur.execute(f"SELECT id, files FROM song WHERE id IN ({marks})", tuple(ids))
+        for song_id, files in cur.fetchall():
+            stems = _sound_stems(entry["path"] for entry in json.loads(files)) if files else set()
+            rates[song_id] = sum(1 for sound in missing if sound & stems) / len(missing)
+    full = lambda song_id: not missing or rates.get(song_id, 0.0) >= SIMILAR_SOUNDS
     matches = {}
     for song_id, song in theirs.items():
         same = [field for field in META_HEADERS if mine[field] & song[field]]
-        if len(same) >= SIMILAR_MIN_FIELDS:
+        if len(same) >= SIMILAR_MIN_FIELDS or (missing and same and full(song_id)):
             matches[song_id] = same
-    songs = sorted(matches, key=lambda i: (-len(matches[i]), i))[:SIMILAR_LIMIT]
-    top = [i for i in songs if len(matches[i]) == len(matches[songs[0]])] if songs else []
-    merge = top[0] if len(top) == 1 else None
-    return songs, {str(i): matches[i] for i in songs}, merge
+    rank = lambda song_id: (not full(song_id), -len(matches[song_id]), -rates.get(song_id, 0.0))
+    songs = sorted(matches, key=lambda i: (*rank(i), i))[:SIMILAR_LIMIT]
+    top = [i for i in songs if rank(i) == rank(songs[0])] if songs else []
+    merge = top[0] if len(top) == 1 and full(top[0]) else None
+    sounds = {str(i): round(rates.get(i, 0.0), 3) for i in songs} if missing else {}
+    return songs, {str(i): matches[i] for i in songs}, sounds, merge
 
 
 def _fill_meta(stage: dict, unit: dict) -> None:
@@ -431,17 +485,18 @@ def _analyze(stage: dict) -> None:
                 if chart["song_id"] is not None and chart["song_id"] not in songs:
                     songs.append(chart["song_id"])
             songs.sort()
-            merge, matches = None, {}
+            merge, matches, sounds = None, {}, {}
             if deleted is not None:
                 kind = "unused"
             elif not songs:
-                songs, matches, merge = _similar(cur, unit)
+                missing = _missing_sounds(stage, unit) if unit["files"] < SIMILAR_FILES else []
+                songs, matches, sounds, merge = _similar(cur, unit, missing)
                 kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches}
+            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds}
 
 
 def analyze(stage_id: str) -> dict:
@@ -939,22 +994,7 @@ def unit_files(stage_id: str, unit_id: str) -> list[dict]:
     if unit is None:
         raise StageError(404, "unit not found")
     charts = {chart["path"] for chart in unit["charts"]}
-    pack = _pack_path(stage, unit)
-    if pack.is_file():
-        with zipfile.ZipFile(pack) as zf:
-            files = [
-                {"path": i.filename, "size": i.file_size}
-                for i in zf.infolist() if not i.is_dir() and i.filename not in charts
-            ]
-        return sorted(files, key=lambda f: f["path"].lower())
-    root = _unit_dir(stage, unit)
-    files = []
-    for path in root.rglob("*") if root.is_dir() else []:
-        if path.is_symlink() or not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if rel not in charts:
-            files.append({"path": rel, "size": path.stat().st_size})
+    files = [{"path": path, "size": size} for path, size in _unit_entries(stage, unit) if path not in charts]
     return sorted(files, key=lambda f: f["path"].lower())
 
 

@@ -134,3 +134,13 @@ def test_pool_thread_safe(fake_pymysql):
         t.join()
     assert errors == []
     assert sum(c.open for c in fake_pymysql.created) <= 4
+
+
+def test_chart_sounds():
+    from ebms_server.db import chart_sounds
+    chart = "#WAV01 Sub\\Kick.wav\n#wav02 kick.wav\n#BMP01 bg.bmp\n#WAV03 キック.ogg\n".encode("cp932")
+    sounds = chart_sounds(chart, "d")
+    assert frozenset(["d/sub/kick"]) in sounds and frozenset(["d/kick"]) in sounds
+    assert any("d/キック" in s for s in sounds) and len(sounds) == 3
+    bmson = b'{"version": "1.0.0", "info": {"title": "x"}, "sound_channels": [{"name": "A.wav", "notes": []}], "bga": {"bga_header": [{"id": 1, "name": "bg.bmp"}]}}'
+    assert chart_sounds(bmson, "") == [frozenset(["a"])]

@@ -609,6 +609,27 @@ def _chart_refs(chart: bytes, base: str) -> tuple[list[tuple[str, tuple[str, ...
     return pre_targets, play_stems
 
 
+def chart_sounds(chart: bytes, base: str) -> list[frozenset[str]]:
+    """차트가 쓰는 키음(#WAV, bmson은 sound_channels). 키음마다 소문자 확장자 뺀 경로 후보(헤더 값의 인코딩 후보별)의 집합입니다."""
+    data = _bmson(chart)
+    if data is not None:
+        stems = set()
+        for item in data.get("sound_channels") or []:
+            name = item.get("name") if isinstance(item, dict) else None
+            if isinstance(name, str) and name.strip():
+                path = posixpath.normpath(posixpath.join(base, name.strip().replace("\\", "/"))).lower()
+                stems.add(frozenset([posixpath.splitext(path)[0]]))
+        return sorted(stems, key=sorted)
+    stems = set()
+    for line in chart.splitlines():
+        line = line.strip()
+        if line[:4].upper() == b"#WAV" and PLAY_HEADER.match(line):
+            paths = _header_paths(line[6:].strip(), base)
+            if paths:
+                stems.add(frozenset(posixpath.splitext(path)[0] for path in paths))
+    return sorted(stems, key=sorted)
+
+
 def kinds_from_charts(paths: list[str], charts: dict[str, bytes]) -> dict[str, str]:
     """곡 zip 항목별 다운로드 구분. paths는 파일 경로, charts는 그중 차트 파일의 {경로: 내용}입니다.
 

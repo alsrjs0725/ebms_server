@@ -70,7 +70,7 @@ def test_upload_is_staged_until_commit(client, monkeypatch):
     assert len(stages) == 1 and stages[0]["status"] == "ready" and stages[0]["units"] == 2
     assert stages[0]["counts"]["new"] == 1 and stages[0]["counts"]["add"] == 1
     got = units(client, job["stage_id"])
-    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None, "merge": None, "matches": {}}
+    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None, "merge": None, "matches": {}, "sounds": {}}
     assert got["pack/p/add"]["suggestion"]["kind"] == "add" and got["pack/p/add"]["suggestion"]["songs"] == [1]
     assert {c["path"]: c["song_id"] for c in got["pack/p/add"]["charts"]} == {"a.bms": 1, "extra.bms": None}
     assert detail(client, job["stage_id"])["songs"] == {"1": "base"}
@@ -337,7 +337,7 @@ def test_similar_songs_for_small_units(client, monkeypatch):
     got = units(client, sid)
     assert got["pack/small"]["suggestion"] == {
         "kind": "similar", "songs": [1, 2, 3], "deleted": None, "merge": 1,
-        "matches": {"1": ["title", "artist", "bpm", "genre"], "2": ["title", "bpm"], "3": ["bpm", "genre"]},
+        "matches": {"1": ["title", "artist", "bpm", "genre"], "2": ["title", "bpm"], "3": ["bpm", "genre"]}, "sounds": {},
     }
     assert got["pack/big"]["suggestion"]["kind"] == "new"
     tie = got["pack/tie"]["suggestion"]
@@ -358,6 +358,34 @@ def test_similar_songs_for_small_units(client, monkeypatch):
     commit_stage(client, sid)
     assert song_files(1) == ["a.bms", "k.wav", "k2.wav", "x.bms"]
     assert [r[0] for r in song_rows()] == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_similar_songs_by_sounds(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload_new(client, "base.zip", make_zip({
+        "b/a.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n#WAV02 snare.wav\n",
+        "b/kick.ogg": b"k", "b/sound/snare.wav": b"s",
+    }))
+    upload_new(client, "other.zip", make_zip({
+        "o/o.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 hat.wav\n", "o/hat.wav": b"h",
+    }))
+    job = stage(client, "pack.zip", make_zip({
+        # 이름이 달라 항목은 작곡가 하나만 같지만 없는 키음(kick, 확장자 무관)이 모두 1에만 있음 → 후보, auto는 1
+        "renamed/x.bms": b"#TITLE Renamed\n#ARTIST Comp\n#WAV01 kick.ogg\n#WAV02 own.wav\n", "renamed/own.wav": b"o",
+        # 항목은 1, 2와 똑같이 겹치지만 snare는 1에 sound/snare.wav로만 있어(경로가 다름) 1도 50% → 후보만, auto는 새 곡
+        "short/x.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#PLAYLEVEL 3\n#WAV01 kick.wav\n#WAV02 snare.wav\n",
+        # 같은 항목이 하나이고 키음도 없으면 후보가 아님
+        "none/x.bms": b"#TITLE Other\n#ARTIST Comp\n#WAV01 nothing.wav\n",
+    }))
+    got = units(client, job["stage_id"])
+    assert got["pack/renamed"]["suggestion"] == {
+        "kind": "similar", "songs": [1], "deleted": None, "merge": 1,
+        "matches": {"1": ["artist"]}, "sounds": {"1": 1.0},
+    }
+    short = got["pack/short"]["suggestion"]
+    assert short["kind"] == "similar" and short["songs"] == [1, 2] and short["merge"] is None
+    assert short["sounds"] == {"1": 0.5, "2": 0.0}
+    assert got["pack/none"]["suggestion"]["kind"] == "new"
 
 
 def test_analyze_fills_meta_of_old_units_and_backfill(client, monkeypatch):

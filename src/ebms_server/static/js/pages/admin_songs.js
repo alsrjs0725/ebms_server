@@ -922,18 +922,29 @@ function suggestionCell(stage, unit) {
         const div = document.createElement("div");
         div.className = "text-muted text-break";
         div.textContent = s.kind === "unused" ? `사용 중지 #${s.deleted}`
-            : s.kind === "similar" ? ids.map((id) => `${songName(stage, id)} (${s.matches[String(id)].map((f) => FIELD[f]).join("·")})`).join(", ")
+            : s.kind === "similar" ? ids.map((id) => `${songName(stage, id)} (${similarReason(s, id)})`).join(", ")
             : ids.map((id) => songName(stage, id)).join(", ");
         td.append(div);
     }
     if (s.kind === "similar") {
-        // 겹치는 채보는 없고 이름·작곡가·BPM·장르 중 2개 이상 같은 곡만 있을 때 "자동"이 하는 일
+        // 겹치는 채보는 없고 이름·작곡가·BPM·장르가 같거나 키음이 있는 곡만 있을 때 "자동"이 하는 일
         const div = document.createElement("div");
         div.className = "small";
-        div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 많이 겹침)` : "자동: 새 곡 (가장 많이 겹치는 곡이 여럿)";
+        const top = s.songs[0];
+        const short = !s.merge && s.sounds && top !== undefined && s.sounds[String(top)] < 1;
+        div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 많이 겹침)`
+            : short ? "자동: 새 곡 (가장 많이 겹치는 곡에 없는 키음이 있음)" : "자동: 새 곡 (가장 많이 겹치는 곡이 여럿)";
         td.append(div);
     }
     return td;
+}
+
+// 비슷한 곡인 이유: 같은 항목과, 곡에 없는 키음이 있으면 그 곡에 있는 비율
+function similarReason(s, id) {
+    const parts = (s.matches[String(id)] || []).map((f) => FIELD[f]);
+    const rate = s.sounds?.[String(id)];
+    if (rate !== undefined) parts.push(`키음 ${Math.round(rate * 100)}%`);
+    return parts.join("·");
 }
 
 function chartStatus(stage, chart) {
