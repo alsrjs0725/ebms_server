@@ -462,16 +462,31 @@ META_HEADERS = {"title": b"#TITLE", "artist": b"#ARTIST", "bpm": b"#BPM", "genre
 
 
 class ChartEncodingError(ValueError):
-    """BMS 차트의 헤더를 CHART_ENCODINGS 중 어느 것으로도 다 풀 수 없습니다."""
+    """BMS 차트의 비교용 헤더 값을 CHART_ENCODINGS 중 어느 것으로도 풀 수 없습니다."""
+
+
+def _meta_values(chart: bytes) -> dict[str, bytes]:
+    """BMS 차트의 META_HEADERS 값(처음 나온 것, 풀기 전 바이트)."""
+    values = {}
+    for line in chart.splitlines():
+        line = line.strip()
+        if not line.startswith(b"#"):
+            continue
+        for field, header in META_HEADERS.items():
+            if field not in values and line[:len(header)].upper() == header and line[len(header):len(header) + 1] in (b" ", b"\t"):
+                values[field] = line[len(header):].strip()
+        if len(values) == len(META_HEADERS):
+            break
+    return values
 
 
 def chart_encoding(chart: bytes) -> str:
-    """BMS 차트의 헤더 줄('#'로 시작) 전체를 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것(charset.guess_encoding).
-    차트 하나는 한 인코딩으로 쓰므로 헤더마다 따로 고르지 않습니다. 풀 수 없으면 대체하지 않고 ChartEncodingError."""
-    lines = [line for line in chart.splitlines() if line.lstrip().startswith(b"#") and not line.isascii()]
-    if not lines:
+    """BMS 차트의 비교용 헤더(META_HEADERS) 값을 모두 오류 없이 풀 수 있는 인코딩 중 이상한 문자가 가장 적은 것(charset.guess_encoding).
+    #WAV·#BMP 같은 파일명 줄은 _header_paths가 후보마다 따로 풀므로 보지 않습니다. 풀 수 없으면 ChartEncodingError."""
+    raws = [value for value in _meta_values(chart).values() if not value.isascii()]
+    if not raws:
         return "utf-8"
-    encoding, failures = charset.guess_encoding(lines, CHART_ENCODINGS)
+    encoding, failures = charset.guess_encoding(raws, CHART_ENCODINGS)
     if encoding is None:
         raise ChartEncodingError("차트 헤더의 인코딩을 알 수 없습니다(" + "; ".join(failures) + ")")
     return encoding
@@ -515,17 +530,22 @@ def chart_meta(chart: bytes) -> dict[str, str]:
             "bpm": _bmson_text(info.get("init_bpm")),
             "genre": _bmson_text(info.get("genre")),
         }
-    encoding = chart_encoding(chart)
-    meta = {}
-    for line in chart.splitlines():
-        line = line.strip()
-        if not line.startswith(b"#"):
-            continue
-        for field, header in META_HEADERS.items():
-            if field not in meta and line[:len(header)].upper() == header and line[len(header):len(header) + 1] in (b" ", b"\t"):
-                meta[field] = line[len(header):].strip().decode(encoding)
-        if len(meta) == len(META_HEADERS):
-            break
+    values = _meta_values(chart)
+    try:
+        encoding = chart_encoding(chart)
+        meta = {field: value.decode(encoding) for field, value in values.items()}
+    except ChartEncodingError:
+        # 한 인코딩으로 다 풀리지 않으면(일본 곡의 한국어 차분 등) 값마다 따로 고릅니다. 그래도 안 풀리는 값이 있으면 오류입니다.
+        meta = {}
+        failures = []
+        for field, value in values.items():
+            encoding, reasons = charset.guess_encoding([value], CHART_ENCODINGS)
+            if encoding is None:
+                failures.append(f"{META_HEADERS[field].decode()}: " + "; ".join(reasons))
+            else:
+                meta[field] = value.decode(encoding)
+        if failures:
+            raise ChartEncodingError("차트 헤더의 인코딩을 알 수 없습니다(" + " / ".join(failures) + ")") from None
     return {field: meta.get(field, "") for field in META_HEADERS}
 
 
@@ -2659,6 +2679,11 @@ class Database:
                     if row is None or row[0] != sha256:
                         con.rollback()
                         return False
+                    # write가 같은 이름의 옛 파일(커밋 전에 꺼진 이전 실행이 남긴 것)을 보고 건너뛰었다면, hold 전에
+                    # held를 본 store_gc가 그 파일을 지웠을 수 있습니다. 잠금 안에서는 gc가 돌지 않으므로 여기서 확인합니다(#158).
+                    path = store.full_path(rel)
+                    if not path.is_file() or path.stat().st_size != len(data):
+                        store.write(rel, data)
                     cur.execute(f"UPDATE {table} SET path = %s WHERE id = %s", (rel, row_id))
                     if table == "song":
                         cur.execute("UPDATE song SET data = NULL WHERE id = %s", (row_id,))

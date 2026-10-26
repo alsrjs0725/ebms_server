@@ -532,6 +532,42 @@ def test_chart_encoding_error_unit_is_held_and_downloadable(client, monkeypatch)
     assert client.get("/api/admin/import/stages").json() == []
 
 
+def test_chart_encoding_ignores_file_name_headers():
+    """비교용 헤더(#TITLE 등)만 보고 인코딩을 고릅니다. #WAV 파일명이 다른 인코딩이어도 등록됩니다(#157)."""
+    chart = "#TITLE 노래\n#ARTIST 바다\n".encode("cp949") + "#WAV01 ソナタ.wav\n".encode("cp932")
+    assert db_module.chart_encoding(chart) == "cp949"
+    assert db_module.chart_meta(chart)["title"] == "노래"
+    # 비교용 헤더끼리 인코딩이 다르면 값마다 따로 고릅니다.
+    mixed = "#TITLE 노래\n".encode("cp949") + "#ARTIST ソナタ\n".encode("cp932")
+    assert db_module.chart_meta(mixed)["title"] == "노래"
+    assert db_module.chart_meta(mixed)["artist"] == "ソナタ"
+    # 어느 인코딩으로도 안 풀리는 값이 있으면 그대로 오류입니다.
+    with pytest.raises(db_module.ChartEncodingError, match="#ARTIST"):
+        db_module.chart_meta("#TITLE 노래\n".encode("cp949") + b"#ARTIST \x85\x40\n")
+
+
+def test_commit_unit_with_skipped_broken_chart(client, monkeypatch):
+    """헤더 인코딩 오류가 난 차트만 제외(skip)로 두면 같은 곡의 나머지 차트는 등록됩니다(#157)."""
+    admin_login(client, monkeypatch)
+    job = stage(client, "pack.zip", make_zip({
+        "p/s/a.bms": "#TITLE 한글\n".encode("cp949"),
+        "p/s/b.bms": b"#TITLE \x85\x40\n",
+        "p/s/k.wav": b"k",
+    }))
+    sid = job["stage_id"]
+    held = units(client, sid)["pack/p/s"]
+    assert "b.bms" in held["error"]
+    # 오류가 없는 차트만 제외해도 등록할 수 없습니다.
+    assert set_target(client, sid, held, "auto", {"a.bms": "skip"}).status_code == 200
+    commit_stage(client, sid)
+    assert not song_rows()
+    assert set_target(client, sid, held, "auto", {"a.bms": None, "b.bms": "skip"}).status_code == 200
+    done = commit_stage(client, sid)
+    assert not any(s.get("error") for s in done["songs"]), done["songs"]
+    assert len(song_rows()) == 1
+    assert client.get("/api/admin/import/stages").json() == []
+
+
 def test_download_old_unpacked_unit(client, monkeypatch):
     admin_login(client, monkeypatch)
     job = stage(client, "pack.zip", make_zip({"s/a.bms": b"#TITLE A\n", "s/k.wav": b"k"}))

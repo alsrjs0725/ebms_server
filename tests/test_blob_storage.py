@@ -423,6 +423,29 @@ def test_store_gc(tmp_path, database, monkeypatch):
     assert not store.full_path(held).exists()
 
 
+def test_move_to_store_rewrites_file_removed_by_gc(tmp_path, database, monkeypatch):
+    """이전 실행이 남긴 같은 이름의 파일을 보고 쓰기를 건너뛴 사이 store_gc가 그 파일을 지워도, 커밋 전에 다시 씁니다(#158)."""
+    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n", "b.bmp": os.urandom(3000)}))
+    data = to_legacy("song", 1)
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT sha256 FROM song WHERE id = 1")
+        rel = store.song_path(1, cur.fetchone()[0])
+    store.write(rel, data)  # 커밋 전에 꺼진 이전 실행이 남긴 파일
+    write = store.write
+
+    def write_then_gc(path, content):
+        result = write(path, content)
+        # hold하기 전에 held를 본 store_gc가 이 파일을 지운 경우
+        store.full_path(path).unlink()
+        monkeypatch.setattr(store, "write", write)
+        return result
+
+    monkeypatch.setattr(store, "write", write_then_gc)
+    assert database._move_to_store("song", 1)
+    assert store.read(rel) == data
+    assert count("SELECT COUNT(*) FROM song_part") == 0
+
+
 def test_open_blob_keeps_reading_replaced_file(tmp_path, database, monkeypatch):
     """받는 중에 새 판으로 바뀌어 옛 파일이 지워져도 열어 둔 파일로 끝까지 읽습니다."""
     database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n"}))

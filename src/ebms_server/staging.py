@@ -890,6 +890,14 @@ def _changed(unit: dict) -> bool:
     return unit["target"] != "auto" or any(chart["target"] is not None for chart in unit["charts"])
 
 
+def _blocked(unit: dict) -> bool:
+    """commit할 수 없는 곡. 헤더 인코딩 오류가 난 차트가 모두 제외(skip)면 나머지 차트는 넣을 수 있습니다."""
+    if not unit.get("error"):
+        return False
+    broken = [chart for chart in unit["charts"] if chart.get("error")]
+    return not broken or any(_chart_target(unit, chart) != "skip" for chart in broken)
+
+
 def _effective_skip(unit: dict) -> bool:
     return all(_chart_target(unit, chart) == "skip" for chart in unit["charts"])
 
@@ -1177,8 +1185,8 @@ def commit(stage_id: str, job: importer.Job) -> None:
     try:
         with Database().batch() as batch:
             for unit in units:
-                if unit.get("error") and not _effective_skip(unit):
-                    # 등록할 수 없는 곡은 제외(skip)로 두지 않는 한 건드리지 않고 묶음에 남깁니다.
+                if _blocked(unit):
+                    # 등록할 수 없는 곡은 오류가 난 차트를 제외(skip)로 두지 않는 한 건드리지 않고 묶음에 남깁니다.
                     job.songs.append({"folder": unit["folder"], "error": unit["error"]})
                     continue
                 groups = _groups(unit)
