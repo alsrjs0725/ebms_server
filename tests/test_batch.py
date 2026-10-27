@@ -1,4 +1,5 @@
 """여러 곡을 한 트랜잭션(배치)으로 넣고 청크는 배치마다 한 번만 갱신하는지 테스트합니다."""
+import hashlib
 import io
 import os
 import zipfile
@@ -213,13 +214,31 @@ def test_overlapping_chart_conflicts_keep_existing(database):
     pkg = put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "c.bms": c2, "k.wav": b"new", "m.wav": b"m"})
     songs = importer.import_tmp()
     assert songs == [{
-        "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "added_files": ["m.wav"], "conflicts": ["c.bms", "k.wav"],
+        "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1,
+        "added_files": ["m.wav"], "conflicts": ["k.wav"], "kept_charts": ["c.bms"],
     }]
     assert song_zip(1) == {"a.bms": a, "c.bms": c1, "k.wav": b"old", "m.wav": b"m"}
-    # 곡 zip에 넣지 못한 차트는 등록하지 않고, 원본 폴더는 남깁니다.
-    assert rows("SELECT COUNT(*) FROM chart")[0][0] == 2
+    # 내용이 다른 차트는 zip에 기존 것을 두고 차트로만 등록합니다(클라이언트는 차트 청크에서 받음).
+    # 다른 파일이 충돌했으므로 원본 폴더는 남깁니다.
+    assert rows("SELECT COUNT(*) FROM chart WHERE song_id = 1")[0][0] == 3
     assert pkg.exists()
+
+
+def test_overlapping_chart_different_chart_only_is_not_conflict(database):
+    a, c1, c2 = b"#TITLE A\n", b"#TITLE C1\n", b"#TITLE C2\n"
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "c.bms": c1})
+    importer.import_tmp()
+
+    pkg = put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "c.bms": c2})
+    songs = importer.import_tmp()
+    assert songs == [{
+        "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 2, "new_charts": 1, "kept_charts": ["c.bms"],
+    }]
+    assert song_zip(1) == {"a.bms": a, "c.bms": c1}
+    assert sorted(c["sha256"] for c in manifest_entry(1)["chart_files"]) == sorted(
+        hashlib.sha256(c).hexdigest() for c in (a, c1, c2)
+    )
+    assert not pkg.exists()
 
 
 def test_overlapping_multiple_songs_is_not_registered(database):

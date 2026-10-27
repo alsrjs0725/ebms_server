@@ -573,6 +573,7 @@ function songLine(song) {
         li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
         if (song.added_files) li.append(`, 기존 곡에 파일 ${song.added_files.length}개 추가`);
         if (song.similar_files) li.append(`, 내용이 달라도 같은 소재로 본 파일 ${song.similar_files.length}개(용량이 작은 쪽 유지, 새 파일로 바꿈 ${(song.replaced_files || []).length}개)`);
+        if (song.kept_charts) li.append(`, 내용이 다른 같은 이름 차트 ${song.kept_charts.length}개는 차트로만 등록(곡 파일은 기존 유지)`);
         if (song.conflicts) {
             const warn = document.createElement("span");
             warn.className = "text-warning-emphasis";
