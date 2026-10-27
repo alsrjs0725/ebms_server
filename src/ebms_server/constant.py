@@ -8,6 +8,8 @@ BMS_FORMAT = (".bms", ".bme", ".bml", ".pms", ".bmson")
 # 차트 헤더가 가리키는 파일의 확장자가 실제와 달라도 같은 종류면 같은 파일로 봅니다.
 IMAGE_FORMAT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
 AUDIO_FORMAT = (".wav", ".ogg", ".mp3", ".flac")
+# BGA 영상(media_match가 다시 인코딩만 다른지 볼 때 씁니다)
+VIDEO_FORMAT = (".mpg", ".mpeg", ".mp4", ".m4v", ".avi", ".wmv", ".webm", ".mkv", ".flv", ".mov")
 DB_HOST = os.environ.get("EBMS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("EBMS_DB_PORT", "3306"))
 DB_USER = os.environ.get("EBMS_DB_USER", "ebms")
