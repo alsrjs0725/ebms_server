@@ -25,7 +25,8 @@ from . import constant, preview
 logger = logging.getLogger(__name__)
 
 SOUND_FORMAT = constant.AUDIO_FORMAT
-IMAGE_FORMAT = constant.IMAGE_FORMAT
+# beatoraja BGImageProcessor.pic_extension에 있는 .tga까지
+IMAGE_FORMAT = (*constant.IMAGE_FORMAT, ".tga")
 VIDEO_FORMAT = constant.VIDEO_FORMAT
 
 SOUND_RATE = 8000
@@ -64,6 +65,16 @@ def kind(path: str) -> str | None:
     if suffix in VIDEO_FORMAT:
         return "video"
     return None
+
+
+def slot(path: str) -> tuple[str, str] | None:
+    """플레이어가 같은 파일 자리로 읽는 (확장자 뺀 소문자 경로, 묶음). 키음은 키음끼리, BGA는 이미지·영상이 한 묶음입니다.
+    beatoraja는 #WAV가 가리키는 파일이 없거나 못 풀면 .wav·.flac·.ogg·.mp3를 차례로 찾고(AudioDriver.getResources),
+    #BMP는 이미지↔이미지·영상↔영상으로 확장자를 바꿔 찾고 없으면 영상·이미지 확장자를 다 찾습니다(BGAProcessor)."""
+    k = kind(path)
+    if k is None:
+        return None
+    return pathlib.PurePosixPath(path.lower()).with_suffix("").as_posix(), "sound" if k == "sound" else "bga"
 
 
 def same_files(pairs: list[tuple[str, bytes, pathlib.Path]]) -> set[str]:

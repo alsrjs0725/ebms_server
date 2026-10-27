@@ -2299,8 +2299,9 @@ class Database:
     def _merge_into_song(self, root: pathlib.Path, song_id: int, cur) -> tuple[int, list[str], list[str], list[str]] | None:
         """새 폴더에서 기존 곡 zip에 없는 파일을 그 곡 zip에 더합니다(겹치는 차트로 같은 곡이라고 본 경우).
 
-        같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 둡니다. 키음·이미지·영상은 풀어서 비교해
-        같은 소재(다시 인코딩만 다름, media_match)로 보이면 그대로 넘어가고, 그 밖에는 충돌로 돌려줍니다.
+        같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 둡니다. 키음·이미지·영상은 확장자만 다른 파일
+        (k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg, media_match.slot)도 같은 자리로 보고, 풀어서 비교해 같은 소재
+        (다시 인코딩만 다름)로 보이면 더하지 않고 넘어가며, 그 밖에는 충돌로 돌려줍니다.
         (새 zip 크기, 더한 경로, 충돌 경로, 같은 소재로 본 경로)를 반환합니다. 더할 파일이 없으면 크기는 0이고 곡은 그대로입니다.
         새 zip이 패킷 한도를 넘으면 None.
         """
@@ -2313,17 +2314,26 @@ class Database:
         media: list[tuple[str, bytes, pathlib.Path]] = []  # 내용이 다른 키음·이미지·영상(기존 내용, 새 파일)
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             existing = {info.filename.rstrip("/").lower(): info for info in zf.infolist()}
+            # 확장자만 다른 파일(k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg). 플레이어는 확장자가 달라도 같은 자리로 대신 읽습니다(media_match.slot).
+            slots: dict[tuple[str, str], zipfile.ZipInfo] = {}
+            for name, info in sorted(existing.items()):
+                if not info.is_dir() and (key := media_match.slot(name)) is not None:
+                    slots.setdefault(key, info)
             for path, is_dir in song_dir_entries(root):
                 if is_dir:
                     continue
                 arcname = path.relative_to(resolved).as_posix()
                 content = path.read_bytes()
                 info = existing.get(arcname.lower())
+                kind = media_match.kind(arcname)
+                if info is None and kind is not None:
+                    info = slots.get(media_match.slot(arcname))
                 if info is None:
                     new_files.append((arcname, content))
-                elif info.is_dir():
+                elif info.is_dir() or (kind is not None and media_match.kind(info.filename) != kind):
+                    # 같은 BGA 자리에 이미지와 영상: 같은 소재로 볼 수 없습니다.
                     conflicts.append(arcname)
-                elif media_match.kind(arcname) is not None:
+                elif kind is not None:
                     old = zf.read(info)
                     if old != content:
                         media.append((arcname, old, path))

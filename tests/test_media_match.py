@@ -114,3 +114,47 @@ def test_merge_keeps_same_media_without_conflict(database, tmp_path):
     }]
     assert song_zip(1) == {"a.bms": a, "k.wav": wav, "x.wav": wav}
     assert pkg.exists()
+
+
+@needs_ffmpeg
+def test_merge_matches_other_extension(database, tmp_path):
+    """확장자만 다른 키음(k.wav ↔ k.ogg)도 같은 파일로 보고 비교합니다."""
+    a = b"#TITLE A\n"
+    wav = sine(tmp_path, "a.wav", 440)
+    other = sine(tmp_path, "b.wav", 880)
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "k.wav": wav, "x.wav": wav})
+    importer.import_tmp()
+
+    ogg = sine(tmp_path, "a.ogg", 440, 1.0, "-c:a", "libvorbis", "-q:a", "2")
+    other_ogg = ffmpeg(tmp_path, "b.ogg", "-i", str(tmp_path / "b.wav"), "-c:a", "libvorbis")
+    put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "k.ogg": ogg, "x.ogg": other_ogg, "n.ogg": ogg})
+    songs = importer.import_tmp()
+    assert songs == [{
+        "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
+        "added_files": ["n.ogg"], "conflicts": ["x.ogg"], "similar_files": ["k.ogg"],
+    }]
+    assert set(song_zip(1)) == {"a.bms", "k.wav", "x.wav", "n.ogg"}
+    assert other  # b.wav는 b.ogg를 만드는 데 씁니다.
+
+
+@needs_ffmpeg
+def test_merge_matches_bga_by_name(database, tmp_path):
+    """BGA는 이미지·영상이 한 자리입니다: 확장자만 다른 같은 그림은 같고, 이미지 자리에 영상은 충돌입니다."""
+    a = b"#TITLE A\n"
+    bmp = image(tmp_path, "a.bmp")
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "bg.bmp": bmp, "mv.bmp": bmp})
+    importer.import_tmp()
+
+    png = image(tmp_path, "a.png")
+    mpg = video(tmp_path, "a.mpg", "testsrc", 2, "-c:v", "mpeg1video")
+    put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "BG.PNG": png, "mv.mpg": mpg})
+    songs = importer.import_tmp()
+    assert songs[0]["similar_files"] == ["BG.PNG"] and songs[0]["conflicts"] == ["mv.mpg"]
+    assert set(song_zip(1)) == {"a.bms", "bg.bmp", "mv.bmp"}
+
+
+def test_slot():
+    assert media_match.slot("Sub/K.WAV") == media_match.slot("sub/k.ogg") == ("sub/k", "sound")
+    assert media_match.slot("bg.bmp") == media_match.slot("bg.mpg") == media_match.slot("bg.tga") == ("bg", "bga")
+    assert media_match.slot("bg.bmp") != media_match.slot("bg.wav")
+    assert media_match.slot("a.bms") is None
