@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pymysql
 
-from . import charset, constant, preview, store
+from . import charset, constant, media_match, preview, store
 
 SCHEMA = [
     """
@@ -2296,11 +2296,15 @@ class Database:
         cur.execute("UPDATE song SET path = %s, data = NULL WHERE id = %s", (path, song_id))
         cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
 
-    def _merge_into_song(self, root: pathlib.Path, song_id: int, cur) -> tuple[int, list[str], list[str]] | None:
+    def _merge_into_song(self, root: pathlib.Path, song_id: int, cur) -> tuple[int, list[str], list[str], list[str]] | None:
         """새 폴더에서 기존 곡 zip에 없는 파일을 그 곡 zip에 더합니다(겹치는 차트로 같은 곡이라고 본 경우).
 
-        같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 두고 충돌로 돌려줍니다.
-        (새 zip 크기, 더한 경로, 충돌 경로)를 반환합니다. 더할 파일이 없으면 크기는 0이고 곡은 그대로입니다.
+        같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 둡니다. 키음·이미지·영상은 확장자만 다른 파일
+        (k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg, media_match.slot)도 같은 자리로 보고, 풀어서 비교해 같은 소재
+        (다시 인코딩만 다름)로 보이면 둘 중 용량이 작은 쪽을 남기고(새 파일이 작으면 기존 파일을 새 파일로 바꿈),
+        그 밖에는 기존 것을 두고 충돌로 돌려줍니다.
+        (새 zip 크기, 더하거나 바꿔 넣은 경로, 충돌 경로, 같은 소재로 본 경로)를 반환합니다.
+        더하거나 바꿀 파일이 없으면 크기는 0이고 곡은 그대로입니다.
         새 zip이 패킷 한도를 넘으면 None.
         """
         data = self._get_song_data_with_cur(cur, song_id)
@@ -2309,27 +2313,64 @@ class Database:
         resolved = root.resolve()
         new_files: list[tuple[str, bytes]] = []
         conflicts: list[str] = []
+        media: list[tuple[str, bytes, pathlib.Path]] = []  # 내용이 다른 키음·이미지·영상(기존 내용, 새 파일)
+        media_old: dict[str, str] = {}  # 그 새 파일이 겨룬 기존 항목 이름
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             existing = {info.filename.rstrip("/").lower(): info for info in zf.infolist()}
+            # 확장자만 다른 파일(k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg). 플레이어는 확장자가 달라도 같은 자리로 대신 읽습니다(media_match.slot).
+            slots: dict[tuple[str, str], zipfile.ZipInfo] = {}
+            for name, info in sorted(existing.items()):
+                if not info.is_dir() and (key := media_match.slot(name)) is not None:
+                    slots.setdefault(key, info)
             for path, is_dir in song_dir_entries(root):
                 if is_dir:
                     continue
                 arcname = path.relative_to(resolved).as_posix()
                 content = path.read_bytes()
                 info = existing.get(arcname.lower())
+                kind = media_match.kind(arcname)
+                if info is None and kind is not None:
+                    info = slots.get(media_match.slot(arcname))
                 if info is None:
                     new_files.append((arcname, content))
-                elif info.is_dir() or info.file_size != len(content) or zf.read(info) != content:
+                elif info.is_dir() or (kind is not None and media_match.kind(info.filename) != kind):
+                    # 같은 BGA 자리에 이미지와 영상: 같은 소재로 볼 수 없습니다.
                     conflicts.append(arcname)
-        conflicts.sort()
+                elif kind is not None:
+                    old = zf.read(info)
+                    if old != content:
+                        media.append((arcname, old, path))
+                        media_old[arcname] = info.filename
+                elif info.file_size != len(content) or zf.read(info) != content:
+                    conflicts.append(arcname)
+        same = media_match.same_files(media)
+        similar = sorted(arcname for arcname, _, _ in media if arcname in same)
+        conflicts = sorted(conflicts + [arcname for arcname, _, _ in media if arcname not in same])
+        # 같은 소재면 용량이 작은 쪽을 남깁니다. 새 파일이 작으면 기존 항목을 빼고 새 파일을 넣습니다.
+        smaller = [(arcname, path) for arcname, old, path in media if arcname in same and path.stat().st_size < len(old)]
+        dropped = {media_old[arcname] for arcname, _ in smaller}
+        new_files += [(arcname, path.read_bytes()) for arcname, path in smaller]
+        if similar:
+            self.logger.info(
+                f"insert_song: Song[{song_id}] judged the same media {similar}, replaced with smaller new ones "
+                f"{sorted(a for a, _ in smaller)}[{root}]"
+            )
         if conflicts:
             self.logger.warning(
                 f"insert_song: Song[{song_id}] kept existing files; skipped different ones {conflicts}[{root}]"
             )
         if not new_files:
-            return 0, [], conflicts
+            return 0, [], conflicts, similar
 
-        buf = io.BytesIO(data)
+        if dropped:
+            # 바꿀 항목이 있으면 그 항목을 뺀 zip을 새로 씁니다(나머지 항목은 압축 방식 그대로).
+            buf = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as zf:
+                for info in src.infolist():
+                    if info.filename not in dropped:
+                        zf.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=6)
+        else:
+            buf = io.BytesIO(data)
         # 기존 항목은 그대로 두고 뒤에 붙입니다(기존 항목의 위치·압축 데이터가 바뀌지 않음).
         with zipfile.ZipFile(buf, mode="a") as zf:
             for arcname, content in new_files:
@@ -2342,7 +2383,7 @@ class Database:
         self._put_song_data(cur, song_id, data)
         added = sorted(arcname for arcname, _ in new_files)
         self.logger.info(f"insert_song: Merged {len(added)} files into song[{song_id}, {len(data)} bytes]")
-        return len(data), added, conflicts
+        return len(data), added, conflicts, similar
 
     def _insert_or_update_charts(self, root: pathlib.Path, bms_files: list, song_id: int, cur) -> tuple[list, int]:
         """(차트 청크에 넣을 새 차트, 지운 곡에서 남은 차트를 이 곡에 다시 붙인 수)를 반환합니다."""
@@ -2979,6 +3020,7 @@ class SongBatch:
             song_bytes = 0
             added: list[str] = []
             conflicts: list[str] = []
+            similar: list[str] = []
             if not existing:
                 song_id, song_bytes = self.db._insert_new_song(root, cur)
                 if song_id is None:
@@ -2992,7 +3034,7 @@ class SongBatch:
                 if merged is None:
                     cur.execute("ROLLBACK TO SAVEPOINT song")
                     return None
-                song_bytes, added, conflicts = merged
+                song_bytes, added, conflicts, similar = merged
                 # 내용이 달라 곡 zip에 넣지 못한 차트는 등록하지 않습니다(zip의 같은 경로 파일과 어긋나므로).
                 bms_files = [f for f in bms_files if f[0].relative_to(root).as_posix() not in conflicts]
             new_charts, reattached = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
@@ -3021,10 +3063,16 @@ class SongBatch:
             "charts": len(bms_files),
             "new_charts": len(new_charts),
         }
-        if added:
-            info["added_files"] = added
+        # 같은 소재여서 더 작은 새 파일로 바꿔 넣은 파일은 "replaced_files"로 따로 적습니다.
+        replaced = [a for a in added if a in similar]
+        if len(replaced) < len(added):
+            info["added_files"] = [a for a in added if a not in similar]
         if conflicts:
             info["conflicts"] = conflicts
+        if similar:
+            info["similar_files"] = similar
+        if replaced:
+            info["replaced_files"] = replaced
         self._infos.append(info)
 
         if (

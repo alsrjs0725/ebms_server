@@ -572,6 +572,7 @@ function songLine(song) {
         badge.textContent = song.new_song ? `새 곡 #${song.song_id}` : `기존 곡 #${song.song_id}`;
         li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
         if (song.added_files) li.append(`, 기존 곡에 파일 ${song.added_files.length}개 추가`);
+        if (song.similar_files) li.append(`, 내용이 달라도 같은 소재로 본 파일 ${song.similar_files.length}개(용량이 작은 쪽 유지, 새 파일로 바꿈 ${(song.replaced_files || []).length}개)`);
         if (song.conflicts) {
             const warn = document.createElement("span");
             warn.className = "text-warning-emphasis";
@@ -602,7 +603,7 @@ function matches(song) {
     if (filterLevel.value && songLevel(song) !== filterLevel.value) return false;
     const q = filterText.value.trim().toLowerCase();
     if (!q) return true;
-    const text = [song.folder, song.error, song.song_id, ...(song.conflicts || []), ...(song.added_files || [])].join("\n");
+    const text = [song.folder, song.error, song.song_id, ...(song.conflicts || []), ...(song.added_files || []), ...(song.similar_files || [])].join("\n");
     return text.toLowerCase().includes(q);
 }
 
