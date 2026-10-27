@@ -82,6 +82,9 @@ def test_recompressed_image_is_same(tmp_path):
     edited = ffmpeg(tmp_path, "c.png", "-i", str(tmp_path / "a.png"), "-vf", "drawbox=x=10:y=10:w=16:h=16:color=red:t=fill")
     assert judge(tmp_path, "bg.png", png, jpg)
     assert judge(tmp_path, "bg.bmp", png, bmp)
+    # 크기만 줄인 그림(256→128)도 같음
+    small = ffmpeg(tmp_path, "s.png", "-i", str(tmp_path / "a.png"), "-vf", "scale=128:128")
+    assert judge(tmp_path, "bg4.png", png, small)
     assert not judge(tmp_path, "bg2.png", png, other)
     assert not judge(tmp_path, "bg3.png", png, edited)
 

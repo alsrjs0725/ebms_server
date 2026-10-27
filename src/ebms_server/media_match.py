@@ -8,7 +8,7 @@ ffmpeg로 풀고, 풀지 못하거나(ffmpeg 없음, 깨진 파일) 다르다고
 - 키음: 모노 SOUND_RATE Hz로 풀어(최대 SOUND_SECONDS초) 길이가 SOUND_LENGTH_TOLERANCE 안이고,
   인코더 지연(SOUND_MAX_LAG초 안)을 맞춘 뒤 정규화 상관계수가 SOUND_MIN_CORRELATION 이상이면 같습니다.
   둘 다 거의 무음이면 길이만 봅니다. 음량만 다른 것은 같은 것으로 봅니다(상관계수는 크기에 무관).
-- 이미지: IMAGE_SIZE×IMAGE_SIZE RGBA로 줄여 픽셀 차이 평균이 IMAGE_MAX_MEAN_DIFF 이하이고
+- 이미지: IMAGE_SIZE×IMAGE_SIZE RGBA로 (면적 평균으로) 줄여 픽셀 차이 평균이 IMAGE_MAX_MEAN_DIFF 이하이고
   어느 채널이든 IMAGE_PIXEL_DIFF보다 많이 다른 픽셀이 IMAGE_MAX_CHANGED 이하이면 같습니다(움직이는 gif는 첫 프레임).
 - 영상: VIDEO_FPS 간격으로 뽑은 프레임(VIDEO_SIZE×VIDEO_SIZE 흑백, 최대 VIDEO_SECONDS초) 수 차이가
   VIDEO_FRAME_TOLERANCE 안이고, 프레임 차이 평균이 VIDEO_MAX_MEAN_DIFF 이하이면 같습니다.
@@ -40,10 +40,10 @@ SOUND_MIN_CORRELATION = 0.8
 # 이 RMS 미만이면 무음으로 봅니다.
 SOUND_SILENCE_RMS = 1e-4
 
-IMAGE_SIZE = 128
+IMAGE_SIZE = 64
 # 0~1(255 단계를 1로) 기준
 IMAGE_MAX_MEAN_DIFF = 0.02
-IMAGE_PIXEL_DIFF = 0.15
+IMAGE_PIXEL_DIFF = 0.25
 IMAGE_MAX_CHANGED = 0.002
 
 VIDEO_FPS = 0.5
@@ -182,7 +182,8 @@ def _best_lag(a: np.ndarray, b: np.ndarray, max_lag: int) -> int:
 
 
 def _same_images(ffmpeg, items, work) -> set[str]:
-    args = ["-frames:v", "1", "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}", "-pix_fmt", "rgba", "-f", "rawvideo"]
+    # 면적 평균으로 줄여, 크기만 바꾼 그림(512→256 등)의 가장자리 차이가 남지 않게 합니다.
+    args = ["-frames:v", "1", "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}:flags=area", "-pix_fmt", "rgba", "-f", "rawvideo"]
     size = IMAGE_SIZE * IMAGE_SIZE * 4
     return {
         path for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v")
@@ -200,7 +201,7 @@ def same_image(a: np.ndarray, b: np.ndarray) -> bool:
 def _same_videos(ffmpeg, items, work) -> set[str]:
     args = [
         "-t", f"{VIDEO_SECONDS:.3f}", "-an",
-        "-vf", f"fps={VIDEO_FPS},scale={VIDEO_SIZE}:{VIDEO_SIZE}", "-pix_fmt", "gray", "-f", "rawvideo",
+        "-vf", f"fps={VIDEO_FPS},scale={VIDEO_SIZE}:{VIDEO_SIZE}:flags=area", "-pix_fmt", "gray", "-f", "rawvideo",
     ]
     frame = VIDEO_SIZE * VIDEO_SIZE
     same = set()
