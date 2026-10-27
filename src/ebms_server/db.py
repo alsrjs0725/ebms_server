@@ -821,20 +821,34 @@ def _safe_entry(path: pathlib.Path, root: pathlib.Path, is_dir: bool) -> bool:
     return True
 
 
+# OS가 폴더에 만드는 파일(탐색기 설정·썸네일 캐시, macOS 메타데이터). 플레이에 쓰이지 않으므로 곡에 넣지 않습니다.
+JUNK_FILES = {"desktop.ini", "thumbs.db", "ehthumbs.db", ".ds_store"}
+JUNK_DIRS = {"__macosx"}
+
+
+def is_junk(name: str, is_dir: bool) -> bool:
+    """곡에 넣지 않는 OS 잡파일·폴더 이름인지. ._로 시작하는 파일은 macOS AppleDouble입니다."""
+    lower = name.lower()
+    if is_dir:
+        return lower in JUNK_DIRS
+    return lower in JUNK_FILES or lower.startswith("._")
+
+
 def song_dir_entries(source_dir: os.PathLike) -> list[tuple[pathlib.Path, bool]]:
-    """곡 폴더 안의 (경로, 폴더 여부) 목록. 심볼릭 링크는 파일·폴더 모두 따라가지 않고 건너뜁니다."""
+    """곡 폴더 안의 (경로, 폴더 여부) 목록. 심볼릭 링크는 파일·폴더 모두 따라가지 않고 건너뜁니다.
+    desktop.ini 같은 OS 잡파일(is_junk)도 뺍니다."""
     root = pathlib.Path(source_dir).resolve()
     entries = []
     for dirpath, dirnames, filenames in os.walk(root):  # followlinks=False
         base = pathlib.Path(dirpath)
         keep = []
         for name in sorted(dirnames):
-            if _safe_entry(base / name, root, is_dir=True):
+            if not is_junk(name, is_dir=True) and _safe_entry(base / name, root, is_dir=True):
                 keep.append(name)
                 entries.append((base / name, True))
         dirnames[:] = keep
         for name in sorted(filenames):
-            if _safe_entry(base / name, root, is_dir=False):
+            if not is_junk(name, is_dir=False) and _safe_entry(base / name, root, is_dir=False):
                 entries.append((base / name, False))
     return entries
 

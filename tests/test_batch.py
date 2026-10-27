@@ -275,3 +275,22 @@ def test_overlapping_chart_within_same_batch(database, tmp_path):
     assert {f["path"] for f in manifest_entry(1)["files"]} == {"a.bms", "x.wav", "y.wav"}
 
 
+
+
+def test_os_junk_files_are_not_imported(database):
+    a = b"#TITLE A\n"
+    put_song(constant.TMP_DIR / "g" / "song1", {
+        "a.bms": a, "desktop.ini": b"[.ShellClassInfo]", "Thumbs.db": b"t", "._a.bms": b"apple",
+        "bga/.DS_Store": b"d", "__MACOSX/x": b"m", "bga/bg.png": b"png",
+    })
+    assert importer.import_tmp()[0]["new_song"]
+    assert song_zip(1) == {"a.bms": a, "bga/bg.png": b"png"}
+
+    # 기존 곡에 더할 때도 잡파일은 넣지도, 충돌로 보지도 않습니다.
+    pkg = put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "desktop.ini": b"other", "n.wav": b"n"})
+    songs = importer.import_tmp()
+    assert songs == [{
+        "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0, "added_files": ["n.wav"],
+    }]
+    assert "desktop.ini" not in song_zip(1)
+    assert not pkg.exists()
