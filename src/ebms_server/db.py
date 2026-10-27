@@ -2301,8 +2301,10 @@ class Database:
 
         같은 경로(대소문자 무시)에 내용이 다른 파일이 있으면 기존 것을 둡니다. 키음·이미지·영상은 확장자만 다른 파일
         (k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg, media_match.slot)도 같은 자리로 보고, 풀어서 비교해 같은 소재
-        (다시 인코딩만 다름)로 보이면 더하지 않고 넘어가며, 그 밖에는 충돌로 돌려줍니다.
-        (새 zip 크기, 더한 경로, 충돌 경로, 같은 소재로 본 경로)를 반환합니다. 더할 파일이 없으면 크기는 0이고 곡은 그대로입니다.
+        (다시 인코딩만 다름)로 보이면 둘 중 용량이 작은 쪽을 남기고(새 파일이 작으면 기존 파일을 새 파일로 바꿈),
+        그 밖에는 기존 것을 두고 충돌로 돌려줍니다.
+        (새 zip 크기, 더하거나 바꿔 넣은 경로, 충돌 경로, 같은 소재로 본 경로)를 반환합니다.
+        더하거나 바꿀 파일이 없으면 크기는 0이고 곡은 그대로입니다.
         새 zip이 패킷 한도를 넘으면 None.
         """
         data = self._get_song_data_with_cur(cur, song_id)
@@ -2312,6 +2314,7 @@ class Database:
         new_files: list[tuple[str, bytes]] = []
         conflicts: list[str] = []
         media: list[tuple[str, bytes, pathlib.Path]] = []  # 내용이 다른 키음·이미지·영상(기존 내용, 새 파일)
+        media_old: dict[str, str] = {}  # 그 새 파일이 겨룬 기존 항목 이름
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             existing = {info.filename.rstrip("/").lower(): info for info in zf.infolist()}
             # 확장자만 다른 파일(k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg). 플레이어는 확장자가 달라도 같은 자리로 대신 읽습니다(media_match.slot).
@@ -2337,13 +2340,21 @@ class Database:
                     old = zf.read(info)
                     if old != content:
                         media.append((arcname, old, path))
+                        media_old[arcname] = info.filename
                 elif info.file_size != len(content) or zf.read(info) != content:
                     conflicts.append(arcname)
         same = media_match.same_files(media)
         similar = sorted(arcname for arcname, _, _ in media if arcname in same)
         conflicts = sorted(conflicts + [arcname for arcname, _, _ in media if arcname not in same])
+        # 같은 소재면 용량이 작은 쪽을 남깁니다. 새 파일이 작으면 기존 항목을 빼고 새 파일을 넣습니다.
+        smaller = [(arcname, path) for arcname, old, path in media if arcname in same and path.stat().st_size < len(old)]
+        dropped = {media_old[arcname] for arcname, _ in smaller}
+        new_files += [(arcname, path.read_bytes()) for arcname, path in smaller]
         if similar:
-            self.logger.info(f"insert_song: Song[{song_id}] kept existing files judged the same media {similar}[{root}]")
+            self.logger.info(
+                f"insert_song: Song[{song_id}] judged the same media {similar}, replaced with smaller new ones "
+                f"{sorted(a for a, _ in smaller)}[{root}]"
+            )
         if conflicts:
             self.logger.warning(
                 f"insert_song: Song[{song_id}] kept existing files; skipped different ones {conflicts}[{root}]"
@@ -2351,7 +2362,15 @@ class Database:
         if not new_files:
             return 0, [], conflicts, similar
 
-        buf = io.BytesIO(data)
+        if dropped:
+            # 바꿀 항목이 있으면 그 항목을 뺀 zip을 새로 씁니다(나머지 항목은 압축 방식 그대로).
+            buf = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as zf:
+                for info in src.infolist():
+                    if info.filename not in dropped:
+                        zf.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=6)
+        else:
+            buf = io.BytesIO(data)
         # 기존 항목은 그대로 두고 뒤에 붙입니다(기존 항목의 위치·압축 데이터가 바뀌지 않음).
         with zipfile.ZipFile(buf, mode="a") as zf:
             for arcname, content in new_files:
@@ -3044,12 +3063,16 @@ class SongBatch:
             "charts": len(bms_files),
             "new_charts": len(new_charts),
         }
-        if added:
-            info["added_files"] = added
+        # 같은 소재여서 더 작은 새 파일로 바꿔 넣은 파일은 "replaced_files"로 따로 적습니다.
+        replaced = [a for a in added if a in similar]
+        if len(replaced) < len(added):
+            info["added_files"] = [a for a in added if a not in similar]
         if conflicts:
             info["conflicts"] = conflicts
         if similar:
             info["similar_files"] = similar
+        if replaced:
+            info["replaced_files"] = replaced
         self._infos.append(info)
 
         if (

@@ -113,10 +113,19 @@ def test_merge_keeps_same_media_without_conflict(database, tmp_path):
     songs = importer.import_tmp()
     assert songs == [{
         "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "conflicts": ["x.wav"], "similar_files": ["k.wav"],
+        "conflicts": ["x.wav"], "similar_files": ["k.wav"], "replaced_files": ["k.wav"],
     }]
-    assert song_zip(1) == {"a.bms": a, "k.wav": wav, "x.wav": wav}
+    # 같은 소재면 용량이 작은 쪽(ogg로 인코딩한 새 파일)으로 바꿉니다.
+    assert len(ogg_as_wav) < len(wav)
+    assert song_zip(1) == {"a.bms": a, "k.wav": ogg_as_wav, "x.wav": wav}
     assert pkg.exists()
+
+    # 새 파일이 더 크면 기존 파일을 둡니다.
+    shutil.rmtree(pkg)
+    put_song(constant.TMP_DIR / "g" / "pkg2", {"a.bms": a, "k.wav": wav})
+    songs = importer.import_tmp()
+    assert songs[0]["similar_files"] == ["k.wav"] and "replaced_files" not in songs[0] and "added_files" not in songs[0]
+    assert song_zip(1)["k.wav"] == ogg_as_wav
 
 
 @needs_ffmpeg
@@ -134,9 +143,10 @@ def test_merge_matches_other_extension(database, tmp_path):
     songs = importer.import_tmp()
     assert songs == [{
         "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "added_files": ["n.ogg"], "conflicts": ["x.ogg"], "similar_files": ["k.ogg"],
+        "added_files": ["n.ogg"], "conflicts": ["x.ogg"], "similar_files": ["k.ogg"], "replaced_files": ["k.ogg"],
     }]
-    assert set(song_zip(1)) == {"a.bms", "k.wav", "x.wav", "n.ogg"}
+    # 작은 k.ogg가 k.wav를 대신합니다(플레이어는 k.wav가 없으면 k.ogg를 읽음).
+    assert set(song_zip(1)) == {"a.bms", "k.ogg", "x.wav", "n.ogg"}
     assert other  # b.wav는 b.ogg를 만드는 데 씁니다.
 
 
@@ -153,7 +163,7 @@ def test_merge_matches_bga_by_name(database, tmp_path):
     put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "BG.PNG": png, "mv.mpg": mpg})
     songs = importer.import_tmp()
     assert songs[0]["similar_files"] == ["BG.PNG"] and songs[0]["conflicts"] == ["mv.mpg"]
-    assert set(song_zip(1)) == {"a.bms", "bg.bmp", "mv.bmp"}
+    assert set(song_zip(1)) == {"a.bms", "BG.PNG", "mv.bmp"}
 
 
 def test_slot():
