@@ -5,6 +5,8 @@
 - 비교용 파일: 브라우저가 못 여는 형식은 ffmpeg로 바꿉니다. 이미지는 png, 키음은 ogg, 영상은 작은 webm
   (VIDEO_FPS 고정 프레임레이트, 키프레임 간격 VIDEO_GOP)이라 화면에서 프레임 번호 ÷ fps로 정확히 옮겨 갈 수 있습니다.
 - 영상은 두 파일을 VIDEO_FPS로 풀어 프레임마다 차이를 재고, 다른 구간을 타임라인에 표시합니다.
+- 채보로 들어보기: 차트를 해석해(preview.parse_chart) 충돌 키음을 뺀 소리로 바탕 음원(FLAC)을 만들고,
+  충돌 키음은 시각표(events)로 줘서 브라우저가 기존·새 키음 중 고른 쪽을 겹쳐 재생합니다.
 - 바꾼 파일·계산 결과는 곡 폴더 아래 `_diff/`에 둡니다(곡이 묶음에서 빠지면 같이 지워짐).
 """
 import difflib
@@ -12,8 +14,11 @@ import hashlib
 import json
 import logging
 import pathlib
+import posixpath
 import subprocess
 import tempfile
+import threading
+import zipfile
 
 import numpy as np
 
@@ -42,6 +47,11 @@ WAVE_BARS = 600
 TEXT_LIMIT = 2 * 1024 * 1024
 TEXT_ENCODINGS = ("utf-8", "cp932", "cp949")
 CONVERT_TIMEOUT = 600
+# 채보로 들어보기: 바탕 음원(무손실 FLAC) 샘플레이트, 최대 길이(초), 넘으면 줄이는 최고 음량, 방식을 바꾸면 올림
+RENDER_RATE = 44100
+RENDER_SECONDS = 20 * 60
+RENDER_PEAK = 0.98
+RENDER_VERSION = 1
 
 MEDIA_TYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
@@ -351,6 +361,272 @@ def text_diff(stage_id: str, unit_id: str, path: str) -> dict:
     lines = difflib.unified_diff(a.splitlines(), b.splitlines(), f"기존 {old_name}", f"새 {new_name}", n=3, lineterm="")
     result["diff"] = "\n".join(lines)
     return result
+
+
+# ---- 채보로 들어보기: 충돌 없는 소리로 바탕 음원을 만들고, 충돌 키음은 브라우저가 시각에 맞춰 겹칩니다 ----
+
+
+class _Files:
+    """곡 하나의 기존(old, 곡 zip)·새(new, 묶음) 파일을 읽습니다. 기존 파일은 DB 연결 하나로 읽습니다."""
+
+    def __init__(self, stage: dict, unit: dict, song_id: int):
+        self.stage, self.unit, self.song_id = stage, unit, song_id
+        self.old = {e["path"]: e for e in Database().get_song_files(song_id) or [] if not e["path"].endswith("/")}
+        self.new = {path for path, _ in staging._unit_entries(stage, unit)}
+        self._con = self._cur = self._zip = None
+
+    def __enter__(self) -> "_Files":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._cur is not None:
+            self._cur.close()
+            self._con.close()
+        if self._zip is not None:
+            self._zip.close()
+
+    def read(self, side: str, path: str) -> bytes:
+        if side == "old":
+            if self._con is None:
+                self._con = db.connect()
+                self._cur = self._con.cursor()
+            return Database()._read_song_member(self._cur, self.song_id, self.old[path])
+        if path not in self.new:
+            raise KeyError(path)
+        pack = staging._pack_path(self.stage, self.unit)
+        if pack.is_file():
+            if self._zip is None:
+                self._zip = zipfile.ZipFile(pack)
+            return self._zip.read(path)
+        return (staging._unit_dir(self.stage, self.unit) / path).read_bytes()
+
+    def merged(self) -> dict[str, tuple[str, str]]:
+        """병합한 뒤의 파일 {경로: (쪽, 그 쪽의 경로)}. 같은 경로(대소문자 무시)는 기존 쪽입니다."""
+        out = {path: ("new", path) for path in self.new}
+        lower = {path.lower(): path for path in self.new}
+        for path in self.old:
+            out.pop(lower.get(path.lower()), None)
+            out[path] = ("old", path)
+        return out
+
+
+def _sound_keys(items: list[dict], song_id: int) -> dict[str, str]:
+    """키음 충돌 {기존·새 경로(소문자): 충돌 경로}. 차트가 어느 쪽 이름을 쓰든 같은 충돌로 봅니다."""
+    keys = {}
+    for item in items:
+        if item["song_id"] == song_id and item["kind"] == "sound":
+            keys[item["path"].lower()] = item["path"]
+            if item["old_path"]:
+                keys[item["old_path"].lower()] = item["path"]
+    return keys
+
+
+def _chart_sounds(files: _Files, side: str, chart_path: str) -> tuple[bytes, preview.Chart, list[str | None]]:
+    """(차트 내용, 해석한 차트, 소리마다 찾은 병합 후 파일 경로(없으면 None))."""
+    content = files.read(side, chart_path)
+    chart = preview.parse_chart(content)
+    merged = files.merged()
+    resolver = preview._Resolver(list(merged))
+    base = posixpath.dirname(chart_path)
+    found: dict[str, str | None] = {}
+    targets = []
+    for s in chart.sounds:
+        if s.name not in found:
+            found[s.name] = resolver.find(base, s.name)
+        targets.append(found[s.name])
+    return content, chart, targets
+
+
+def _chart_title(content: bytes) -> str:
+    from .db import _bmson
+
+    data = _bmson(content)
+    if data is not None:
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        return " ".join(str(info.get(k) or "") for k in ("title", "subtitle", "chart_name")).strip()
+    lines = preview._bms_lines(content)
+    values = {}
+    for line in lines:
+        parts = line.split(None, 1)
+        name = parts[0][1:].upper()
+        if name in (b"TITLE", b"SUBTITLE", b"PLAYLEVEL") and len(parts) > 1:
+            values.setdefault(name, preview._decode(parts[1].strip()))
+    title = " ".join(v for v in (values.get(b"TITLE"), values.get(b"SUBTITLE")) if v)
+    return f"{title} (Lv.{values[b'PLAYLEVEL']})" if b"PLAYLEVEL" in values else title
+
+
+def render_charts(stage_id: str, unit_id: str, path: str) -> dict:
+    """충돌 파일 path를 들어볼 차트 목록 items: [{side, path, title, uses}]. 차트 충돌이면 그 차트의 기존·새 쪽,
+    키음 충돌이면 그 키음을 쓰는 차트(양쪽)이고, uses는 그 키음이 울리는 횟수입니다."""
+    stage, unit = _unit(stage_id, unit_id)
+    items = list_conflicts(stage_id, unit_id)["items"]
+    item = next((i for i in items if i["path"] == path), None)
+    if item is None:
+        raise StageError(404, "충돌 파일이 아닙니다.")
+    out = []
+    with _Files(stage, unit, item["song_id"]) as files:
+        if item["kind"] == "chart":
+            pairs = [("old", item["old_path"]), ("new", item["path"])]
+        else:
+            pairs = [("old", p) for p in sorted(files.old) if db._is_chart(p)]
+            pairs += [("new", p) for p in sorted(files.new) if db._is_chart(p)]
+        keys = _sound_keys(items, item["song_id"])
+        for side, chart_path in pairs:
+            if not chart_path:
+                continue
+            try:
+                content, chart, targets = _chart_sounds(files, side, chart_path)
+            except Exception:
+                logger.exception(f"conflicts: could not read chart {side}:{chart_path}")
+                continue
+            uses = sum(1 for t in targets if t and keys.get(t.lower()) == path)
+            if item["kind"] != "chart" and not uses:
+                continue
+            out.append({"side": side, "path": chart_path, "title": _chart_title(content), "uses": uses,
+                        "sounds": len(chart.sounds)})
+    return {"song_id": item["song_id"], "items": out}
+
+
+_renders: dict[str, dict] = {}  # 만드는 중인 바탕 음원 {캐시 이름: {done, total, error}}
+_renders_lock = threading.Lock()
+
+
+def _render_key(stage: dict, unit: dict, song_id: int, side: str, chart_path: str) -> str:
+    with _Files(stage, unit, song_id) as files:
+        content = files.read(side, chart_path)
+    return _cache_name(f"{song_id}\0{side}\0{chart_path}", content, f"render{RENDER_VERSION}")
+
+
+def render(stage_id: str, unit_id: str, song_id: int, side: str, chart_path: str) -> dict:
+    """차트 하나의 바탕 음원과 겹칠 소리. 만드는 중이면 {status: running, done, total}(처음 부르면 만들기 시작),
+    다 됐으면 {status: ready, seconds, gain, rate, events}. events는 충돌 키음 [{t, key, o, e}]
+    (t 시각, key 충돌 경로, o 키음 안에서 시작할 위치, e 끊을 시각, 모두 초)이고, 바탕에는 빠져 있습니다.
+    바탕은 gain을 곱해 둔 것이라 겹치는 소리에도 같은 gain을 곱합니다."""
+    if side not in CHOICES:
+        raise StageError(400, "side는 old 또는 new입니다.")
+    stage, unit = _unit(stage_id, unit_id)
+    if not any(p == song_id for p in _conflict_paths(unit).values()):
+        raise StageError(404, "이 곡의 충돌이 아닙니다.")
+    try:
+        key = _render_key(stage, unit, song_id, side, chart_path)
+    except (KeyError, FileNotFoundError):
+        raise StageError(404, "차트가 없습니다.") from None
+    out = _cache_dir(stage, unit) / f"{key}.json"
+    if out.is_file() and (out.with_suffix(".flac")).is_file():
+        return {"status": "ready", **json.loads(out.read_text("utf-8"))}
+    with _renders_lock:
+        state = _renders.get(key)
+        if state is not None and state.get("error"):
+            # 실패는 한 번 알리고, 다음에 부르면 다시 만듭니다.
+            del _renders[key]
+            return {"status": "error", "error": state["error"]}
+        if state is None:
+            _ffmpeg()
+            state = _renders[key] = {"done": 0, "total": 0}
+            threading.Thread(
+                target=_render_job, args=(stage, unit, song_id, side, chart_path, out, state), daemon=True,
+                name=f"conflict-render-{key[:8]}",
+            ).start()
+    return {"status": "running", "done": state["done"], "total": state["total"]}
+
+
+def render_bed(stage_id: str, unit_id: str, song_id: int, side: str, chart_path: str) -> pathlib.Path:
+    stage, unit = _unit(stage_id, unit_id)
+    try:
+        key = _render_key(stage, unit, song_id, side, chart_path)
+    except (KeyError, FileNotFoundError):
+        raise StageError(404, "차트가 없습니다.") from None
+    path = _cache_dir(stage, unit) / f"{key}.flac"
+    if not path.is_file():
+        raise StageError(404, "바탕 음원을 아직 만들지 않았습니다.")
+    return path
+
+
+def _render_job(stage: dict, unit: dict, song_id: int, side: str, chart_path: str, out: pathlib.Path, state: dict) -> None:
+    try:
+        result = _render_bed(stage, unit, song_id, side, chart_path, out.with_suffix(".flac"), state)
+        out.write_text(json.dumps(result), "utf-8")
+        with _renders_lock:
+            _renders.pop(out.stem, None)
+    except Exception as e:
+        logger.exception(f"conflicts: render failed {side}:{chart_path}")
+        state["error"] = f"채보 음원을 만들지 못했습니다: {e}"
+
+
+def _render_bed(
+    stage: dict, unit: dict, song_id: int, side: str, chart_path: str, flac: pathlib.Path, state: dict,
+) -> dict:
+    ffmpeg = _ffmpeg()
+    rate, channels = RENDER_RATE, 2
+    items = list_conflicts(stage["id"], unit["id"])["items"]
+    keys = _sound_keys(items, song_id)
+    with _Files(stage, unit, song_id) as files:
+        _, chart, targets = _chart_sounds(files, side, chart_path)
+        merged = files.merged()
+        events = []
+        bed: dict[str, list[preview.Sound]] = {}  # 병합 후 경로 → 바탕에 섞을 소리
+        for s, target in zip(chart.sounds, targets):
+            if target is None or s.time >= RENDER_SECONDS:
+                continue
+            key = keys.get(target.lower())
+            if key is not None:
+                events.append({"t": round(s.time, 5), "key": key, "o": round(s.offset, 5),
+                               "e": None if s.end is None else round(s.end, 5)})
+            else:
+                bed.setdefault(target, []).append(s)
+        members = sorted(bed)
+        state["total"] = len(members)
+        buf = np.zeros((int((chart.length + 5) * rate), channels), dtype=np.float32)
+        last = 0
+        with tempfile.TemporaryDirectory(prefix="ebms-render-") as tmp:
+            for start in range(0, len(members), preview.DECODE_BATCH):
+                batch = members[start : start + preview.DECODE_BATCH]
+                paths = []
+                for n, member in enumerate(batch):
+                    p = pathlib.Path(tmp) / f"{n}{posixpath.splitext(member)[1].lower()}"
+                    p.write_bytes(files.read(*merged[member]))
+                    paths.append(p)
+                decoded = preview._decode_sounds(ffmpeg, paths, RENDER_SECONDS, rate, channels)
+                for p in paths:
+                    p.unlink(missing_ok=True)
+                for member, data in zip(batch, decoded):
+                    if data is None:
+                        continue
+                    for s in bed[member]:
+                        seg = data[int(round(s.offset * rate)) :]
+                        if s.end is not None:
+                            seg = seg[: max(0, int(round((s.end - s.time) * rate)))]
+                        pos = int(round(s.time * rate))
+                        end = min(pos + len(seg), int(RENDER_SECONDS * rate))
+                        if end <= pos:
+                            continue
+                        if end > len(buf):
+                            buf = np.concatenate([buf, np.zeros((end - len(buf) + 10 * rate, channels), np.float32)])
+                        # 같은 키음이 끝나기 전에 또 나와도 앞 소리를 끊지 않고 겹칩니다.
+                        buf[pos:end] += seg[: end - pos]
+                        last = max(last, end)
+                state["done"] = min(len(members), start + len(batch))
+    seconds = max(last / rate, max((e["t"] for e in events), default=0.0) + 1.0, chart.length)
+    buf = buf[: int(seconds * rate)]
+    if len(buf) < int(seconds * rate):
+        buf = np.concatenate([buf, np.zeros((int(seconds * rate) - len(buf), channels), np.float32)])
+    peak = float(np.max(np.abs(buf))) if len(buf) else 0.0
+    gain = 1.0 if peak <= RENDER_PEAK else RENDER_PEAK / peak
+    if gain != 1.0:
+        buf *= gain
+    part = flac.with_name(flac.name + ".part")
+    result = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-y", "-f", "f32le", "-ar", str(rate), "-ac", str(channels), "-i", "pipe:0",
+         "-c:a", "flac", "-sample_fmt", "s16", "-f", "flac", str(part)],
+        input=buf.astype("<f4").tobytes(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=CONVERT_TIMEOUT, check=False,
+    )
+    if result.returncode != 0:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip()[-300:] or "ffmpeg 오류")
+    part.replace(flac)
+    events.sort(key=lambda e: e["t"])
+    return {"seconds": round(seconds, 3), "gain": round(gain, 6), "rate": rate, "events": events}
 
 
 def set_choices(stage_id: str, unit_id: str, choices: dict[str, str | None]) -> dict:

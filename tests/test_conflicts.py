@@ -1,5 +1,6 @@
 """병합 충돌 해결: 충돌 파일 비교와 파일마다 기존 유지·새 파일로 바꿈을 골라 그 곡만 다시 넣는 흐름 테스트."""
 import io
+import time
 import shutil
 import subprocess
 import zipfile
@@ -131,6 +132,9 @@ def test_chart_conflict_text_diff_and_apply(client, monkeypatch):
     assert [(i["path"], i["kind"]) for i in items] == [("c.bms", "chart")]
     diff = client.get(base(sid, unit) + "/compare", params={"path": "c.bms"}).json()["diff"]
     assert "-#00111:01" in diff and "+#00111:0001" in diff
+    # 채보로 들어보기는 그 차트의 기존·새 쪽을 고릅니다.
+    charts = client.get(base(sid, unit) + "/charts", params={"path": "c.bms"}).json()["items"]
+    assert [(c["side"], c["path"], c["title"]) for c in charts] == [("old", "c.bms", "C"), ("new", "c.bms", "C")]
     client.put(base(sid, unit), json={"choices": {"c.bms": "new"}})
     done = wait(client, client.post(base(sid, unit) + "/apply").json())
     assert done["songs"][0]["new_charts"] == 1
@@ -204,3 +208,50 @@ def test_sound_compare_reports_sync_offset(client, monkeypatch, tmp_path):
     result = client.get(base(sid, unit) + "/compare", params={"path": "k.wav"}).json()
     assert result["offset_ms"] == pytest.approx(-200, abs=5)
     assert result["aligned_correlation"] > 0.9 > result["correlation"]
+
+
+def _wait_render(client, url, params):
+    for _ in range(300):
+        r = client.get(url, params=params)
+        assert r.status_code == 200, r.text
+        if r.json()["status"] != "running":
+            return r.json()
+        time.sleep(0.05)
+    raise AssertionError("render did not finish")
+
+
+@needs_ffmpeg
+def test_render_chart_with_sound_conflict(client, monkeypatch, tmp_path):
+    # 채보로 들어보기: 충돌 키음(lead.wav)은 바탕에서 빼고 시각표로, 나머지(kick.wav)는 바탕 FLAC에 섞습니다.
+    admin_login(client, monkeypatch)
+    kick = _media(tmp_path, "kick.wav", ["-f", "lavfi", "-i", "sine=f=60:d=0.3"])
+    lead = _media(tmp_path, "lead.wav", ["-f", "lavfi", "-i", "sine=f=523:d=0.5"])
+    lead2 = _media(tmp_path, "lead2.wav", ["-f", "lavfi", "-i", "sine=f=330:d=0.5"])
+    chart = b"#TITLE R\n#PLAYLEVEL 5\n#BPM 120\n#WAV01 kick.wav\n#WAV02 lead.wav\n#00111:01010101\n#00112:0002\n#00201:02\n"
+    upload(client, "base.zip", make_zip({"a.bms": chart, "kick.wav": kick, "lead.wav": lead}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": chart, "p/s/kick.wav": kick, "p/s/lead.wav": lead2}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+
+    charts = client.get(base(sid, unit) + "/charts", params={"path": "lead.wav"}).json()
+    assert charts["song_id"] == 1
+    assert [(c["side"], c["path"], c["uses"]) for c in charts["items"]] == [("old", "a.bms", 2), ("new", "a.bms", 2)]
+    assert charts["items"][0]["title"] == "R (Lv.5)"
+
+    params = {"song": 1, "side": "new", "chart": "a.bms"}
+    data = _wait_render(client, base(sid, unit) + "/render", params)
+    assert data["status"] == "ready", data
+    # 120BPM에서 1마디는 2초: lead는 1번 마디 가운데(3초)와 2번 마디 처음(4초)
+    assert [(round(e["t"], 3), e["key"]) for e in data["events"]] == [(3.0, "lead.wav"), (4.0, "lead.wav")]
+    assert data["rate"] == conflicts.RENDER_RATE and 0 < data["gain"] <= 1
+    r = client.get(base(sid, unit) + "/render/bed", params=params)
+    assert r.status_code == 200 and r.content[:4] == b"fLaC"
+    bed = tmp_path / "bed.flac"
+    bed.write_bytes(r.content)
+    pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", str(bed), "-ac", "1", "-f", "f32le", "-"], capture_output=True, check=True).stdout
+    samples = np.frombuffer(pcm, "<f4")
+    rate = conflicts.RENDER_RATE
+    assert np.abs(samples[int(2.05 * rate):int(2.25 * rate)]).max() > 0.1  # kick (2초)
+    assert np.abs(samples[int(4.05 * rate):int(4.4 * rate)]).max() < 0.01  # lead는 바탕에 없음
+    assert client.get(base(sid, unit) + "/charts", params={"path": "zz.wav"}).status_code == 404

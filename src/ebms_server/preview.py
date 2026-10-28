@@ -416,12 +416,16 @@ def _run(cmd: list[str], data: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def _decode_sounds(ffmpeg: str, paths: list[pathlib.Path], seconds: float) -> list[np.ndarray | None]:
-    """키음 파일들을 모노 float32 샘플로 풉니다. 풀지 못한 파일은 None."""
+def _decode_sounds(
+    ffmpeg: str, paths: list[pathlib.Path], seconds: float | None, rate: int = SAMPLE_RATE, channels: int = 1
+) -> list[np.ndarray | None]:
+    """키음 파일들을 float32 샘플로 풉니다(seconds초까지, None이면 끝까지). 채널이 둘 이상이면 (샘플, 채널) 모양입니다.
+    풀지 못한 파일은 None."""
     out: list[np.ndarray | None] = [None] * len(paths)
+    limit = [] if seconds is None else ["-t", f"{seconds:.3f}"]
 
     def args(i: int, src: int, dst: pathlib.Path) -> list[str]:
-        return ["-map", f"{src}:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE), "-t", f"{seconds:.3f}", "-f", "f32le", str(dst)]
+        return ["-map", f"{src}:a:0", "-ac", str(channels), "-ar", str(rate), *limit, "-f", "f32le", str(dst)]
 
     for start in range(0, len(paths), DECODE_BATCH):
         batch = list(range(start, min(start + DECODE_BATCH, len(paths))))
@@ -444,7 +448,8 @@ def _decode_sounds(ffmpeg: str, paths: list[pathlib.Path], seconds: float) -> li
                 raws[i].unlink(missing_ok=True)
         for i in batch:
             if raws[i].exists():
-                out[i] = np.fromfile(raws[i], dtype="<f4")
+                data = np.fromfile(raws[i], dtype="<f4")
+                out[i] = data if channels == 1 else data[: len(data) // channels * channels].reshape(-1, channels)
                 raws[i].unlink()
     return out
 

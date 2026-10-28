@@ -124,6 +124,7 @@ function showConflict(index) {
     if (!conflict.items.length) { conflictView.textContent = "충돌 파일이 없습니다."; return; }
     conflict.index = Math.max(0, Math.min(index, conflict.items.length - 1));
     conflictKeys = null;
+    stopConflictPlayer();
     for (const m of conflictView.querySelectorAll("video, audio")) m.pause();
     renderConflictList();
     const item = conflict.items[conflict.index];
@@ -169,6 +170,7 @@ function showConflict(index) {
         right.append(mediaElement(item.kind, conflictUrl(item, "new")));
         body.append(el("p", "small text-muted", "이미지와 영상이라 차이를 계산하지 않습니다."));
     }
+    if (item.kind === oldKind && (item.kind === "sound" || item.kind === "chart")) chartListen(item);
 }
 
 function mediaElement(kind, url) {
@@ -426,6 +428,388 @@ async function showVideos(item, left, right, body) {
     if (data.segments.length) seek(data.segments[0][0]);
 }
 
+// ---- 채보로 들어보기: 바탕 음원(충돌 없는 소리) 위에 충돌 키음을 차트 시각에 맞춰 겹쳐 재생 ----
+// 키음 충돌은 같은 위치에서 기존(A)·새(B) 키음을, 차트 충돌은 기존(A)·새(B) 차트를 바꿔 듣습니다.
+// 다른 충돌 키음은 고른 쪽(고르지 않았으면 기존)으로 울립니다. 키음은 재생 위치 앞 LISTEN_AHEAD초 안에 울릴 것만 받아 둡니다.
+
+const LISTEN_AHEAD = 10;
+const LISTEN_KEEP = 30;  // 재생 위치에서 이만큼 먼 키음은 메모리에서 뺍니다.
+const LISTEN_SCHEDULE = 0.3;  // 이만큼 앞서 재생을 예약합니다(초).
+const LISTEN_LOOP = 2;  // 눈금을 누르면 그 앞뒤 이만큼(초)을 반복합니다.
+
+let conflictPlayer = null;
+
+function stopConflictPlayer() {
+    if (conflictPlayer) conflictPlayer.close();
+    conflictPlayer = null;
+}
+
+function clock(t) {
+    const m = Math.floor(t / 60);
+    return `${m}:${(t - m * 60).toFixed(1).padStart(4, "0")}`;
+}
+
+function chartListen(item) {
+    const box = el("div", "border rounded p-2 mt-3");
+    const head = el("div", "d-flex flex-wrap align-items-center gap-2");
+    head.append(el("strong", "", "채보로 들어보기"));
+    const start = el("button", "btn btn-sm btn-outline-primary", "채보 음원 만들기");
+    start.type = "button";
+    head.append(start);
+    const status = el("div", "small text-muted mt-1",
+        item.kind === "chart" ? "기존 차트(A)와 새 차트(B)를 같은 위치에서 바꿔 들어 봅니다."
+            : "이 키음을 쓰는 차트를 재생하며 기존 키음(A)과 새 키음(B)을 같은 위치에서 바꿔 들어 봅니다.");
+    box.append(head, status);
+    conflictView.append(box);
+    start.addEventListener("click", () => { start.remove(); setupListen(item, box, head, status); });
+}
+
+async function waitRender(item, chart, status) {
+    const q = `song=${item.song_id}&side=${chart.side}&chart=${encodeURIComponent(chart.path)}`;
+    for (;;) {
+        const res = await fetch(`${conflictBase()}/render?${q}`);
+        if (!res.ok) throw new Error(await detail(res));
+        const data = await res.json();
+        if (data.status === "error") throw new Error(data.error);
+        if (data.status === "ready") return { data, bedUrl: `${conflictBase()}/render/bed?${q}` };
+        status.textContent = `채보 음원 만드는 중… 키음 ${data.done}/${data.total || "?"}`;
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+}
+
+async function setupListen(item, box, head, status) {
+    status.textContent = "차트를 찾는 중…";
+    const res = await fetch(`${conflictBase()}/charts?path=${encodeURIComponent(item.path)}`);
+    if (!res.ok) { status.textContent = await detail(res); return; }
+    const charts = (await res.json()).items;
+    if (!charts.length) { status.textContent = "이 키음을 쓰는 차트가 없습니다."; return; }
+    if (!conflict || conflict.items[conflict.index] !== item) return;
+    let ctx;
+    try {
+        ctx = new AudioContext({ sampleRate: 44100 });
+    } catch {
+        ctx = new AudioContext();
+    }
+    stopConflictPlayer();
+    const player = makePlayer(item, ctx, box, status);
+    conflictPlayer = player;
+    if (item.kind === "chart") {
+        // A·B는 차트의 기존·새 쪽입니다.
+        const pick = (side) => charts.find((c) => c.side === side);
+        if (!pick("old") || !pick("new")) { status.textContent = "기존·새 차트를 읽지 못했습니다."; return; }
+        await player.load({ old: pick("old"), new: pick("new") });
+        return;
+    }
+    // 키음 충돌: 차트를 고르고, A·B는 그 차트 안의 이 키음입니다. 기본은 이 키음을 가장 많이 쓰는 새 차트.
+    const select = el("select", "form-select form-select-sm w-auto");
+    select.setAttribute("aria-label", "들어볼 차트");
+    charts.forEach((c, i) => {
+        const o = el("option", "", `${c.side === "old" ? "기존" : "새"} ${c.path}${c.title ? ` · ${c.title}` : ""} · ${c.uses}번`);
+        o.value = i;
+        select.append(o);
+    });
+    const best = charts.reduce((b, c, i) => (c.side === "new" && (b < 0 || c.uses > charts[b].uses) ? i : b), -1);
+    select.value = best < 0 ? 0 : best;
+    head.append(select);
+    select.addEventListener("change", () => player.load({ both: charts[select.value] }));
+    await player.load({ both: charts[select.value] });
+}
+
+function makePlayer(item, ctx, box, status) {
+    const chartMode = item.kind === "chart";
+    const master = ctx.createGain();
+    master.connect(ctx.destination);
+    const bedGain = ctx.createGain();
+    const overlayGain = ctx.createGain();  // 바탕과 같은 gain
+    const keyGain = ctx.createGain();  // 지금 보는 키음
+    bedGain.connect(master);
+    overlayGain.connect(master);
+    keyGain.connect(overlayGain);
+
+    const renders = {};  // {old, new} 또는 {both}: {data, bed}
+    const buffers = new Map();  // "키|old" → AudioBuffer | Promise | null(못 읽음)
+    const sources = new Set();
+    let ab = "new";
+    let current = null;
+    let playing = false, pos = 0, t0ctx = 0, t0pos = 0, next = 0, timer = null, loop = null, closed = false, failed = 0;
+
+    // ---- 화면 ----
+    const controls = el("div", "d-flex flex-wrap align-items-center gap-2 mt-2");
+    const playBtn = el("button", "btn btn-sm btn-primary", "재생");
+    playBtn.type = "button";
+    const time = el("span", "small font-monospace", "");
+    const abGroup = el("div", "btn-group btn-group-sm");
+    abGroup.setAttribute("role", "group");
+    const abBtns = {};
+    for (const [value, text] of [["old", chartMode ? "A 기존 차트" : "A 기존 키음"], ["new", chartMode ? "B 새 차트" : "B 새 키음"]]) {
+        const b = el("button", "btn btn-outline-secondary", text);
+        b.type = "button";
+        b.addEventListener("click", () => setAb(value));
+        abBtns[value] = b;
+        abGroup.append(b);
+    }
+    const pickBtn = el("button", "btn btn-sm btn-outline-primary", "지금 듣는 쪽으로 고르기");
+    pickBtn.type = "button";
+    pickBtn.addEventListener("click", () => choose(item, ab));
+    const loopBtn = el("button", "btn btn-sm btn-outline-warning d-none", "반복 끄기");
+    loopBtn.type = "button";
+    loopBtn.addEventListener("click", () => { loop = null; loopBtn.classList.add("d-none"); draw(); });
+    controls.append(playBtn, time, abGroup, pickBtn, loopBtn);
+    const mixRow = el("div", "d-flex flex-wrap align-items-center gap-3 mt-2 small");
+    const slider = (label, value, max, gain) => {
+        const wrap = el("label", "d-flex align-items-center gap-1", label);
+        const r = el("input", "form-range");
+        r.type = "range"; r.min = 0; r.max = max; r.value = value; r.style.width = "8rem";
+        r.addEventListener("input", () => { gain.gain.value = r.value / 100; });
+        wrap.append(r);
+        return wrap;
+    };
+    mixRow.append(slider("바탕 음량", 100, 100, bedGain));
+    if (!chartMode) mixRow.append(slider("이 키음 음량", 100, 300, keyGain));
+    const canvas = el("canvas", "w-100 border rounded mt-2 conflict-timeline");
+    canvas.style.height = "48px";
+    canvas.style.cursor = "pointer";
+    const help = el("div", "small text-muted mt-1",
+        (chartMode ? "" : "빨간 눈금: 이 키음이 울리는 곳(누르면 앞뒤 2초 반복) · ") + "Space 재생/멈춤 · A/B 바꾸기 · ←/→ 이전/다음 눈금");
+    box.append(controls, mixRow, canvas, help);
+
+    const otherChoice = (key) => conflict.items.find((i) => i.path === key)?.choice || "old";
+    const variant = (key) => (!chartMode && key === item.path ? ab : otherChoice(key));
+    const now = () => (playing ? t0pos + (ctx.currentTime - t0ctx) : pos);
+    const events = () => current?.data.events || [];
+    const markers = () => (chartMode ? [] : events().filter((e) => e.key === item.path).map((e) => e.t));
+
+    function renderAb() {
+        for (const [v, b] of Object.entries(abBtns)) b.classList.toggle("active", v === ab);
+    }
+
+    function draw() {
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * ratio;
+        canvas.height = canvas.clientHeight * ratio;
+        const g = canvas.getContext("2d");
+        g.clearRect(0, 0, canvas.width, canvas.height);
+        if (!current) return;
+        const total = current.data.seconds || 1;
+        const x = (t) => (t / total) * canvas.width;
+        if (loop) {
+            g.fillStyle = "rgba(255,193,7,0.3)";
+            g.fillRect(x(loop[0]), 0, Math.max(2, x(loop[1]) - x(loop[0])), canvas.height);
+        }
+        g.fillStyle = "#dc3545";
+        for (const t of markers()) g.fillRect(x(t), canvas.height * 0.2, Math.max(1, ratio), canvas.height * 0.6);
+        g.fillStyle = "#0d6efd";
+        g.fillRect(x(now()), 0, 2 * ratio, canvas.height);
+        time.textContent = `${clock(now())} / ${clock(total)}${failed ? ` · 못 읽은 키음 ${failed}` : ""}`;
+    }
+
+    function stopSources() {
+        for (const s of sources) { try { s.stop(); } catch { /* 이미 끝남 */ } }
+        sources.clear();
+    }
+
+    function start(buffer, when, offset, duration, dest) {
+        if (offset >= buffer.duration) return;
+        const s = ctx.createBufferSource();
+        s.buffer = buffer;
+        s.connect(dest);
+        s.onended = () => sources.delete(s);
+        sources.add(s);
+        if (duration === undefined) s.start(when, offset);
+        else if (duration > 0) s.start(when, offset, duration);
+    }
+
+    // 재생 위치 p 앞 LISTEN_AHEAD초 안에 울릴 키음을 받고, 먼 키음은 뺍니다.
+    function ensure(p) {
+        const want = new Set();
+        for (const e of events()) {
+            if (e.t < p - 1) continue;
+            if (e.t > p + LISTEN_AHEAD) break;
+            if (!chartMode && e.key === item.path) { want.add(`${e.key}|old`); want.add(`${e.key}|new`); }
+            else want.add(`${e.key}|${variant(e.key)}`);
+        }
+        const keep = new Set(want);
+        for (const e of events()) {
+            if (e.t > p - 5 && e.t < p + LISTEN_KEEP) keep.add(`${e.key}|${variant(e.key)}`);
+        }
+        for (const id of buffers.keys()) {
+            if (!keep.has(id) && !id.startsWith(`${item.path}|`)) buffers.delete(id);
+        }
+        const pending = [];
+        for (const id of want) {
+            if (buffers.has(id)) { const b = buffers.get(id); if (b instanceof Promise) pending.push(b); continue; }
+            const [key, side] = [id.slice(0, id.lastIndexOf("|")), id.slice(id.lastIndexOf("|") + 1)];
+            const promise = fetch(`${conflictBase()}/file?path=${encodeURIComponent(key)}&side=${side}&raw=true`)
+                .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.statusText))))
+                .then((data) => ctx.decodeAudioData(data))
+                .then((buf) => { if (buffers.get(id) === promise) buffers.set(id, buf); return buf; })
+                .catch(() => { if (buffers.get(id) === promise) { buffers.set(id, null); failed++; } return null; });
+            buffers.set(id, promise);
+            pending.push(promise);
+        }
+        return pending;
+    }
+
+    function bufferFor(e) {
+        const b = buffers.get(`${e.key}|${variant(e.key)}`);
+        return b instanceof AudioBuffer ? b : null;
+    }
+
+    function dest(e) {
+        if (!chartMode && e.key === item.path) return keyGain;
+        return overlayGain;
+    }
+
+    function playFrom(from) {
+        stopSources();
+        if (!current) return;
+        from = Math.max(0, Math.min(from, current.data.seconds));
+        t0ctx = ctx.currentTime + 0.05;
+        t0pos = from;
+        playing = true;
+        playBtn.textContent = "멈춤";
+        start(current.bed, t0ctx, from, undefined, bedGain);
+        const list = events();
+        // from 앞에서 울리기 시작해 아직 울리는 소리도 이어서 냅니다.
+        next = list.findIndex((e) => e.t >= from);
+        if (next < 0) next = list.length;
+        for (let i = next - 1; i >= 0 && list[i].t > from - 30; i--) {
+            const e = list[i], b = bufferFor(e);
+            if (!b || (e.e != null && e.e <= from)) continue;
+            start(b, t0ctx, e.o + (from - e.t), e.e != null ? e.e - from : undefined, dest(e));
+        }
+        if (!timer) timer = setInterval(tick, 50);
+    }
+
+    // to로 옮깁니다. play면(기본은 재생 중이었으면) 이어서 재생합니다.
+    async function seek(to, play = playing) {
+        pause();
+        pos = Math.max(0, Math.min(to, current ? current.data.seconds : 0));
+        draw();
+        if (!play) { ensure(pos); return; }
+        // 옮긴 자리의 키음을 잠깐 기다렸다 재생합니다(최대 3초).
+        await Promise.race([Promise.all(ensure(pos)), new Promise((r) => setTimeout(r, 3000))]);
+        if (!closed) playFrom(pos);
+    }
+
+    function pause() {
+        if (playing) pos = now();
+        playing = false;
+        stopSources();
+        playBtn.textContent = "재생";
+    }
+
+    function tick() {
+        if (!current) return;
+        const p = now();
+        ensure(p);
+        if (playing && loop && p >= loop[1]) { playFrom(loop[0]); return; }
+        if (playing && p >= current.data.seconds) { pause(); pos = 0; }
+        if (playing) {
+            const list = events();
+            const gain = current.data.gain;
+            overlayGain.gain.value = gain;
+            while (next < list.length && list[next].t < p + LISTEN_SCHEDULE) {
+                const e = list[next++];
+                const b = bufferFor(e);
+                if (!b) continue;
+                const when = t0ctx + (e.t - t0pos);
+                const late = Math.max(0, ctx.currentTime - when);
+                start(b, when + late, e.o + late, e.e != null ? e.e - e.t - late : undefined, dest(e));
+            }
+        }
+        draw();
+    }
+
+    function setAb(value) {
+        if (value === ab) return;
+        ab = value;
+        renderAb();
+        const p = now();
+        if (chartMode) current = renders[ab];
+        if (!current) return;
+        overlayGain.gain.value = current.data.gain;
+        if (playing) playFrom(Math.min(p, current.data.seconds));
+        else { pos = Math.min(p, current.data.seconds); draw(); }
+    }
+
+    function marker(dir) {
+        const p = now(), list = markers();
+        const t = dir > 0 ? list.find((x) => x > p + 0.05) : [...list].reverse().find((x) => x < p - 0.3);
+        if (t === undefined) return;
+        loop = [Math.max(0, t - LISTEN_LOOP), t + LISTEN_LOOP];
+        loopBtn.classList.remove("d-none");
+        seek(loop[0], true);
+    }
+
+    playBtn.addEventListener("click", () => (playing ? pause() : seek(pos, true)));
+    canvas.addEventListener("click", (ev) => {
+        if (!current) return;
+        const rect = canvas.getBoundingClientRect();
+        const t = ((ev.clientX - rect.left) / rect.width) * current.data.seconds;
+        const near = markers().find((m) => Math.abs(((m - t) / current.data.seconds) * rect.width) <= 4);
+        if (near !== undefined) {
+            loop = [Math.max(0, near - LISTEN_LOOP), near + LISTEN_LOOP];
+            loopBtn.classList.remove("d-none");
+            seek(loop[0], true);
+        } else {
+            seek(t);
+        }
+    });
+    conflictKeys = (e) => {
+        if (!current) return false;
+        if (e.key === " ") { if (playing) pause(); else seek(pos, true); return true; }
+        if (e.key === "a" || e.key === "A") { setAb("old"); return true; }
+        if (e.key === "b" || e.key === "B") { setAb("new"); return true; }
+        if (!chartMode && e.key === "ArrowLeft") { marker(-1); return true; }
+        if (!chartMode && e.key === "ArrowRight") { marker(1); return true; }
+        return false;
+    };
+    renderAb();
+
+    return {
+        // charts: {old, new}(차트 충돌) 또는 {both}(키음 충돌: 차트 하나).
+        async load(charts) {
+            pause();
+            current = null;
+            loop = null;
+            loopBtn.classList.add("d-none");
+            for (const k of Object.keys(renders)) delete renders[k];
+            try {
+                for (const [k, chart] of Object.entries(charts)) {
+                    const { data, bedUrl } = await waitRender(item, chart, status);
+                    if (closed) return;
+                    status.textContent = "바탕 음원을 받는 중…";
+                    const r = await fetch(bedUrl);
+                    if (!r.ok) throw new Error(await detail(r));
+                    const bed = await ctx.decodeAudioData(await r.arrayBuffer());
+                    if (closed) return;
+                    renders[k] = { data, bed };
+                }
+            } catch (err) {
+                status.textContent = err.message;
+                return;
+            }
+            current = chartMode ? renders[ab] : renders.both;
+            overlayGain.gain.value = current.data.gain;
+            const list = markers();
+            status.textContent = chartMode ? "A/B로 기존·새 차트를 바꿔 들어 보세요."
+                : `이 키음이 ${list.length}번 울립니다. 눈금을 누르면 그 앞뒤를 반복합니다.`;
+            pos = list.length ? Math.max(0, list[0] - LISTEN_LOOP) : 0;
+            ensure(pos);
+            draw();
+        },
+        close() {
+            closed = true;
+            pause();
+            clearInterval(timer);
+            buffers.clear();
+            conflictKeys = null;
+            ctx.close();
+        },
+    };
+}
+
 // ---- 그 밖의 파일: 줄 단위 diff ----
 
 async function showText(item, body) {
@@ -506,6 +890,7 @@ conflictApply.addEventListener("click", async () => {
 });
 
 conflictModalEl.addEventListener("hidden.bs.modal", () => {
+    stopConflictPlayer();
     for (const m of conflictView.querySelectorAll("video, audio")) m.pause();
     conflictView.replaceChildren();
     conflictKeys = null;
