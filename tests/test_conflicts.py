@@ -119,14 +119,22 @@ def test_slot_conflict_replaces_existing_entry(client, monkeypatch):
     assert song_zip(1) == {"a.bms": b"#TITLE A\n", "k.ogg": b"new"}
 
 
-def test_old_chart_conflicts_are_not_listed(client, monkeypatch):
-    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new"})
-    from ebms_server import staging
-    with staging._lock:
-        data = staging._load(sid)
-        data["units"][0]["result"]["songs"][0]["conflicts"].append("c.bms")
-        staging._save(data)
-    assert [i["path"] for i in client.get(base(sid, unit)).json()["items"]] == ["k.wav"]
+def test_chart_conflict_text_diff_and_apply(client, monkeypatch):
+    # 싱크를 고치며 차트도 바뀌는 경우가 있어 같은 이름 차트도 비교해 고릅니다.
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "c.bms": b"#TITLE C\n#00111:01\n"}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/c.bms": b"#TITLE C\n#00111:0001\n"}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+    items = client.get(base(sid, unit)).json()["items"]
+    assert [(i["path"], i["kind"]) for i in items] == [("c.bms", "chart")]
+    diff = client.get(base(sid, unit) + "/compare", params={"path": "c.bms"}).json()["diff"]
+    assert "-#00111:01" in diff and "+#00111:0001" in diff
+    client.put(base(sid, unit), json={"choices": {"c.bms": "new"}})
+    done = wait(client, client.post(base(sid, unit) + "/apply").json())
+    assert done["songs"][0]["new_charts"] == 1
+    assert song_zip(1)["c.bms"] == b"#TITLE C\n#00111:0001\n"
 
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")

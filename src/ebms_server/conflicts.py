@@ -67,9 +67,7 @@ def _conflict_paths(unit: dict) -> dict[str, int]:
         if not song_id:
             continue
         for path in info.get("conflicts", []):
-            # 이전 버전은 내용이 다른 차트도 충돌로 남겼습니다. 이제는 다시 넣으면 차트로만 등록하므로 고를 것이 없습니다.
-            if not db._is_chart(path):
-                paths.setdefault(path, song_id)
+            paths.setdefault(path, song_id)
     return paths
 
 
@@ -89,7 +87,8 @@ def _match(files: list[dict], path: str) -> dict | None:
 
 
 def _kind(path: str) -> str:
-    return media_match.kind(path) or "other"
+    """sound, image, video, chart(줄 단위 비교), other"""
+    return media_match.kind(path) or ("chart" if db._is_chart(path) else "other")
 
 
 def list_conflicts(stage_id: str, unit_id: str) -> dict:
@@ -193,7 +192,7 @@ def web_file(stage_id: str, unit_id: str, path: str, side: str, raw: bool = Fals
     suffix = pathlib.PurePosixPath(name).suffix.lower()
     filename = pathlib.PurePosixPath(name).name
     kind = _kind(name)
-    if raw or kind == "other":
+    if raw or kind in ("chart", "other"):
         return content, MEDIA_TYPES.get(suffix, "application/octet-stream"), filename
     if (kind == "image" and suffix in WEB_IMAGE) or (kind == "sound" and suffix in WEB_SOUND):
         # 파일로 돌려줘야 Range 요청을 받아 재생 중 위치를 옮길 수 있습니다.
