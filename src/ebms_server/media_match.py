@@ -43,8 +43,8 @@ SOUND_SECONDS = 600.0
 # 길이 차이 허용: 이 비율과 SOUND_LENGTH_SECONDS 중 큰 값
 SOUND_LENGTH_TOLERANCE = 0.02
 SOUND_LENGTH_SECONDS = 0.1
-# 비교 화면에 참고로 보여 주는 시작 위치 차이를 찾는 범위(초). 판정에는 쓰지 않습니다.
-SOUND_OFFSET_SEARCH = 0.1
+# 비교 화면에 참고로 보여 주는 싱크 오차를 찾는 범위(초). 판정에는 쓰지 않습니다.
+SOUND_OFFSET_SEARCH = 0.5
 SOUND_MIN_CORRELATION = 0.75
 # 이 RMS 미만이면 무음으로 봅니다.
 SOUND_SILENCE_RMS = 1e-4

@@ -53,6 +53,9 @@ def test_list_choose_and_apply(client, monkeypatch):
     assert r.status_code == 200 and r.content == b"old"
     r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "new"})
     assert r.content == b"new" and r.headers["content-type"] == "audio/wav"
+    # 재생 중 위치를 옮길 수 있게 Range 요청을 받습니다.
+    r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "new"}, headers={"Range": "bytes=1-2"})
+    assert r.status_code == 206 and r.content == b"ew"
     diff = client.get(base(sid, unit) + "/compare", params={"path": "readme.txt"}).json()
     assert "-two" in diff["diff"] and "+TWO" in diff["diff"]
     assert client.get(base(sid, unit) + "/file", params={"path": "a.bms", "side": "old"}).status_code == 404
@@ -176,3 +179,20 @@ def test_sound_compare(client, monkeypatch, tmp_path):
     assert result["new"]["seconds"] == pytest.approx(1.5, abs=0.05)
     assert result["same"] is False and len(result["new"]["peaks"]) == conflicts.WAVE_BARS
     assert np.max(result["old"]["peaks"]) > 0.1
+    assert {"correlation", "aligned_correlation", "offset_ms"} <= result.keys()
+
+
+@needs_ffmpeg
+def test_sound_compare_reports_sync_offset(client, monkeypatch, tmp_path):
+    # 판정은 싱크를 맞추지 않고, 싱크 맞춘 상관계수와 싱크 오차는 따로 보여 줍니다.
+    admin_login(client, monkeypatch)
+    old = _media(tmp_path, "old.wav", ["-f", "lavfi", "-i", "anoisesrc=d=1:seed=3", "-ac", "1"])
+    new = _media(tmp_path, "new.wav", ["-f", "lavfi", "-i", "anoisesrc=d=1:seed=3", "-ac", "1", "-af", "adelay=200"])
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": old}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/k.wav": new}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+    result = client.get(base(sid, unit) + "/compare", params={"path": "k.wav"}).json()
+    assert result["offset_ms"] == pytest.approx(-200, abs=5)
+    assert result["aligned_correlation"] > 0.9 > result["correlation"]
