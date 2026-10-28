@@ -8,7 +8,6 @@ const conflictView = document.getElementById("conflict-view");
 const conflictCount = document.getElementById("conflict-count");
 const conflictApply = document.getElementById("conflict-apply");
 const conflictAllOld = document.getElementById("conflict-all-old");
-const CHART_EXT = /\.(bms|bme|bml|pms|bmson)$/i;
 const KIND = { sound: "키음", image: "이미지", video: "영상", chart: "차트", other: "파일" };
 
 let conflict = null;  // {stageId, unit, items, songs, index}
@@ -16,7 +15,7 @@ let conflictKeys = null;  // 지금 보는 파일의 단축키 처리(영상 프
 
 // 곡 행에 붙일 "충돌 해결" 버튼. 고를 충돌 파일이 없으면 null.
 function conflictButton(stage, unit) {
-    const paths = (unit.result?.conflicts || []).filter((p) => !CHART_EXT.test(p) || p.includes("/"));
+    const paths = unit.result?.conflicts || [];
     if (!paths.length) return null;
     const btn = document.createElement("button");
     btn.type = "button";
