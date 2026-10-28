@@ -572,7 +572,7 @@ function songLine(song) {
         badge.textContent = song.new_song ? `새 곡 #${song.song_id}` : `기존 곡 #${song.song_id}`;
         li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
         if (song.added_files) li.append(`, 기존 곡에 파일 ${song.added_files.length}개 추가`);
-        if (song.similar_files) li.append(`, 내용이 달라도 같은 소재로 본 파일 ${song.similar_files.length}개(용량이 작은 쪽 유지, 새 파일로 바꿈 ${(song.replaced_files || []).length}개)`);
+        if (song.similar_files) li.append(`, 내용이 달라도 같은 소재로 본 파일 ${song.similar_files.length}개(품질이 좋은 쪽 유지, 새 파일로 바꿈 ${(song.replaced_files || []).length}개)`);
         if (song.resolved_files) {
             const picked = Object.values(song.resolved_files);
             li.append(`, 충돌 파일 고른 대로 처리(새 파일로 바꿈 ${picked.filter((v) => v === "new").length}개, 기존 유지 ${picked.filter((v) => v === "old").length}개)`);

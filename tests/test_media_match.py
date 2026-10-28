@@ -23,6 +23,11 @@ def sine(tmp_path, name, freq, seconds=1.0, *codec):
     return ffmpeg(tmp_path, name, "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={seconds}", *codec)
 
 
+def noise(tmp_path, name, *codec, seconds=2.0):
+    """대역이 넓은 소리(분홍 잡음). 손실 압축하면 고음이 잘려 대역폭이 줄어듭니다."""
+    return ffmpeg(tmp_path, name, "-f", "lavfi", "-i", f"anoisesrc=color=pink:duration={seconds}:sample_rate=44100:seed=1", *codec)
+
+
 def image(tmp_path, name, pattern="testsrc", *codec):
     return ffmpeg(tmp_path, name, "-f", "lavfi", "-i", f"{pattern}=size=256x256:duration=1", "-frames:v", "1", *codec)
 
@@ -103,51 +108,58 @@ def test_reencoded_video_is_same(tmp_path):
 @needs_ffmpeg
 def test_merge_keeps_same_media_without_conflict(database, tmp_path):
     a = b"#TITLE A\n"
-    wav = sine(tmp_path, "a.wav", 440)
+    wav = noise(tmp_path, "a.wav")
     put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "k.wav": wav, "x.wav": wav})
     importer.import_tmp()
 
-    ogg_as_wav = sine(tmp_path, "a.ogg", 440, 1.0, "-c:a", "libvorbis", "-q:a", "2")
-    other = sine(tmp_path, "b.wav", 880)
+    # 같은 소재를 손실 압축한 새 파일은 더 작아도 기존 무손실 파일을 둡니다.
+    ogg_as_wav = noise(tmp_path, "a.ogg", "-c:a", "libvorbis", "-q:a", "2")
+    other = sine(tmp_path, "b.wav", 880, 2.0)
     pkg = put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "k.wav": ogg_as_wav, "x.wav": other})
     songs = importer.import_tmp()
     assert songs == [{
         "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "conflicts": ["x.wav"], "similar_files": ["k.wav"], "replaced_files": ["k.wav"],
+        "conflicts": ["x.wav"], "similar_files": ["k.wav"],
     }]
-    # 같은 소재면 용량이 작은 쪽(ogg로 인코딩한 새 파일)으로 바꿉니다.
     assert len(ogg_as_wav) < len(wav)
-    assert song_zip(1) == {"a.bms": a, "k.wav": ogg_as_wav, "x.wav": wav}
+    assert song_zip(1) == {"a.bms": a, "k.wav": wav, "x.wav": wav}
     assert pkg.exists()
 
-    # 새 파일이 더 크면 기존 파일을 둡니다.
-    shutil.rmtree(pkg)
-    put_song(constant.TMP_DIR / "g" / "pkg2", {"a.bms": a, "k.wav": wav})
+
+@needs_ffmpeg
+def test_merge_replaces_with_better_quality(database, tmp_path):
+    """기존이 저품질(낮은 비트레이트 ogg)이고 새 파일이 무손실이면 더 커도 새 파일로 바꿉니다."""
+    a = b"#TITLE A\n"
+    low = noise(tmp_path, "low.ogg", "-c:a", "libvorbis", "-q:a", "0")
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "k.ogg": low})
+    importer.import_tmp()
+
+    wav = noise(tmp_path, "a.wav")
+    put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "k.wav": wav})
     songs = importer.import_tmp()
-    assert songs[0]["similar_files"] == ["k.wav"] and "replaced_files" not in songs[0] and "added_files" not in songs[0]
-    assert song_zip(1)["k.wav"] == ogg_as_wav
+    assert songs[0]["similar_files"] == ["k.wav"] and songs[0]["replaced_files"] == ["k.wav"]
+    # 확장자가 달라도 같은 자리이므로 기존 k.ogg를 빼고 k.wav를 넣습니다.
+    assert song_zip(1) == {"a.bms": a, "k.wav": wav}
 
 
 @needs_ffmpeg
 def test_merge_matches_other_extension(database, tmp_path):
     """확장자만 다른 키음(k.wav ↔ k.ogg)도 같은 파일로 보고 비교합니다."""
     a = b"#TITLE A\n"
-    wav = sine(tmp_path, "a.wav", 440)
-    other = sine(tmp_path, "b.wav", 880)
+    wav = noise(tmp_path, "a.wav")
     put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "k.wav": wav, "x.wav": wav})
     importer.import_tmp()
 
-    ogg = sine(tmp_path, "a.ogg", 440, 1.0, "-c:a", "libvorbis", "-q:a", "2")
-    other_ogg = ffmpeg(tmp_path, "b.ogg", "-i", str(tmp_path / "b.wav"), "-c:a", "libvorbis")
+    ogg = noise(tmp_path, "a.ogg", "-c:a", "libvorbis", "-q:a", "2")
+    other_ogg = sine(tmp_path, "b.ogg", 880, 2.0, "-c:a", "libvorbis")
     put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "k.ogg": ogg, "x.ogg": other_ogg, "n.ogg": ogg})
     songs = importer.import_tmp()
     assert songs == [{
         "folder": "g/pkg", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "added_files": ["n.ogg"], "conflicts": ["x.ogg"], "similar_files": ["k.ogg"], "replaced_files": ["k.ogg"],
+        "added_files": ["n.ogg"], "conflicts": ["x.ogg"], "similar_files": ["k.ogg"],
     }]
-    # 작은 k.ogg가 k.wav를 대신합니다(플레이어는 k.wav가 없으면 k.ogg를 읽음).
-    assert set(song_zip(1)) == {"a.bms", "k.ogg", "x.wav", "n.ogg"}
-    assert other  # b.wav는 b.ogg를 만드는 데 씁니다.
+    # 무손실인 기존 k.wav를 둡니다.
+    assert set(song_zip(1)) == {"a.bms", "k.wav", "x.wav", "n.ogg"}
 
 
 @needs_ffmpeg
@@ -163,6 +175,7 @@ def test_merge_matches_bga_by_name(database, tmp_path):
     put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "BG.PNG": png, "mv.mpg": mpg})
     songs = importer.import_tmp()
     assert songs[0]["similar_files"] == ["BG.PNG"] and songs[0]["conflicts"] == ["mv.mpg"]
+    # 크기·형식이 같은 그림이면 작은 쪽(png)을 남깁니다.
     assert set(song_zip(1)) == {"a.bms", "BG.PNG", "mv.bmp"}
 
 
@@ -171,3 +184,52 @@ def test_slot():
     assert media_match.slot("bg.bmp") == media_match.slot("bg.mpg") == media_match.slot("bg.tga") == ("bg", "bga")
     assert media_match.slot("bg.bmp") != media_match.slot("bg.wav")
     assert media_match.slot("a.bms") is None
+
+
+def _better(tmp_path, path, old: bytes, new: bytes) -> bool:
+    new_file = tmp_path / "new" / path
+    new_file.parent.mkdir(parents=True, exist_ok=True)
+    new_file.write_bytes(new)
+    return path in media_match.better_new([(path, old, new_file)])
+
+
+@needs_ffmpeg
+def test_better_quality(tmp_path):
+    wav = noise(tmp_path, "a.wav")
+    mp3_low = noise(tmp_path, "low.mp3", "-c:a", "libmp3lame", "-b:a", "64k")
+    mp3_high = noise(tmp_path, "high.mp3", "-c:a", "libmp3lame", "-b:a", "320k")
+    ogg_low = noise(tmp_path, "low.ogg", "-c:a", "libvorbis", "-q:a", "0")
+    # 대역폭: 무손실 > 고음질 손실 > 저음질 손실
+    assert not _better(tmp_path, "k1.wav", wav, mp3_high)
+    assert _better(tmp_path, "k2.wav", mp3_low, wav)
+    assert _better(tmp_path, "k3.mp3", mp3_low, mp3_high)
+    assert not _better(tmp_path, "k4.mp3", mp3_high, mp3_low)
+    assert _better(tmp_path, "k5.ogg", ogg_low, mp3_high)
+    # 같은 파일이면 바꾸지 않습니다.
+    assert not _better(tmp_path, "k6.wav", wav, wav)
+
+    big = image(tmp_path, "big.png")
+    small = ffmpeg(tmp_path, "small.png", "-i", str(tmp_path / "big.png"), "-vf", "scale=128:128")
+    jpg = image(tmp_path, "a.jpg", "testsrc", "-q:v", "3")
+    assert _better(tmp_path, "bg.png", small, big)
+    assert not _better(tmp_path, "bg2.png", big, small)
+    # 해상도가 같으면 무손실 형식
+    assert _better(tmp_path, "bg3.png", jpg, big)
+
+    hi = ffmpeg(tmp_path, "hi.mpg", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=4", "-c:v", "mpeg1video")
+    lo = ffmpeg(tmp_path, "lo.mpg", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25:duration=4", "-c:v", "mpeg1video")
+    assert _better(tmp_path, "mv.mpg", lo, hi)
+    assert not _better(tmp_path, "mv2.mpg", hi, lo)
+
+
+def test_bandwidth_math():
+    rate = media_match.BAND_RATE
+    rng = np.random.default_rng(1)
+    full = rng.standard_normal(rate)
+    # 8kHz 위를 잘라 낸 잡음
+    spectrum = np.fft.rfft(full)
+    spectrum[int(8000 * len(full) / rate):] = 0
+    cut = np.fft.irfft(spectrum, len(full))
+    assert media_match.bandwidth(full) > 20000
+    assert 7000 < media_match.bandwidth(cut) < 9000
+    assert media_match.bandwidth(np.zeros(rate)) == 0
