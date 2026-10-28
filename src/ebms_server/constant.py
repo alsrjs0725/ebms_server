@@ -39,23 +39,14 @@ CACHE_MAX_BYTES = parse_size(os.environ.get("EBMS_CACHE_MAX_BYTES", "0"))
 # 곡 zip·차트 청크·사전 청크 파일을 두는 폴더(store.py, #152). DB에는 경로·크기·sha256만 둡니다.
 STORE_DIR = pathlib.Path(os.environ.get("EBMS_STORE_DIR", BASE_DIR / "var" / "store"))
 # 아무 행도 가리키지 않는 저장소 파일을 지우는 주기(시간)와, 지우지 않고 두는 최근 파일의 나이(초).
-# gc는 쓰기 잠금을 잡고 보므로 이 프로세스의 커밋 전 파일은 따로 지키고, 나이 기준은 다른 프로세스(migrate 스크립트)를 위한 여유입니다.
 STORE_GC_HOURS = float(os.environ.get("EBMS_STORE_GC_HOURS", "1"))
 STORE_GC_GRACE_SECONDS = 600
-# DB BLOB에 남은 기존 데이터를 저장소 파일로 옮기는 백그라운드 작업(Database.migrate_to_store).
-# 한 곡(청크)씩 옮기고 일한 시간 x STORE_MIGRATE_REST_RATIO 만큼 쉬어 디스크를 서비스에 양보합니다(3이면 약 25%).
-STORE_MIGRATE_ENABLED = os.environ.get("EBMS_STORE_MIGRATE", "1") not in ("0", "false", "no", "")
-STORE_MIGRATE_REST_RATIO = float(os.environ.get("EBMS_STORE_MIGRATE_REST_RATIO", "3"))
-STORE_MIGRATE_REST_MIN = 0.2
-# 저장소 디스크의 남은 공간이 옮길 크기 + 이 값보다 작으면 마이그레이션을 멈추고 STORE_MIGRATE_WAIT초 뒤 다시 봅니다.
-STORE_MIN_FREE_BYTES = parse_size(os.environ.get("EBMS_STORE_MIN_FREE", "20G"))
-STORE_MIGRATE_WAIT = 600
 # HTTP 접근 로그(var/log/access.log, 접속 IP·경로)를 날마다 돌려 남기는 일수. 처리방침의 보유기간과 맞춥니다.
 ACCESS_LOG_DAYS = 30
 # 관리자가 지운(사용 중지한) 곡의 zip을 옮겨 두는 폴더. 복원하면 DB로 되돌리고 지웁니다.
 UNUSED_DIR = BASE_DIR / "var" / "unused"
 # 차트 청크 하나에 넣는 차트 수. 차트가 커서 BYTE_PER_CHUNK를 넘으면 그 전에 다음 청크로 넘어갑니다.
-# 바꾸면 서버 시작 뒤 기존 차트 청크를 이 크기로 다시 묶습니다(Database.rechunk_charts).
+# 새로 만드는 청크에만 적용됩니다. 기존 청크를 다시 묶으려면 따로 스크립트를 돌려야 합니다.
 CHARTS_PER_CHUNK = 100
 BYTE_PER_CHUNK = 64 * 1024 * 1024
 # 곡 여러 개를 한 트랜잭션으로 넣을 때 커밋하는 곡 수. 새 차트가 BYTE_PER_CHUNK에 이르러도 커밋합니다.
@@ -67,14 +58,12 @@ IMPORT_BATCH_SONGS = 20
 IMPORT_SLOW_BATCH_SONGS = 5
 IMPORT_SLOW_REST_RATIO = 1.0
 IMPORT_SLOW_REST_MAX = 60
-# 서버 시작 시 기존 곡을 다시 처리(매니페스트·pre/play 판정 채우기)할 때 커밋하는 곡 수
-BACKFILL_BATCH_SONGS = 100
-# 기존 곡을 다시 처리할 때 진행도 로그를 남기는 간격(초)
+# 오래 걸리는 뒤 작업(사전 청크·미리듣기 만들기 등)의 진행도 로그를 남기는 간격(초)
 BACKFILL_PROGRESS_SECONDS = 10
 CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 매니페스트 청크 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_MANIFEST_CHUNK
 # 곡 하나가 바뀌어도 청크를 통째로 다시 만들고 클라이언트가 다시 받으므로 작게 둡니다(곡당 파일 목록이 커서 100곡에 gzip 약 2MB).
-# 바꾸면 서버 시작 뒤 매니페스트 청크를 모두 다시 만듭니다(Database.rechunk_manifest).
+# chunk_id가 song_id에서 바로 나오므로 바꾸면 기존 매니페스트 청크를 모두 다시 만들어야 합니다(따로 스크립트).
 SONGS_PER_MANIFEST_CHUNK = 100
 # 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 넣는 최대 곡 수. 곡은 속한 난이도표 조합이 같은 곡끼리 묶습니다
 # (pre_rebalance.py). 곡 하나가 바뀌면 청크를 통째로 다시 받으므로 작게 둡니다.
@@ -97,20 +86,10 @@ TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
 TABLE_PAGE_DIR = BASE_DIR / "src" / "ebms_server" / "table"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
 API_VERSION = 3
-# 다운로드 본문(BLOB 조각) 읽기에 쓰는 스레드 수 한도. API·로그인이 쓰는 기본 스레드 한도(40)와 따로 셉니다.
-# 큰 곡을 동시에 많이 받아도 다른 요청이 스레드를 기다리지 않게 합니다. 늘리면 MySQL 동시 연결도 그만큼 늘어납니다.
-DOWNLOAD_THREADS = int(os.environ.get("EBMS_DOWNLOAD_THREADS", "16"))
-# BLOB 다운로드 시 한 번에 읽어오는 크기
-BLOB_READ_SIZE = 1024 * 1024
-# 다운로드 하나가 보내기 전에 미리 읽어 메모리에 쌓아 두는 BLOB 조각 수 상한(조각당 BLOB_READ_SIZE).
-# 디스크 읽기가 전송을 기다리지 않고 연달아 이어지게 합니다. 메모리는 동시 다운로드 수 × 이 값 × 1MB까지 씁니다.
-READ_AHEAD_CHUNKS = int(os.environ.get("EBMS_READ_AHEAD_CHUNKS", "64"))
-# INSERT/UPDATE 쿼리에서 BLOB 외에 필요한 여유 바이트
-PACKET_OVERHEAD = 1024 * 1024
+# 파일을 나눠 읽거나 복사할 때 한 번에 다루는 크기
+READ_SIZE = 1024 * 1024
 # 연결 풀에 남겨 둘 유휴 MySQL 연결 수 상한
 DB_POOL_SIZE = int(os.environ.get("EBMS_DB_POOL_SIZE", "32"))
-# 클라이언트가 보낼 수 있는 최대 패킷 크기. 서버의 max_allowed_packet과 맞춥니다.
-DB_MAX_ALLOWED_PACKET = 1024 * 1024 * 1024
 
 # 로그인/세션. docker compose에서는 .env 값을 environment로 넘깁니다.
 # 외부에서 접속하는 서버 주소. OAuth 리다이렉트 주소(<PUBLIC_URL>/auth/<oauth>/callback)를 만드는 데 씁니다.

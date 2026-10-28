@@ -20,15 +20,12 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      # 압축 파일을 BLOB으로 주고받기 위해 패킷 한도를 키움
-      - --max_allowed_packet=1G
       - --innodb_buffer_pool_size=512M
       - --max_connections=200
       # 쓰기 로그(binlog·redo log·doublewrite)는 /var/lib/mysql-log에 둡니다. EBMS_MYSQL_LOG_DIR(SSD 등)를 비우면
       # 데이터 폴더를 그 자리에 한 번 더 붙이므로 지금까지와 같은 파일입니다(docs/deployment.md#쓰기-로그를-ssd에-두기).
       - --log-bin=/var/lib/mysql-log/binlog
-      # binlog에 바뀐 열만 적습니다. 기본(FULL)은 UPDATE·DELETE마다 행 전체를 적어, BLOB을 파일로 옮기며 비우는 동안
-      # 옮긴 BLOB이 binlog에 그대로 쌓입니다.
+      # binlog에 바뀐 열만 적어 크기를 줄입니다(기본 FULL은 UPDATE·DELETE마다 행 전체를 적음).
       - --binlog-row-image=MINIMAL
       - --innodb-log-group-home-dir=/var/lib/mysql-log
       - --innodb-doublewrite-dir=/var/lib/mysql-log
@@ -66,8 +63,6 @@ services:
       EBMS_DISCORD_CLIENT_ID: ${EBMS_DISCORD_CLIENT_ID:-}
       EBMS_DISCORD_CLIENT_SECRET: ${EBMS_DISCORD_CLIENT_SECRET:-}
       EBMS_ADMIN_USER_IDS: ${EBMS_ADMIN_USER_IDS:-}
-      # 다운로드 본문 읽기 스레드 수 한도(API용 스레드와 따로 셈)
-      EBMS_DOWNLOAD_THREADS: ${EBMS_DOWNLOAD_THREADS:-16}
       # 프록시 헤더를 믿을 앞단 프록시 주소(쉼표 구분). 호스트의 프록시는 docker 브리지 게이트웨이로 보입니다.
       EBMS_FORWARDED_ALLOW_IPS: ${EBMS_FORWARDED_ALLOW_IPS:-127.0.0.1}
       # 캐싱 리버스 프록시(deploy/proxy)와 나누는 비밀값. 비우면 프록시 연동을 끕니다(docs/proxy.md).

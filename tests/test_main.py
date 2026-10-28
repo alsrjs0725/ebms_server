@@ -4,20 +4,9 @@ import threading
 
 from fastapi.testclient import TestClient
 
-from ebms_server import auth, constant, importer, main, migrate, preview, retention, staging, tables
+from ebms_server import auth, constant, importer, main, preview, retention, staging, tables
 
 from test_auth import client  # noqa: F401  (fixture 재사용)
-
-BACKFILL_STEPS = [
-    "backfill_file_kinds",
-    "rechunk_charts",
-    "rechunk_manifest",
-    "backfill_chart_formats",
-    "backfill_pre_chunks",
-    "backfill_chart_md5",
-    "backfill_chart_meta",
-]
-
 
 def fake_database(calls: list, fail: set = frozenset()):
     """메서드를 부를 때마다 이름을 calls에 남기는 가짜 Database. fail에 든 이름은 예외를 던집니다."""
@@ -34,39 +23,18 @@ def fake_database(calls: list, fail: set = frozenset()):
     return FakeDatabase
 
 
-def test_backfill_keeps_going_after_a_step_fails(monkeypatch, caplog):
+def test_background_startup_keeps_going_after_a_step_fails(monkeypatch, caplog):
     calls = []
-    monkeypatch.setattr(main, "Database", fake_database(calls, fail={"rechunk_charts", "backfill_chart_md5"}))
+    monkeypatch.setattr(main, "Database", fake_database(calls, fail={"backfill_pre_chunks"}))
+    monkeypatch.setattr(main.pre_rebalance, "kick", lambda: calls.append("pre_rebalance.kick"))
     monkeypatch.setattr(preview, "kick", lambda: calls.append("preview.kick"))
-    monkeypatch.setattr(constant, "STORE_MIGRATE_ENABLED", True)
 
-    main.backfill_pre_chunks()
+    main.background_startup()
 
-    # 한 단계가 실패해도 나머지 단계와 미리듣기·저장소 마이그레이션은 그대로 돕니다.
-    assert calls == BACKFILL_STEPS + ["preview.kick", "migrate_to_store"]
+    # 사전 청크 만들기가 실패해도 재배치·미리듣기는 그대로 돕니다.
+    assert calls == ["backfill_pre_chunks", "pre_rebalance.kick", "preview.kick"]
     failed = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert failed == ["rechunk_charts failed", "backfill_chart_md5 failed"]
-
-
-def test_backfill_skips_store_migration_when_disabled(monkeypatch):
-    calls = []
-    monkeypatch.setattr(main, "Database", fake_database(calls, fail={"migrate_to_store"}))
-    monkeypatch.setattr(preview, "kick", lambda: calls.append("preview.kick"))
-    monkeypatch.setattr(constant, "STORE_MIGRATE_ENABLED", False)
-
-    main.backfill_pre_chunks()
-    assert calls == BACKFILL_STEPS + ["preview.kick"]
-
-
-def test_backfill_survives_failing_store_migration(monkeypatch, caplog):
-    calls = []
-    monkeypatch.setattr(main, "Database", fake_database(calls, fail={"migrate_to_store"}))
-    monkeypatch.setattr(preview, "kick", lambda: None)
-    monkeypatch.setattr(constant, "STORE_MIGRATE_ENABLED", True)
-
-    main.backfill_pre_chunks()
-    assert calls[-1] == "migrate_to_store"
-    assert "migrate_to_store failed" in caplog.text
+    assert failed == ["backfill_pre_chunks failed"]
 
 
 def test_store_gc_loop_retries_after_error_until_stopped(monkeypatch, caplog):
@@ -120,7 +88,7 @@ def test_lifespan_starts_and_stops_background_work(client, monkeypatch, caplog, 
     started = threading.Event()
 
     monkeypatch.setattr(main, "configure_logging", lambda: calls.append("configure_logging"))
-    monkeypatch.setattr(main, "backfill_pre_chunks", lambda: (calls.append("backfill"), started.set()))
+    monkeypatch.setattr(main, "background_startup", lambda: (calls.append("backfill"), started.set()))
     monkeypatch.setattr(main, "store_gc_loop", lambda stop: store_stops.append(stop))
     monkeypatch.setattr(importer, "recover", lambda: calls.append("importer.recover"))
     monkeypatch.setattr(staging, "recover", lambda: calls.append("staging.recover"))
@@ -158,7 +126,7 @@ def test_lifespan_starts_and_stops_background_work(client, monkeypatch, caplog, 
 def test_lifespan_without_optional_workers(client, monkeypatch, caplog):
     store_stops = []
     monkeypatch.setattr(main, "configure_logging", lambda: None)
-    monkeypatch.setattr(main, "backfill_pre_chunks", lambda: None)
+    monkeypatch.setattr(main, "background_startup", lambda: None)
     monkeypatch.setattr(main, "store_gc_loop", lambda stop: store_stops.append(stop))
     monkeypatch.setattr(constant, "STORE_GC_HOURS", 0)
     monkeypatch.setattr(constant, "RETENTION_INTERVAL_HOURS", 0)
@@ -172,11 +140,3 @@ def test_lifespan_without_optional_workers(client, monkeypatch, caplog):
     assert "is not https" not in caplog.text
     assert "No OAuth login" not in caplog.text
     assert "EBMS_SECRET_KEY" not in caplog.text
-
-
-def test_migrate_runs_each_step(monkeypatch):
-    calls = []
-    monkeypatch.setattr(migrate, "Database", fake_database(calls))
-    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: None)
-    migrate.main()
-    assert calls == ["backfill_file_kinds", "migrate_chart_chunk_names", "backfill_chart_formats"]

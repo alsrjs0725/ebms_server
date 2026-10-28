@@ -61,10 +61,6 @@ class SQLiteCursor:
         sql = re.sub(r"SUBSTRING\(", "SUBSTR(", sql, flags=re.IGNORECASE)
         sql = re.sub(r",\s*\)", "\n)", sql)
 
-        if "SELECT @@max_allowed_packet" in sql:
-            self._cur.execute("SELECT 1073741824")
-            return
-
         if "information_schema.COLUMNS" in sql:
             table_name, col_name = args[0], args[1]
             try:
@@ -74,11 +70,6 @@ class SQLiteCursor:
             except sqlite3.OperationalError:
                 count = 0
             self._cur.execute(f"SELECT {count}")
-            return
-
-        if "ALTER TABLE song DROP COLUMN folder, DROP COLUMN files" in sql:
-            self._cur.execute("ALTER TABLE song DROP COLUMN folder")
-            self._cur.execute("ALTER TABLE song DROP COLUMN files")
             return
 
         if "ON DUPLICATE KEY UPDATE" in sql:

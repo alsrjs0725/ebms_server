@@ -20,7 +20,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -486,7 +486,7 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
 @router.get("/api/admin/songs/{song_id}/zip")
 def download_song_zip(song_id: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
     """곡 zip 전체. 티켓·사용량은 쓰지 않습니다."""
-    return downloads.blob_response(request, "song", song_id, f"song_{song_id}.zip", "song not found")
+    return downloads.file_response(request, "song", song_id, f"song_{song_id}.zip", "song not found")
 
 
 @router.get("/api/admin/songs/{song_id}/file")
@@ -498,27 +498,17 @@ def download_song_file(song_id: int, path: str, admin: Annotated[User, Depends(w
     entry = next((f for f in files if f["path"] == path), None)
     if entry is None:
         raise HTTPException(status_code=404, detail="file not found")
-    blob = db.Database().open_blob("song", song_id)
-    if blob is None:
+    file = db.Database().open_file("song", song_id)
+    if file is None:
         raise HTTPException(status_code=404, detail="song not found")
     try:
-        start, decompressor = downloads._zip_member(blob, entry)
+        start, decompressor = downloads.zip_member(file, entry)
     except ValueError:
-        blob.close()
+        file.close()
         raise HTTPException(status_code=500, detail="broken song file")
-    body = downloads._iter_member(blob, start, entry["comp_size"], decompressor)
     name = urllib.parse.quote(path.rsplit("/", 1)[-1])
-
-    @downloads._once
-    def cleanup():
-        try:
-            body.close()
-        finally:
-            blob.close()
-
-    return downloads.ReleasingStreamingResponse(
-        body,
-        on_close=cleanup,
+    return StreamingResponse(
+        downloads.send(downloads.member_chunks(file, start, entry["comp_size"], decompressor)),
         media_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
         headers={"Content-Length": str(entry["size"]), "Content-Disposition": f"attachment; filename*=UTF-8''{name}"},
     )

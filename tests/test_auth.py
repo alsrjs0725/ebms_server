@@ -328,26 +328,6 @@ def test_missing_nickname_asked_after_login(client, monkeypatch):
     assert r.headers["location"] == "/admin"
 
 
-def test_old_columns_dropped_on_start(client, monkeypatch):
-    """예전 DB에 남은 이메일·기기 이름 컬럼은 서버 시작 시 값과 함께 지웁니다(#102)."""
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("ALTER TABLE user ADD COLUMN email VARCHAR(255)")
-        cur.execute("ALTER TABLE user_identity ADD COLUMN email VARCHAR(255)")
-        cur.execute("ALTER TABLE user_identity ADD COLUMN name VARCHAR(255) NOT NULL DEFAULT ''")
-        cur.execute("INSERT INTO user (id, display_name, created_at) VALUES ('u1', 'OAuth Name', 0)")
-        cur.execute("ALTER TABLE session ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
-        cur.execute("ALTER TABLE auth_code ADD COLUMN device_name VARCHAR(255) NOT NULL DEFAULT ''")
-        con.commit()
-    Database().generate_database()
-    assert not any(has_column(*c) for c in REMOVED_COLUMNS)
-    # OAuth에서 가져온 표시 이름도 비움(다음 로그인 때 닉네임을 정함)
-    assert accounts.get_user("u1").display_name == ""
-    # 이미 정리한 DB에서 다시 시작하면 닉네임을 건드리지 않음
-    accounts.set_nickname("u1", "Nick")
-    Database().generate_database()
-    assert accounts.get_user("u1").display_name == "Nick"
-
-
 def test_banned_user_cannot_login(client, monkeypatch):
     oauth(client, monkeypatch, "google", "g1")
     user_id = me(client).id

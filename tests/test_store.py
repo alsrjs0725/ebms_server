@@ -79,29 +79,6 @@ def test_remove_counts_only_existing_files():
     assert not store.full_path(a).exists() and not store.full_path(b).exists()
 
 
-def test_free_bytes_before_store_dir_exists(monkeypatch, tmp_path):
-    monkeypatch.setattr(constant, "STORE_DIR", tmp_path / "not" / "yet" / "store")
-    assert store.free_bytes() > 0
-
-
-def test_hold_is_reentrant():
-    rel = "song/0000/1.aaaa.zip"
-    with store.hold(rel):
-        with store.hold(rel):
-            assert rel in store.held()
-        # 바깥 hold가 남아 있으면 계속 잡혀 있습니다.
-        assert rel in store.held()
-    assert rel not in store.held()
-
-
-def test_hold_releases_on_error():
-    rel = "song/0000/9.eeee.zip"
-    with pytest.raises(RuntimeError):
-        with store.hold(rel):
-            raise RuntimeError("boom")
-    assert rel not in store.held()
-
-
 def test_cutoff_leaves_grace_period(monkeypatch):
     monkeypatch.setattr(constant, "STORE_GC_GRACE_SECONDS", 600)
     assert store.cutoff() == pytest.approx(time.time() - 600, abs=5)

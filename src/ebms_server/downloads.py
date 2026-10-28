@@ -1,37 +1,36 @@
 """다운로드 API. 사전(/api/pre/*)과 플레이(/api/play/*) 두 갈래로, 둘 다 로그인이 필요합니다.
 
-- 사전: 차트 청크, 매니페스트, 사전 청크(곡들의 배너·스테이지파일·프리뷰 등 묶음), 곡의 사전 파일 하나. 이번 달 사용량에 더하고 한도를 넘으면 감속.
-- 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안, 곡 크기 × 3 바이트까지 같은 곡은 재차감 없음), 티켓이 없으면 429.
+- 사전: 차트 청크, 매니페스트, 사전 청크(곡들의 배너·스테이지파일·프리뷰 등 묶음), 곡의 사전 파일 하나.
+  보낼 바이트를 요청 때 이번 달 사용량에 더하고, 한도를 넘었으면 연결마다 pre_throttled_kbps로 보냅니다.
+- 플레이: 곡 zip 전체. 곡 1개당 티켓 1개(grant_seconds 동안 같은 곡은 재차감 없음), 티켓이 없으면 429.
 
-캐싱 리버스 프록시(proxy.py) 뒤에서는 차트 청크·사전 청크·곡 zip의 인증·차감을 /api/proxy/authz가 하고,
+캐싱 리버스 프록시(proxy.py) 뒤에서는 차트 청크·사전 청크·곡 zip의 인증·차감을 /api/proxy/authz가 같은 규칙으로 하고,
 이 경로들은 프록시의 캐시 채우기 요청(사용자 없음)에 본문만 내려줍니다.
 """
+import asyncio
 import gzip
-import logging
 import mimetypes
-import queue
 import re
 import struct
-import threading
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Annotated
 
-import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
 
 from . import constant, download_log, proxy, quota
 from .accounts import User
 from .auth import current_user, optional_api_session
-from .db import BlobReader, Database
+from .db import Database, StoreFile
 
 router = APIRouter()
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+# 감속할 때 한 번에 보내는 크기
+THROTTLE_PIECE = 16 * 1024
 
 
 def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
@@ -62,117 +61,30 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
     return start, end
 
 
-def _once(fn: Callable[[], None]) -> Callable[[], None]:
-    """처음 한 번만 fn을 부르는 함수를 반환합니다(슬롯 반납이 두 번 되지 않도록)."""
-    lock = threading.Lock()
-    done = False
-
-    def call() -> None:
-        nonlocal done
-        with lock:
-            if done:
-                return
-            done = True
-        fn()
-
-    return call
+def _file_chunks(file: StoreFile, start: int, end: int) -> Iterator[bytes]:
+    """[start, end] 바이트(양끝 포함)를 READ_SIZE씩 읽습니다. 끝나거나 닫히면 파일을 닫습니다."""
+    try:
+        yield from file.iter_range(start, end)
+    finally:
+        file.close()
 
 
-class ReleasingStreamingResponse(StreamingResponse):
-    """응답이 끝나면 on_close를 부르는 StreamingResponse.
-
-    Starlette는 본문을 시작하기 전에 연결이 끊기면 본문 이터레이터를 한 번도 돌리지 않아
-    제너레이터의 finally에 맡긴 정리가 실행되지 않습니다. 그래서 정리를 응답 수명에 묶습니다.
-    on_close는 멱등이어야 합니다(본문 쪽 finally에서도 부를 수 있음). on_finish는 본문까지 닫은 뒤 한 번 기다립니다.
-    """
-
-    def __init__(self, content, *, on_close: Callable[[], None], on_finish=None, **kwargs):
-        super().__init__(content, **kwargs)
-        self._on_close = on_close
-        self._on_finish = on_finish
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            try:
-                self._on_close()
-            finally:
-                # 중간에 멈춘 본문(사용량 기록 등)을 바로 마무리합니다. 취소 중이어도 끝까지 닫습니다.
-                with anyio.CancelScope(shield=True):
-                    try:
-                        aclose = getattr(self.body_iterator, "aclose", None)
-                        if aclose is not None:
-                            await aclose()
-                    finally:
-                        if self._on_finish is not None:
-                            await self._on_finish()
-
-
-class ReadAhead:
-    """BLOB 조각 iterator를 백그라운드 스레드에서 미리 읽어 두는 iterator.
-
-    조각 하나를 보내는 동안 다음 조각을 읽어 디스크 읽기와 전송이 겹치게 합니다. 조각을 하나씩 읽고 보내면
-    느린 HDD에서 읽는 동안 전송이 멈춰 속도가 들쭉날쭉해집니다. 최대 READ_AHEAD_CHUNKS개까지 쌓습니다.
-    close()는 읽기를 멈추게만 하고, 원본 iterator는 읽던 스레드가 닫습니다(다른 스레드에서 닫을 수 없음).
-    """
-
-    _END = object()
-
-    def __init__(self, chunks: Iterator[bytes], max_chunks: int | None = None):
-        self._chunks = chunks
-        self._queue: queue.Queue = queue.Queue(maxsize=max(1, max_chunks or constant.READ_AHEAD_CHUNKS))
-        self._stop = threading.Event()
-        self._done = False
-        threading.Thread(target=self._run, name="blob-read-ahead", daemon=True).start()
-
-    def _put(self, item) -> bool:
-        """큐가 비기를 기다려 넣습니다. 그 사이 close()되면 False."""
-        while not self._stop.is_set():
-            try:
-                self._queue.put(item, timeout=0.5)
-                return True
-            except queue.Full:
-                pass
-        return False
-
-    def _run(self) -> None:
-        try:
-            for chunk in self._chunks:
-                if not self._put(chunk):
-                    return
-            self._put(self._END)
-        except BaseException as e:
-            self._put(e)
-        finally:
-            close = getattr(self._chunks, "close", None)
-            if close is not None:
-                close()
-
-    def __iter__(self) -> "ReadAhead":
-        return self
-
-    def __next__(self) -> bytes:
-        if self._done:
-            raise StopIteration
-        item = self._queue.get()
-        if item is self._END:
-            self._done = True
-            raise StopIteration
-        if isinstance(item, BaseException):
-            self._done = True
-            raise item
-        return item
-
-    def close(self) -> None:
-        self._done = True
-        self._stop.set()
-        # 쌓아 둔 조각을 바로 놓아 줍니다.
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
+async def send(chunks: Iterator[bytes], rate: int | None = None) -> AsyncIterator[bytes]:
+    """동기 iterator(파일 읽기)의 조각을 스레드에서 꺼내 보냅니다. rate(바이트/초)를 주면 그 속도로 나눠 보냅니다.
+    끝나거나 연결이 끊기면 chunks를 닫습니다(본문을 시작하기 전에 끊기면 열어 둔 파일은 StoreFile이 GC 때 닫음)."""
+    try:
+        while (chunk := await run_in_threadpool(next, chunks, None)) is not None:
+            if not rate:
+                yield chunk
+                continue
+            for i in range(0, len(chunk), THROTTLE_PIECE):
+                piece = chunk[i : i + THROTTLE_PIECE]
+                yield piece
+                await asyncio.sleep(len(piece) / rate)
+    finally:
+        close = getattr(chunks, "close", None)
+        if close is not None:
+            close()
 
 
 def _not_modified(request: Request, etag: str) -> bool:
@@ -193,120 +105,64 @@ def download_user(
     return session[0]
 
 
-def blob_response(
+def file_response(
     request: Request,
     table: str,
     row_id: int,
     filename: str,
     detail: str,
     *,
-    user_id: str | None = None,
-    before_send: Callable[[int, int], Callable[[int], None] | None] | None = None,
+    charge: Callable[[], None] | None = None,
     meter_user: str | None = None,
     expect_sha256: str | None = None,
 ) -> Response:
-    """BLOB을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다.
+    """저장소 파일을 내려줍니다. Range(단일 범위), If-Range, If-None-Match를 지원하고 ETag는 sha256입니다.
 
-    user_id: 동시 다운로드 수를 제한할 사용자 ID.
-    before_send: 본문(200/206)을 보내기로 정한 뒤 (보낼 바이트 수, 전체 크기)로 호출합니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
-        함수를 돌려주면 응답이 끝날 때 보내지 못한 바이트 수로 부릅니다(0이면 부르지 않음).
-    meter_user: 주면 보낸 바이트를 그 사용자의 사전 다운로드 사용량에 더하고 한도를 넘으면 감속합니다.
+    charge: 본문(200/206)을 보내기로 정한 뒤 부릅니다(티켓 차감). HTTPException을 내면 그대로 응답합니다.
+    meter_user: 주면 보낼 바이트를 그 사용자의 사전 다운로드 사용량에 더하고, 한도를 넘었으면 감속합니다.
     expect_sha256: 주면 내용의 sha256이 다를 때 409를 냅니다(프록시가 옛 키로 새 내용을 캐시하지 않도록).
     """
-    if user_id and not quota.acquire_download_slot(user_id):
-        raise HTTPException(status_code=429, detail="too many concurrent downloads")
-    release = _once(lambda: quota.release_download_slot(user_id) if user_id else None)
-
+    file = Database().open_file(table, row_id)
+    if file is None:
+        status, detail = proxy.missing_song(row_id) if table == "song" else (404, detail)
+        raise HTTPException(status_code=status, detail=detail)
     try:
-        blob = Database().open_blob(table, row_id)
-        if blob is None:
-            if table == "song":
-                status, detail = proxy.missing_song(row_id)
-                raise HTTPException(status_code=status, detail=detail)
-            raise HTTPException(status_code=404, detail=detail)
-        if expect_sha256 and expect_sha256 != blob.sha256:
-            blob.close()
+        if expect_sha256 and expect_sha256 != file.sha256:
             raise HTTPException(status_code=409, detail="content changed. retry.")
-        etag = f'"{blob.sha256}"'
-        headers = {
-            "Accept-Ranges": "bytes",
-            "ETag": etag,
-            "X-Content-SHA256": blob.sha256,
-        }
-
+        etag = f'"{file.sha256}"'
+        headers = {"Accept-Ranges": "bytes", "ETag": etag, "X-Content-SHA256": file.sha256}
         if _not_modified(request, etag):
-            blob.close()
-            release()
+            file.close()
             return Response(status_code=304, headers=headers)
 
         rng = None
         if_range = request.headers.get("if-range")
         if if_range is None or if_range.strip() == etag:
             try:
-                rng = parse_range(request.headers.get("range"), blob.size)
+                rng = parse_range(request.headers.get("range"), file.size)
             except ValueError:
-                blob.close()
                 raise HTTPException(
                     status_code=416,
                     detail="Range not satisfiable",
-                    headers={**headers, "Content-Range": f"bytes */{blob.size}"},
+                    headers={**headers, "Content-Range": f"bytes */{file.size}"},
                 )
-
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'
         if rng is None:
-            start, end, status = 0, blob.size - 1, 200
+            start, end, status = 0, file.size - 1, 200
         else:
             start, end = rng
             status = 206
-            headers["Content-Range"] = f"bytes {start}-{end}/{blob.size}"
+            headers["Content-Range"] = f"bytes {start}-{end}/{file.size}"
         headers["Content-Length"] = str(end - start + 1)
-
-        settle = None
-        if before_send is not None:
-            try:
-                settle = before_send(end - start + 1, blob.size)
-            except BaseException:
-                blob.close()
-                raise
-        gen = ReadAhead(blob.iter_range(start, end))
-
-        @_once
-        def cleanup():
-            try:
-                if hasattr(gen, "close"):
-                    gen.close()
-            finally:
-                blob.close()
-                release()
-
-        # 보내지 못한 바이트. 본문을 시작하기 전에 끊겨도 응답이 끝날 때 settle에 넘깁니다.
-        unsent = [end - start + 1]
-
-        if meter_user is not None:
-            body = quota.metered(meter_user, gen, close=cleanup)
-        else:
-            async def wrapped_body():
-                try:
-                    while (chunk := await quota.next_download_chunk(gen)) is not None:
-                        yield chunk
-                        unsent[0] -= len(chunk)
-                finally:
-                    cleanup()
-            body = wrapped_body()
-
-        async def finish():
-            if settle is not None and unsent[0] > 0:
-                try:
-                    await run_in_threadpool(settle, unsent[0])
-                except Exception:
-                    logging.getLogger(__name__).exception(f"settle failed: {unsent[0]} bytes")
-
-        return ReleasingStreamingResponse(
-            body, on_close=cleanup, on_finish=finish, status_code=status, media_type="application/zip", headers=headers
-        )
+        if charge is not None:
+            charge()
+        rate = quota.meter_pre(meter_user, end - start + 1) if meter_user is not None else None
     except BaseException:
-        release()
+        file.close()
         raise
+    return StreamingResponse(
+        send(_file_chunks(file, start, end), rate), status_code=status, media_type="application/zip", headers=headers
+    )
 
 
 def manifest_response(request: Request, chunk_id: int, meter_user: str | None = None) -> Response:
@@ -321,9 +177,8 @@ def manifest_response(request: Request, chunk_id: int, meter_user: str | None = 
     if meter_user is None:
         return Response(data, media_type="application/json", headers=headers)
     headers["Content-Length"] = str(len(data))
-    return StreamingResponse(
-        quota.metered(meter_user, iter([data])), media_type="application/json", headers=headers
-    )
+    rate = quota.meter_pre(meter_user, len(data))
+    return StreamingResponse(send(iter([data]), rate), media_type="application/json", headers=headers)
 
 
 # ---- 사전 다운로드 ----
@@ -333,18 +188,18 @@ def pre_chart_hash(user: Annotated[User, Depends(current_user)]):
     return Database().get_chart_chunk_hash()
 
 
-def _pre_blob(request: Request, table: str, chunk_id: int, filename: str, user: User | None) -> Response:
+def _pre_file(request: Request, table: str, chunk_id: int, filename: str, user: User | None) -> Response:
     if user is None:
-        return blob_response(
+        return file_response(
             request, table, chunk_id, filename, "File not found",
             expect_sha256=request.headers.get(proxy.EXPECT_SHA256_HEADER),
         )
-    return blob_response(request, table, chunk_id, filename, "File not found", user_id=user.id, meter_user=user.id)
+    return file_response(request, table, chunk_id, filename, "File not found", meter_user=user.id)
 
 
 @router.get("/api/pre/chart/{chunk_id}")
 def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
-    return _pre_blob(request, "chart_chunk", chunk_id, constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
+    return _pre_file(request, "chart_chunk", chunk_id, constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
 
 
 @router.get("/api/pre/assethash")
@@ -360,7 +215,7 @@ def pre_chunk_sizes(user: Annotated[User, Depends(current_user)]):
 
 @router.get("/api/pre/asset/{chunk_id}")
 def pre_asset_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
-    return _pre_blob(request, "pre_chunk", chunk_id, constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
+    return _pre_file(request, "pre_chunk", chunk_id, constant.PRE_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
 
 
 @router.get("/api/pre/manifest/hash")
@@ -373,7 +228,7 @@ def pre_manifest(chunk_id: int, request: Request, user: Annotated[User, Depends(
     return manifest_response(request, chunk_id, meter_user=user.id)
 
 
-def _zip_member(blob: BlobReader, entry: dict) -> tuple[int, object]:
+def zip_member(file: StoreFile, entry: dict) -> tuple[int, object]:
     """곡 zip에서 항목 데이터가 시작하는 위치와 압축 해제기를 구합니다."""
     if entry["method"] == zipfile.ZIP_STORED:
         decompressor = None
@@ -385,19 +240,20 @@ def _zip_member(blob: BlobReader, entry: dict) -> tuple[int, object]:
     if "data_offset" in entry:
         return entry["data_offset"], decompressor
 
-    head = blob.read(entry["offset"], 30)
+    head = file.read(entry["offset"], 30)
     if len(head) != 30 or head[:4] != b"PK\x03\x04":
         raise ValueError("bad local file header")
     name_len, extra_len = struct.unpack("<HH", head[26:30])
     return entry["offset"] + 30 + name_len + extra_len, decompressor
 
 
-def _iter_member(blob: BlobReader, start: int, comp_size: int, decompressor):
+def member_chunks(file: StoreFile, start: int, comp_size: int, decompressor) -> Iterator[bytes]:
+    """곡 zip 항목 하나를 압축을 풀며 읽습니다. 끝나거나 닫히면 파일을 닫습니다."""
     try:
         pos, end = start, start + comp_size
         while pos < end:
-            n = min(constant.BLOB_READ_SIZE, end - pos)
-            raw = blob.read(pos, n)
+            n = min(constant.READ_SIZE, end - pos)
+            raw = file.read(pos, n)
             pos += n
             out = decompressor.decompress(raw) if decompressor else raw
             if out:
@@ -407,82 +263,50 @@ def _iter_member(blob: BlobReader, start: int, comp_size: int, decompressor):
             if tail:
                 yield tail
     finally:
-        blob.close()
+        file.close()
 
 
 @router.get("/api/pre/song/{song_id}/file")
 def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[User, Depends(current_user)]):
     """곡의 사전 파일 하나를 압축을 풀어 내려줍니다. 사전 파일이 아니면 403."""
-    if not quota.acquire_download_slot(user.id):
-        raise HTTPException(status_code=429, detail="too many concurrent downloads")
-    release = _once(lambda: quota.release_download_slot(user.id))
-
-    try:
-        files = Database().get_song_files(song_id)
-        if files is None:
-            status, detail = proxy.missing_song(song_id)
-            raise HTTPException(status_code=status, detail=detail)
-        entry = next((f for f in files if f["path"] == path), None)
-        if entry is None:
-            rendered = Database().get_preview(song_id, path)
-            if rendered is None:
-                raise HTTPException(status_code=404, detail="file not found")
-            return _preview_response(request, user, rendered, release)
-        if entry.get("kind") != "pre":
-            raise HTTPException(status_code=403, detail="not a pre-download file")
-
-        etag = f'"{entry["crc32"]}-{entry["size"]}"'
-        headers = {"ETag": etag, "Content-Length": str(entry["size"])}
-        if _not_modified(request, etag):
-            del headers["Content-Length"]
-            release()
-            return Response(status_code=304, headers=headers)
-
-        blob = Database().open_blob("song", song_id)
-        if blob is None:
-            status, detail = proxy.missing_song(song_id)
-            raise HTTPException(status_code=status, detail=detail)
-        try:
-            start, decompressor = _zip_member(blob, entry)
-        except ValueError:
-            blob.close()
-            raise HTTPException(status_code=500, detail="broken song file. report this to admin.")
-        body = _iter_member(blob, start, entry["comp_size"], decompressor)
+    files = Database().get_song_files(song_id)
+    if files is None:
+        status, detail = proxy.missing_song(song_id)
+        raise HTTPException(status_code=status, detail=detail)
+    entry = next((f for f in files if f["path"] == path), None)
+    if entry is None:
+        rendered = Database().get_preview(song_id, path)
+        if rendered is None:
+            raise HTTPException(status_code=404, detail="file not found")
+        entry, data = rendered
+        media_type = "audio/ogg"
+    elif entry.get("kind") != "pre":
+        raise HTTPException(status_code=403, detail="not a pre-download file")
+    else:
+        data = None
         media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
 
-        @_once
-        def cleanup():
-            try:
-                body.close()
-            finally:
-                blob.close()
-                release()
-
-        return ReleasingStreamingResponse(
-            quota.metered(user.id, body, close=cleanup),
-            on_close=cleanup,
-            media_type=media_type,
-            headers=headers,
-        )
-    except BaseException:
-        release()
-        raise
-
-
-def _preview_response(request: Request, user: User, rendered: tuple[dict, bytes], release: Callable[[], None]):
-    """서버가 만든 미리듣기(곡 zip에 없는 사전 파일). 곡의 사전 파일과 같이 사용량에 더합니다."""
-    entry, data = rendered
     etag = f'"{entry["crc32"]}-{entry["size"]}"'
-    headers = {"ETag": etag, "Content-Length": str(entry["size"])}
     if _not_modified(request, etag):
-        del headers["Content-Length"]
-        release()
-        return Response(status_code=304, headers=headers)
-    return ReleasingStreamingResponse(
-        quota.metered(user.id, iter([data]), close=release),
-        on_close=release,
-        media_type="audio/ogg",
-        headers=headers,
+        return Response(status_code=304, headers={"ETag": etag})
+    headers = {"ETag": etag, "Content-Length": str(entry["size"])}
+    if data is not None:
+        # 서버가 만든 미리듣기(곡 zip에 없는 사전 파일)
+        rate = quota.meter_pre(user.id, len(data))
+        return StreamingResponse(send(iter([data]), rate), media_type=media_type, headers=headers)
+
+    file = Database().open_file("song", song_id)
+    if file is None:
+        status, detail = proxy.missing_song(song_id)
+        raise HTTPException(status_code=status, detail=detail)
+    try:
+        start, decompressor = zip_member(file, entry)
+    except ValueError:
+        file.close()
+        raise HTTPException(status_code=500, detail="broken song file. report this to admin.")
+    rate = quota.meter_pre(user.id, entry["size"])
+    return StreamingResponse(
+        send(member_chunks(file, start, entry["comp_size"], decompressor), rate), media_type=media_type, headers=headers
     )
 
 
@@ -492,31 +316,27 @@ def _preview_response(request: Request, user: User, rendered: tuple[dict, bytes]
 def play_song(song_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
     """곡 zip 전체. Range 이어받기를 지원하고, 본문을 보낼 때 티켓을 씁니다(304·416은 차감 없음)."""
     if user is None:
-        return blob_response(
+        return file_response(
             request, "song", song_id, f"{song_id}.zip", "song not found",
             expect_sha256=request.headers.get(proxy.EXPECT_SHA256_HEADER),
         )
 
     resumed = download_log.is_resume(request)
 
-    def charge(nbytes: int, size: int):
+    def charge():
         try:
-            charged = quota.charge_play(user.id, song_id, nbytes, size)
+            charged = quota.charge_play(user.id, song_id)
         except quota.NoTicket as e:
             download_log.record(user.id, song_id, "no_ticket", resumed)
             raise HTTPException(
                 status_code=429, detail="no download ticket", headers={"Retry-After": str(e.retry_after)}
             )
         download_log.record(user.id, song_id, "charged" if charged else "free", resumed)
-        # 끊겨서 받지 못한 만큼은 티켓의 받은 바이트에서 뺍니다.
-        return lambda unsent: quota.refund_play(user.id, song_id, unsent)
 
     try:
-        return blob_response(
-            request, "song", song_id, f"{song_id}.zip", "song not found", user_id=user.id, before_send=charge
-        )
+        return file_response(request, "song", song_id, f"{song_id}.zip", "song not found", charge=charge)
     except HTTPException as e:
-        result = download_log.failure_result(e.status_code, e.detail)
+        result = download_log.failure_result(e.status_code)
         if result:
             download_log.record(user.id, song_id, result, resumed)
         raise
