@@ -128,11 +128,14 @@ def _add(batch, job: Job, song_dir: pathlib.Path, folder: str, remove: bool) -> 
     job.rest(batch)
 
 
-def _insert(batch, song_dir: pathlib.Path, folder: str, remove: bool, target: str | int | None = None) -> dict:
-    """곡 하나를 배치에 넣고 결과를 반환합니다. 실패해도 예외를 내지 않습니다. target은 SongBatch.add와 같습니다.
+def _insert(
+    batch, song_dir: pathlib.Path, folder: str, remove: bool, target: str | int | None = None,
+    resolutions: dict[str, str] | None = None,
+) -> dict:
+    """곡 하나를 배치에 넣고 결과를 반환합니다. 실패해도 예외를 내지 않습니다. target·resolutions는 SongBatch.add와 같습니다.
     반환한 결과는 나중에 배치 커밋이 실패하면 "error"가 채워집니다."""
     try:
-        info = batch.add(song_dir, remove=remove, target=target)
+        info = batch.add(song_dir, remove=remove, target=target, resolutions=resolutions)
     except AmbiguousSongError as e:
         logger.warning(f"import skipped[{song_dir}]: {e}")
         return {"folder": folder, "error": str(e)}

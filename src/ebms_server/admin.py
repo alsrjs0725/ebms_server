@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import audit, auth, cache, constant, db, download_log, downloads, importer, logs, quota, staging
+from . import audit, auth, cache, conflicts, constant, db, download_log, downloads, importer, logs, media_match, quota, staging
 from .accounts import User
 from .templating import templates
 
@@ -668,6 +668,53 @@ def download_unit(stage_id: str, unit_id: str, admin: Annotated[User, Depends(we
         filename=name,
         background=BackgroundTask(path.unlink, missing_ok=True) if temporary else None,
     )
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts")
+def unit_conflicts(stage_id: str, unit_id: str, admin: Annotated[User, Depends(web_admin)]):
+    """곡의 병합 충돌 파일 목록과 고른 것."""
+    return _stage_call(conflicts.list_conflicts, stage_id, unit_id)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/file")
+def conflict_file(
+    stage_id: str, unit_id: str, path: str, side: str, admin: Annotated[User, Depends(web_admin)], raw: bool = False,
+):
+    """충돌 파일의 기존(old)·새(new) 쪽. 브라우저가 못 여는 형식은 바꿔서 줍니다(raw면 원본, 내려받기)."""
+    body, media_type, name = _stage_call(conflicts.web_file, stage_id, unit_id, path, side, raw)
+    disposition = "attachment" if raw else "inline"
+    headers = {"Content-Disposition": f"{disposition}; filename*=UTF-8''{urllib.parse.quote(name)}"}
+    if isinstance(body, bytes):
+        return Response(body, media_type=media_type, headers=headers)
+    return FileResponse(body, media_type=media_type, headers=headers)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/compare")
+def conflict_compare(stage_id: str, unit_id: str, path: str, admin: Annotated[User, Depends(web_admin)]):
+    """충돌 파일 비교 결과. 키음은 파형·상관계수, 영상은 프레임별 차이, 그 밖은 줄 단위 diff."""
+    kind = media_match.kind(path)
+    fn = {"sound": conflicts.sound_compare, "video": conflicts.video_compare}.get(kind, conflicts.text_diff)
+    return _stage_call(fn, stage_id, unit_id, path)
+
+
+class ConflictChoices(BaseModel):
+    choices: dict[str, str | None]
+
+
+@router.put("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts")
+def set_conflict_choices(
+    stage_id: str, unit_id: str, body: ConflictChoices, admin: Annotated[User, Depends(web_admin)],
+):
+    """충돌 파일마다 old(기존 유지)·new(새 파일로 바꿈)를 고릅니다. null이면 고른 것을 지웁니다."""
+    return _stage_call(conflicts.set_choices, stage_id, unit_id, body.choices)
+
+
+@router.post("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/apply")
+def apply_conflicts(stage_id: str, unit_id: str, admin: Annotated[User, Depends(web_admin)], slow: bool = False):
+    """고른 대로 그 곡만 다시 넣는 작업을 시작합니다."""
+    job = _stage_call(conflicts.apply, stage_id, unit_id, slow)
+    logger.info(f"import conflicts applied {job.id} by {admin.id}: stage {stage_id} unit {unit_id}")
+    return job.json()
 
 
 @router.post("/api/admin/import/stages/{stage_id}/analyze")

@@ -1,0 +1,178 @@
+"""병합 충돌 해결: 충돌 파일 비교와 파일마다 기존 유지·새 파일로 바꿈을 골라 그 곡만 다시 넣는 흐름 테스트."""
+import io
+import shutil
+import subprocess
+import zipfile
+
+import numpy as np
+import pytest
+
+from ebms_server import conflicts
+
+from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
+from test_import import make_zip, stage, upload, wait  # noqa: F401
+from test_quota import admin_login
+from test_staging import commit_stage, song_files, units
+
+
+def song_zip(song_id):
+    from ebms_server import db as db_module
+    with zipfile.ZipFile(io.BytesIO(db_module.Database().get_song_data(song_id))) as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
+
+
+def conflicted(client, monkeypatch, new_files):
+    """기존 곡(#1)과 겹치는 곡을 올려 commit하고, 충돌로 남은 (묶음 id, 곡) 을 돌려줍니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": b"old", "readme.txt": b"one\ntwo\n"}))
+    job = stage(client, "pack.zip", make_zip({f"p/s/{k}": v for k, v in {"a.bms": b"#TITLE A\n", **new_files}.items()}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    return sid, units(client, sid)["pack/p/s"]
+
+
+def base(sid, unit):
+    return f"/api/admin/import/stages/{sid}/units/{unit['id']}/conflicts"
+
+
+def test_list_choose_and_apply(client, monkeypatch):
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "readme.txt": b"one\nTWO\n", "m.wav": b"m"})
+    assert unit["result"]["conflicts"] == ["k.wav", "readme.txt"]
+
+    r = client.get(base(sid, unit))
+    assert r.status_code == 200, r.text
+    items = {i["path"]: i for i in r.json()["items"]}
+    assert items["k.wav"] == {
+        "path": "k.wav", "song_id": 1, "kind": "sound", "new_size": 3,
+        "old_path": "k.wav", "old_kind": "sound", "old_size": 3, "choice": None,
+    }
+    assert items["readme.txt"]["kind"] == "other"
+
+    # 원본 내려받기와 텍스트 diff
+    r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "old", "raw": True})
+    assert r.status_code == 200 and r.content == b"old"
+    r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "new"})
+    assert r.content == b"new" and r.headers["content-type"] == "audio/wav"
+    diff = client.get(base(sid, unit) + "/compare", params={"path": "readme.txt"}).json()
+    assert "-two" in diff["diff"] and "+TWO" in diff["diff"]
+    assert client.get(base(sid, unit) + "/file", params={"path": "a.bms", "side": "old"}).status_code == 404
+
+    # 다 고르기 전에는 적용할 수 없습니다.
+    assert client.put(base(sid, unit), json={"choices": {"k.wav": "new"}}).status_code == 200
+    assert client.post(base(sid, unit) + "/apply").status_code == 409
+    assert client.put(base(sid, unit), json={"choices": {"readme.txt": "maybe"}}).status_code == 400
+    assert client.put(base(sid, unit), json={"choices": {"zz.txt": "old"}}).status_code == 400
+    assert client.put(base(sid, unit), json={"choices": {"readme.txt": "old"}}).json() == {
+        "resolutions": {"k.wav": "new", "readme.txt": "old"},
+    }
+
+    r = client.post(base(sid, unit) + "/apply")
+    assert r.status_code == 200, r.text
+    done = wait(client, r.json())
+    assert done["songs"] == [{
+        "folder": "pack/p/s", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
+        "resolved_files": {"k.wav": "new", "readme.txt": "old"},
+    }]
+    files = song_zip(1)
+    assert files["k.wav"] == b"new" and files["readme.txt"] == b"one\ntwo\n" and files["m.wav"] == b"m"
+    # 충돌이 풀린 곡은 묶음에서 빠지고, 남은 곡이 없으면 묶음도 지웁니다.
+    assert client.get(f"/api/admin/import/stages/{sid}").status_code == 404
+
+
+def test_apply_commits_only_that_unit(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": b"old"}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/k.wav": b"new"}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    # 충돌 곡이 남은 묶음에 다른 곡이 있어도 적용은 그 곡만 넣습니다.
+    from ebms_server import staging
+    with staging._lock:
+        data = staging._load(sid)
+        other = dict(data["units"][0], id="other", folder="pack/p/other", result=None)
+        data["units"].append(other)
+        staging._save(data)
+    unit = units(client, sid)["pack/p/s"]
+    client.put(base(sid, unit), json={"choices": {"k.wav": "old"}})
+    done = wait(client, client.post(base(sid, unit) + "/apply").json())
+    assert [s["folder"] for s in done["songs"]] == ["pack/p/s"]
+    assert [u["folder"] for u in client.get(f"/api/admin/import/stages/{sid}").json()["items"]] == ["pack/p/other"]
+    assert song_files(1) == ["a.bms", "k.wav"]
+
+
+def test_slot_conflict_replaces_existing_entry(client, monkeypatch):
+    # 확장자만 다른 같은 자리(k.wav ↔ k.ogg)를 새 파일로 바꾸면 기존 항목을 뺍니다.
+    admin_login(client, monkeypatch)
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": b"old"}))
+    monkeypatch.setattr("ebms_server.media_match.same_files", lambda pairs: set())
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/k.ogg": b"new"}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+    items = client.get(base(sid, unit)).json()["items"]
+    assert [(i["path"], i["old_path"]) for i in items] == [("k.ogg", "k.wav")]
+    client.put(base(sid, unit), json={"choices": {"k.ogg": "new"}})
+    wait(client, client.post(base(sid, unit) + "/apply").json())
+    assert song_zip(1) == {"a.bms": b"#TITLE A\n", "k.ogg": b"new"}
+
+
+def test_old_chart_conflicts_are_not_listed(client, monkeypatch):
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new"})
+    from ebms_server import staging
+    with staging._lock:
+        data = staging._load(sid)
+        data["units"][0]["result"]["songs"][0]["conflicts"].append("c.bms")
+        staging._save(data)
+    assert [i["path"] for i in client.get(base(sid, unit)).json()["items"]] == ["k.wav"]
+
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+
+
+def _media(tmp_path, name, args):
+    out = tmp_path / name
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *args, str(out)], check=True)
+    return out.read_bytes()
+
+
+@needs_ffmpeg
+def test_video_timeline_and_webm(client, monkeypatch, tmp_path):
+    admin_login(client, monkeypatch)
+    old = _media(tmp_path, "old.mpg", ["-f", "lavfi", "-i", "color=c=black:s=64x64:d=6:r=30", "-c:v", "mpeg1video"])
+    # 2초부터 흰 화면
+    new = _media(tmp_path, "new.mpg", [
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:d=2:r=30", "-f", "lavfi", "-i", "color=c=white:s=64x64:d=4:r=30",
+        "-filter_complex", "[0][1]concat=n=2:v=1", "-c:v", "mpeg1video",
+    ])
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "bg.mpg": old}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/bg.mpg": new}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+
+    r = client.get(base(sid, unit) + "/compare", params={"path": "bg.mpg"})
+    assert r.status_code == 200, r.text
+    timeline = r.json()
+    assert timeline["fps"] == conflicts.VIDEO_FPS
+    assert len(timeline["segments"]) == 1
+    start, end = timeline["segments"][0]
+    assert abs(start - 60) <= 2 and end >= 175
+    r = client.get(base(sid, unit) + "/file", params={"path": "bg.mpg", "side": "new"})
+    assert r.status_code == 200 and r.headers["content-type"] == "video/webm" and r.content[:4] == b"\x1a\x45\xdf\xa3"
+
+
+@needs_ffmpeg
+def test_sound_compare(client, monkeypatch, tmp_path):
+    admin_login(client, monkeypatch)
+    old = _media(tmp_path, "old.wav", ["-f", "lavfi", "-i", "sine=f=440:d=0.5"])
+    new = _media(tmp_path, "new.wav", ["-f", "lavfi", "-i", "sine=f=440:d=1.5"])
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": old}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/k.wav": new}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+    result = client.get(base(sid, unit) + "/compare", params={"path": "k.wav"}).json()
+    assert result["old"]["seconds"] == pytest.approx(0.5, abs=0.05)
+    assert result["new"]["seconds"] == pytest.approx(1.5, abs=0.05)
+    assert result["same"] is False and len(result["new"]["peaks"]) == conflicts.WAVE_BARS
+    assert np.max(result["old"]["peaks"]) > 0.1

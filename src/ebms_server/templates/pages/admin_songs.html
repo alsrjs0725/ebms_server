@@ -194,8 +194,34 @@
 </div>
 <div id="jobs"><p class="text-muted small">작업이 없습니다.</p></div>
 </div>
+<div class="modal fade" id="conflict-modal" tabindex="-1" aria-labelledby="conflict-title" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title h5 text-break" id="conflict-title">충돌 해결</h2>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="닫기"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted mb-2">파일마다 기존 곡의 파일을 둘지 새 파일로 바꿀지 고른 뒤 적용하면 이 곡만 다시 넣습니다.
+                    단축키: <kbd>1</kbd> 기존 유지 · <kbd>2</kbd> 새 파일 · <kbd>j</kbd>/<kbd>k</kbd> 다음·이전 파일 · 영상에서 <kbd>←</kbd>/<kbd>→</kbd> 한 프레임, <kbd>Space</kbd> 재생</p>
+                <div class="row g-3">
+                    <div class="col-md-4">
+                        <div class="list-group small" id="conflict-list"></div>
+                    </div>
+                    <div class="col-md-8" id="conflict-view"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <span class="me-auto small" id="conflict-count"></span>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="conflict-all-old">남은 파일 모두 기존 유지</button>
+                <button type="button" class="btn btn-primary btn-sm" id="conflict-apply" disabled>적용</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script src="{{ url_for('static', path='/js/pages/admin_songs.js') }}"></script>
+<script src="{{ url_for('static', path='/js/pages/admin_conflicts.js') }}"></script>
 {% endblock %}
