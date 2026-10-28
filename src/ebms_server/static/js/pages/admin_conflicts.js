@@ -9,7 +9,7 @@ const conflictCount = document.getElementById("conflict-count");
 const conflictApply = document.getElementById("conflict-apply");
 const conflictAllOld = document.getElementById("conflict-all-old");
 const CHART_EXT = /\.(bms|bme|bml|pms|bmson)$/i;
-const KIND = { sound: "키음", image: "이미지", video: "영상", other: "파일" };
+const KIND = { sound: "키음", image: "이미지", video: "영상", chart: "차트", other: "파일" };
 
 let conflict = null;  // {stageId, unit, items, songs, index}
 let conflictKeys = null;  // 지금 보는 파일의 단축키 처리(영상 프레임 이동 등)
@@ -153,13 +153,17 @@ function showConflict(index) {
     cols.append(left, right);
     const body = el("div", "mt-2");
     conflictView.replaceChildren(head, cols, body);
+    if (item.kind === "chart") {
+        body.append(el("p", "small text-muted",
+            "기존 유지: 새 차트는 등록하지 않습니다. 새 파일로 바꿈: 곡 파일의 차트를 새 것으로 바꾸고 새 차트를 등록합니다(기존 차트 등록은 그대로)."));
+    }
     renderChoice(item);
 
     const oldKind = item.old_kind || item.kind;
     if (item.kind === "image" && oldKind === "image") showImages(item, left, right, body);
     else if (item.kind === "sound" && oldKind === "sound") showSounds(item, left, right, body);
     else if (item.kind === "video" && oldKind === "video") showVideos(item, left, right, body);
-    else if (item.kind === "other" && oldKind === "other") showText(item, body);
+    else if (item.kind === oldKind && (item.kind === "chart" || item.kind === "other")) showText(item, body);
     else {
         // 같은 BGA 자리에 이미지와 영상: 각자 보여 주기만 합니다.
         left.append(mediaElement(oldKind, conflictUrl(item, "old")));
