@@ -573,6 +573,10 @@ function songLine(song) {
         li.append(badge, ` 차트 ${song.charts}개 중 새 차트 ${song.new_charts}개`);
         if (song.added_files) li.append(`, 기존 곡에 파일 ${song.added_files.length}개 추가`);
         if (song.similar_files) li.append(`, 내용이 달라도 같은 소재로 본 파일 ${song.similar_files.length}개(용량이 작은 쪽 유지, 새 파일로 바꿈 ${(song.replaced_files || []).length}개)`);
+        if (song.resolved_files) {
+            const picked = Object.values(song.resolved_files);
+            li.append(`, 충돌 파일 고른 대로 처리(새 파일로 바꿈 ${picked.filter((v) => v === "new").length}개, 기존 유지 ${picked.filter((v) => v === "old").length}개)`);
+        }
         if (song.kept_charts) li.append(`, 내용이 다른 같은 이름 차트 ${song.kept_charts.length}개는 차트로만 등록(곡 파일은 기존 유지)`);
         if (song.conflicts) {
             const warn = document.createElement("span");
@@ -591,7 +595,7 @@ function songLevel(song) {
     if (song.skipped) return "skipped";
     if (song.conflicts && song.conflicts.length) return "conflict";
     if (song.new_song) return "new";
-    if (song.new_charts || (song.added_files && song.added_files.length)) return "added";
+    if (song.new_charts || (song.added_files && song.added_files.length) || song.resolved_files) return "added";
     return "same";
 }
 
@@ -1020,6 +1024,9 @@ function unitRows(stage, unit, locked) {
     download.href = `/api/admin/import/stages/${stage.id}/units/${unit.id}/zip`;
     download.textContent = "내려받기";
     folder.append(code, toggle, download);
+    // 병합 충돌 파일을 비교해 고르는 창(admin_conflicts.js)
+    const resolve = typeof conflictButton === "function" ? conflictButton(stage, unit) : null;
+    if (resolve) folder.append(resolve);
     if (unit.error) {
         const err = document.createElement("div");
         err.className = "text-danger";

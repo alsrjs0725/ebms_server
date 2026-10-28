@@ -1150,7 +1150,9 @@ def commit(stage_id: str, job: importer.Job) -> None:
         stage = _load(stage_id)
     root = _dir(stage_id)
     work_root = root / "_work"
-    units = list(stage["units"])
+    # 충돌 해결을 적용할 때는 그 곡만 다시 넣습니다(commit_units).
+    only = stage.get("commit_units")
+    units = [u for u in stage["units"] if only is None or u["id"] in only]
     job.total = len(units)
     pending: list[tuple[dict, list[dict]]] = []  # 커밋을 기다리는 (곡, 그 곡의 등록 결과들)
     done: set[str] = set()
@@ -1215,7 +1217,10 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     try:
                         song_dir = _subset(unit_dir, charts, all_charts, work) if split else unit_dir
                         job.apply_limits(batch)
-                        info = importer._insert(batch, song_dir, label, remove=False, target=_auto(unit, target))
+                        info = importer._insert(
+                            batch, song_dir, label, remove=False, target=_auto(unit, target),
+                            resolutions=unit.get("resolutions"),
+                        )
                     except Exception as e:
                         logger.exception(f"commit failed[{label}]")
                         info = {"folder": label, "error": str(e) or type(e).__name__}
@@ -1235,6 +1240,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
             stage["status"] = "ready"
             stage["error"] = None
             stage.pop("resumes", None)
+            stage.pop("commit_units", None)
             if stage["units"]:
                 try:
                     _analyze(stage)
@@ -1246,12 +1252,17 @@ def commit(stage_id: str, job: importer.Job) -> None:
                 shutil.rmtree(root, ignore_errors=True)
 
 
-def start_commit(stage_id: str, slow: bool = False) -> importer.Job:
+def start_commit(stage_id: str, slow: bool = False, unit_ids: list[str] | None = None) -> importer.Job:
+    """묶음을 commit합니다. unit_ids를 주면 그 곡만 넣습니다(충돌 해결 적용)."""
     with _lock:
         stage = _load(stage_id)
         _require_ready(stage)
         stage["status"] = "committing"
         stage["slow"] = slow  # 서버가 다시 시작돼 이어서 commit할 때도 같은 속도로
+        if unit_ids is not None:
+            stage["commit_units"] = list(unit_ids)
+        else:
+            stage.pop("commit_units", None)
         _save(stage)
     job = importer.Job("commit", stage["name"], slow)
     job.stage_id = stage_id
