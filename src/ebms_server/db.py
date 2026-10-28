@@ -2324,7 +2324,8 @@ class Database:
         차트 청크에서 받으므로, 내용이 다른 차트는 zip에 기존 것을 두되 충돌로 보지 않습니다(새 차트는 따로 등록).
         키음·이미지·영상은 확장자만 다른 파일
         (k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg, media_match.slot)도 같은 자리로 보고, 풀어서 비교해 같은 소재
-        (다시 인코딩만 다름)로 보이면 둘 중 용량이 작은 쪽을 남기고(새 파일이 작으면 기존 파일을 새 파일로 바꿈),
+        (다시 인코딩만 다름)로 보이면 둘 중 품질이 좋은 쪽(비슷하면 용량이 작은 쪽, media_match.better_new)을 남기고
+        (새 파일을 남기면 기존 파일을 새 파일로 바꿈),
         그 밖에는 기존 것을 두고 충돌로 돌려줍니다.
         resolutions는 관리자가 충돌 파일마다 고른 것({새 파일 경로: "old" | "new"})입니다. "old"면 새 파일을 버리고,
         "new"면 겨룬 기존 항목을 빼고 새 파일을 넣습니다. 고른 파일은 충돌로 돌려주지 않습니다.
@@ -2381,10 +2382,11 @@ class Database:
         same = media_match.same_files(media)
         similar = sorted(arcname for arcname, _, _ in media if arcname in same)
         conflicts = sorted(conflicts + [arcname for arcname, _, _ in media if arcname not in same])
-        # 같은 소재면 용량이 작은 쪽을 남깁니다. 새 파일이 작으면 기존 항목을 빼고 새 파일을 넣습니다.
-        smaller = [(arcname, path) for arcname, old, path in media if arcname in same and path.stat().st_size < len(old)]
-        dropped = {media_old[arcname] for arcname, _ in smaller}
-        new_files += [(arcname, path.read_bytes()) for arcname, path in smaller]
+        # 같은 소재면 품질이 좋은 쪽을 남깁니다. 새 파일을 남기면 기존 항목을 빼고 새 파일을 넣습니다.
+        keep_new = media_match.better_new([m for m in media if m[0] in same])
+        better = [(arcname, path) for arcname, _, path in media if arcname in keep_new]
+        dropped = {media_old[arcname] for arcname, _ in better}
+        new_files += [(arcname, path.read_bytes()) for arcname, path in better]
         # 관리자가 고른 충돌 파일. 기존 항목이 폴더면 바꿀 수 없어 충돌로 둡니다.
         resolutions = resolutions or {}
         resolved = {
@@ -2401,8 +2403,8 @@ class Database:
             self.logger.info(f"insert_song: Song[{song_id}] resolved conflicts by admin {resolved}[{root}]")
         if similar:
             self.logger.info(
-                f"insert_song: Song[{song_id}] judged the same media {similar}, replaced with smaller new ones "
-                f"{sorted(a for a, _ in smaller)}[{root}]"
+                f"insert_song: Song[{song_id}] judged the same media {similar}, replaced with better new ones "
+                f"{sorted(a for a, _ in better)}[{root}]"
             )
         if conflicts:
             self.logger.warning(
