@@ -151,3 +151,26 @@ zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`
 
 - 응답 `200`/`206` (`application/zip`): 곡 zip (Deflate 압축, 폴더 구조 유지)
 - 오류: `404` `song not found`, `410` `song deleted` 또는 `song deleted: <삭제 사유>`(관리자가 지운 곡, 번호는 결번), `422` `song_id`가 정수가 아님, `429` `no download ticket`
+
+## `POST /api/mcp` (MCP)
+
+AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) 서버입니다(Streamable HTTP, JSON-RPC 2.0). 요청마다 JSON 하나로 답하고 서버가 먼저 보내는 스트림은 없어 `GET /api/mcp`는 405입니다.
+
+- 인증: `Authorization: Bearer`로 클라이언트 세션키(사용자)나 관리자 API 키(`ebms_ak_...`)를 보냅니다. 웹 세션 쿠키로는 쓰지 못합니다(401).
+- 권한은 사이트와 같은 두 단계입니다. `tools/list`는 그 권한으로 쓸 수 있는 도구만 보여 주고, 권한 밖의 도구를 부르면 JSON-RPC 오류 `-32003`입니다.
+
+| 도구 | 권한 | 설명 |
+| --- | --- | --- |
+| `whoami` | 사용자 | 이 연결의 사용자 `{id, nickname, role(user/admin)}` |
+| `list_conflict_units` | 관리자 | 검토 대기 묶음에서 병합 충돌이 남은 곡. `pending_only`(기본 true)면 AI 추천이 덜 된 곡만 |
+| `get_conflict_case` | 관리자 | 곡 하나의 판단 자료: 겨룬 기존 곡과 차트, 새 차트의 상태(`same_as_registered`/`conflict`/`new_chart`), 충돌 파일마다 비교 수치(키음 상관계수·싱크 오차, 그림 차이, 영상 프레임 차이, 품질, 차트 diff 앞부분·`#WAV` 번호 바뀜)와 그 파일을 쓰는 차트(`used_by_old/new`, 차트면 `conflict_sounds_old/new`). `offset`·`limit`(기본 50, 최대 200)으로 나눠 받습니다 |
+| `get_file_diff` | 관리자 | 텍스트 충돌 파일의 전체 diff(최대 2000줄) |
+| `submit_recommendation` | 관리자 | 충돌 파일마다 `old`/`new`/`unsure` 추천(`confidence`, `reason`)과 곡 전체 판단(`summary`, `split_recommended`, `issues`, `model`)을 저장합니다 |
+
+추천은 묶음의 곡 정보(`unit.ai`)에 따로 저장하고 관리자가 고른 것(`resolutions`)은 바꾸지 않습니다. 충돌 해결 창에 파일마다 AI 추천과 이유가 보이고, **AI 추천대로 고르기**를 누르면 고르지 않은 파일 중 old·new로 추천된 것만 고릅니다(unsure는 직접 고름). 적용은 관리자가 합니다. 판단 기준은 `initialize` 응답의 `instructions`로 클라이언트에 알려 줍니다.
+
+agy 등록 예(관리자 API 키는 관리자 페이지의 API 키에서 만듭니다):
+
+```
+agy mcp add --header "Authorization: Bearer ebms_ak_..." ebms https://<서버 주소>/api/mcp
+```

@@ -8,6 +8,8 @@ const conflictView = document.getElementById("conflict-view");
 const conflictCount = document.getElementById("conflict-count");
 const conflictApply = document.getElementById("conflict-apply");
 const conflictAllOld = document.getElementById("conflict-all-old");
+const conflictAi = document.getElementById("conflict-ai");
+const conflictAiSummary = document.getElementById("conflict-ai-summary");
 const KIND = { sound: "키음", image: "이미지", video: "영상", chart: "차트", other: "파일" };
 
 let conflict = null;  // {stageId, unit, items, songs, index}
@@ -39,12 +41,14 @@ async function openConflicts(stageId, unit) {
     document.getElementById("conflict-title").textContent = `충돌 해결 · ${unit.folder}`;
     conflictList.textContent = "읽는 중…";
     conflictView.replaceChildren();
+    conflictAiSummary.classList.add("d-none");
     conflictModal.show();
     const res = await fetch(conflictBase());
     if (!res.ok) { conflictList.textContent = await detail(res); return; }
     const data = await res.json();
     conflict.items = data.items;
     conflict.songs = data.songs;
+    renderAiSummary(data.ai);
     const first = conflict.items.findIndex((i) => !i.choice);
     renderConflictList();
     showConflict(first < 0 ? 0 : first);
@@ -52,6 +56,24 @@ async function openConflicts(stageId, unit) {
 
 function choiceText(choice) {
     return choice === "old" ? "기존 유지" : choice === "new" ? "새 파일" : "고르지 않음";
+}
+
+// MCP(AI)가 남긴 곡 전체 판단. 추천은 저장만 돼 있고, 고르는 것은 관리자가 합니다.
+function renderAiSummary(ai) {
+    conflictAiSummary.replaceChildren();
+    conflictAiSummary.classList.toggle("d-none", !ai);
+    if (!ai) return;
+    conflictAiSummary.append(el("strong", "", `AI 판단${ai.model ? ` (${ai.model})` : ""}: `), ai.summary || "");
+    if (ai.split_recommended) conflictAiSummary.append(el("div", "fw-semibold", "다른 곡이 섞여 있어 새 곡으로 나누는 것을 권합니다."));
+    if (ai.issues?.length) {
+        const ul = el("ul", "mb-0");
+        ul.append(...ai.issues.map((t) => el("li", "", t)));
+        conflictAiSummary.append(ul);
+    }
+}
+
+function aiText(ai) {
+    return ai.choice === "unsure" ? "모르겠음" : choiceText(ai.choice);
 }
 
 function renderConflictList() {
@@ -65,13 +87,26 @@ function renderConflictList() {
         const badge = document.createElement("span");
         badge.className = `badge ${item.choice === "new" ? "text-bg-primary" : item.choice === "old" ? "text-bg-secondary" : "text-bg-warning"}`;
         badge.textContent = `${KIND[item.kind]} · ${choiceText(item.choice)}`;
-        a.append(name, badge);
+        const badges = el("span", "d-flex gap-1 flex-shrink-0");
+        if (item.ai) {
+            const ai = el("span", `badge ${item.ai.choice === "unsure" ? "text-bg-warning" : "text-bg-info"}`, `AI ${aiText(item.ai)}`);
+            ai.title = item.ai.reason || "";
+            badges.append(ai);
+        }
+        badges.append(badge);
+        a.append(name, badges);
         a.addEventListener("click", () => showConflict(i));
         return a;
     }));
     const done = conflict.items.filter((i) => i.choice).length;
     conflictCount.textContent = `고름 ${done}/${conflict.items.length}`;
     conflictApply.disabled = !conflict.items.length || done < conflict.items.length;
+    conflictAi.classList.toggle("d-none", !aiPending().length);
+}
+
+// 고르지 않은 파일 중 AI가 old·new로 추천한 것(unsure는 사람이 고릅니다).
+function aiPending() {
+    return conflict.items.filter((i) => !i.choice && (i.ai?.choice === "old" || i.ai?.choice === "new"));
 }
 
 async function choose(item, choice) {
@@ -144,6 +179,13 @@ function showConflict(index) {
         group.append(btn);
     }
     head.append(group);
+    if (item.ai) {
+        const confidence = item.ai.confidence == null ? "" : ` ${Math.round(item.ai.confidence * 100)}%`;
+        const line = el("div", "small w-100 text-body-secondary");
+        line.append(el("span", `badge me-1 ${item.ai.choice === "unsure" ? "text-bg-warning" : "text-bg-info"}`, `AI ${aiText(item.ai)}${confidence}`),
+            item.ai.reason || "");
+        head.append(line);
+    }
 
     const cols = el("div", "row g-2");
     const left = el("div", "col-6");
@@ -867,6 +909,22 @@ conflictAllOld.addEventListener("click", async () => {
     });
     if (!res.ok) { alert(await detail(res)); return; }
     for (const i of rest) i.choice = "old";
+    renderConflictList();
+    renderChoice(conflict.items[conflict.index]);
+});
+
+conflictAi.addEventListener("click", async () => {
+    const rest = aiPending();
+    if (!rest.length) return;
+    const unsure = conflict.items.filter((i) => !i.choice && !rest.includes(i)).length;
+    if (!confirm(`AI 추천대로 ${rest.length}개를 고릅니다.${unsure ? ` 추천이 없거나 모르겠다고 한 ${unsure}개는 직접 고르세요.` : ""}`)) return;
+    const res = await fetch(conflictBase(), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ choices: Object.fromEntries(rest.map((i) => [i.path, i.ai.choice])) }),
+    });
+    if (!res.ok) { alert(await detail(res)); return; }
+    for (const i of rest) i.choice = i.ai.choice;
     renderConflictList();
     renderChoice(conflict.items[conflict.index]);
 });

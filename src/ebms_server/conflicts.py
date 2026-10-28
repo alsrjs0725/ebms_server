@@ -102,10 +102,12 @@ def _kind(path: str) -> str:
 
 
 def list_conflicts(stage_id: str, unit_id: str) -> dict:
-    """곡의 충돌 파일 목록. items: [{path, song_id, kind, new_size, old_path, old_kind, old_size, choice}]"""
+    """곡의 충돌 파일 목록. items: [{path, song_id, kind, new_size, old_path, old_kind, old_size, choice, ai}]"""
     stage, unit = _unit(stage_id, unit_id)
     new_sizes = dict(staging._unit_entries(stage, unit))
     choices = unit.get("resolutions") or {}
+    ai = unit.get("ai") or {}
+    ai_items = ai.get("items") or {}
     files_by_song: dict[int, list[dict]] = {}
     items = []
     for path, song_id in sorted(_conflict_paths(unit).items(), key=lambda kv: kv[0].lower()):
@@ -121,6 +123,7 @@ def list_conflicts(stage_id: str, unit_id: str) -> dict:
             "old_kind": _kind(old["path"]) if old else None,
             "old_size": old["size"] if old else None,
             "choice": choices.get(path),
+            "ai": ai_items.get(path),
         })
     folders = staging._song_folders({item["song_id"] for item in items})
     return {
@@ -128,6 +131,8 @@ def list_conflicts(stage_id: str, unit_id: str) -> dict:
         "folder": unit["folder"],
         "items": items,
         "songs": {str(k): v for k, v in folders.items()},
+        # MCP(mcp.py)로 AI가 남긴 곡 전체 판단(summary, split_recommended, issues, model). 파일별 추천은 items[].ai
+        "ai": {k: v for k, v in ai.items() if k != "items"} or None,
     }
 
 
