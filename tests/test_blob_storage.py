@@ -600,17 +600,16 @@ def test_pre_chunk(tmp_path, client, database, monkeypatch):
         assert zf.read("1/banner.png") == banner
         assert zf.read("1/pv.ogg") == preview
 
-    # 다음 구간(song 2, 3)은 새 청크이고, 같은 구간에 곡이 추가되면 그 청크만 바뀝니다.
+    # 청크에 자리(2곡)가 남으면 같은 청크에 들어가고, 차면 다음 곡은 새 청크에 들어갑니다. 바뀐 청크만 바뀝니다.
     database.insert_song(make_song(tmp_path, "s2", {"b.bms": b"#B"}))
     after = client.get("/api/pre/assethash").json()
-    assert sorted(after) == ["0", "1"] and after["0"] == hashes["0"]
-    with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/asset/1").content)) as zf:
-        assert zf.namelist() == []
+    # 곡 2는 사전 파일이 없어 청크 내용이 같습니다.
+    assert after == hashes
     s3 = make_song(tmp_path, "s3", {"c.bms": b"#C"})
     (s3 / "preview.ogg").write_bytes(b"p3")
     database.insert_song(s3)
     last = client.get("/api/pre/assethash").json()
-    assert last["0"] == hashes["0"] and last["1"] != after["1"]
+    assert sorted(last) == ["0", "1"] and last["0"] == after["0"]
     with zipfile.ZipFile(io.BytesIO(client.get("/api/pre/asset/1").content)) as zf:
         assert zf.namelist() == ["3/preview.ogg"]
 

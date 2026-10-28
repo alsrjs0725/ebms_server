@@ -157,7 +157,7 @@ def test_register_and_chunk_tags(client, monkeypatch):
     assert (listed[insane["id"]]["matched_charts"], listed[insane["id"]]["songs"]) == (1, 1)
     assert (listed[other["id"]]["matched_charts"], listed[other["id"]]["songs"]) == (2, 2)
 
-    # 곡 1(A)·2(B)·3(C), 청크 = song_id // 2 → 곡 1은 청크 0, 곡 3은 청크 1
+    # 곡 1(A)·2(B)·3(C)는 표가 없을 때 들어와 2곡씩 청크 0(곡 1·2)·1(곡 3)에 있습니다.
     pre = client.get("/api/pre/tables").json()
     assert pre["chunks"] == {"0": [insane["id"], other["id"]], "1": [other["id"]]}
     assert [t["name"] for t in pre["tables"]] == ["Insane", "Other"]
@@ -167,11 +167,17 @@ def test_register_and_chunk_tags(client, monkeypatch):
     pages["https://t.example/d.json"] = [{"md5": md5(B), "level": "1"}]
     r = client.post(f"/api/admin/tables/{insane['id']}/refresh").json()
     assert r["charts"] == 1 and r["error"] is None
-    assert client.get("/api/pre/tables").json()["chunks"] == {"0": [other["id"]], "1": [insane["id"], other["id"]]}
+    assert client.get("/api/pre/tables").json()["chunks"] == {"0": [insane["id"], other["id"]], "1": [other["id"]]}
+    # 재배치: 청크 0에 섞인 곡 2(Insane)를 새 청크로 옮겨 Insane만 고르면 곡 2만 받습니다.
+    assert db_module.Database().rebalance_pre_chunks() == 1
+    assert client.get("/api/pre/tables").json()["chunks"] == {
+        "0": [other["id"]], "1": [other["id"]], "2": [insane["id"]],
+    }
+    assert db_module.Database().rebalance_pre_chunks() == 0
     del pages["https://t.example/d.json"]
     r = client.post(f"/api/admin/tables/{insane['id']}/refresh").json()
     assert r["charts"] == 1 and "404" in r["error"]
-    assert client.get("/api/pre/tables").json()["chunks"]["1"] == [insane["id"], other["id"]]
+    assert client.get("/api/pre/tables").json()["chunks"]["2"] == [insane["id"]]
 
     assert client.delete(f"/api/admin/tables/{insane['id']}").json() == {"ok": True}
     assert client.delete(f"/api/admin/tables/{insane['id']}").status_code == 404
@@ -348,3 +354,24 @@ def test_start(monkeypatch):
     # 등록할 때 이미 읽었으므로 시작 직후에는 읽지 않고, 멈추면 스레드가 끝납니다.
     assert not thread.is_alive()
     assert calls == []
+
+
+def test_new_song_goes_to_table_chunk(client, monkeypatch):
+    monkeypatch.setattr(constant, "SONGS_PER_PRE_CHUNK", 2)
+    admin_login(client, monkeypatch)
+    pages = {
+        "https://t.example/h.json": {"name": "Insane", "symbol": "★", "data_url": "d.json"},
+        "https://t.example/d.json": [{"md5": md5(A), "level": "1"}, {"md5": md5(C), "level": "2"}],
+    }
+    monkeypatch.setattr(tables, "http_get", fake_web(pages))
+    insane = client.post("/api/admin/tables", json={"url": "https://t.example/h.json"}).json()
+    # 표가 있는 곡(A, C)은 표가 없는 곡(B)과 다른 청크에 들어갑니다.
+    for name, chart in (("a.zip", A), ("b.zip", B), ("c.zip", C)):
+        upload(client, name, make_zip({"x.bms": chart, "banner.png": b"png"}))
+    assert client.get("/api/pre/tables").json()["chunks"] == {"0": [insane["id"]]}
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT id, pre_chunk FROM song ORDER BY id")
+        assert [tuple(r) for r in cur.fetchall()] == [(1, 0), (2, 1), (3, 0)]
+        cur.execute("SELECT id, sig FROM pre_chunk ORDER BY id")
+        assert [tuple(r) for r in cur.fetchall()] == [(0, str(insane["id"])), (1, "")]
+    assert db_module.Database().rebalance_pre_chunks() == 0

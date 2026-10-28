@@ -73,7 +73,7 @@ def test_chunks_once_per_batch(database, tmp_path, monkeypatch):
     # 차트 청크는 한 번만 읽고 쓰고, 매니페스트(100곡)·사전(8곡) 청크는 영향받은 것만 한 번씩
     assert appends == [40]
     assert manifests == [0]
-    assert pres == [0, 1, 2, 3, 4, 5]
+    assert pres == [0, 1, 2, 3, 4]
     assert len(chunk_names()) == 40
     assert rows("SELECT COUNT(*) FROM song")[0][0] == 40
 

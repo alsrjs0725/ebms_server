@@ -10,7 +10,8 @@
    `title`·`mode`·`md5`·`sha256`이 문자열이 아닌 항목은 건너뜁니다. 여러 data_url에 같은 차트가 있으면 처음 것만 둡니다.
 
 곡과는 차트의 md5(chart.md5) 또는 sha256(chart.id)으로 맞춥니다. 사전 청크 하나에 난이도표의 곡이 하나라도 있으면
-그 청크에 그 난이도표 태그가 붙습니다. 태그는 요청할 때 계산하므로 곡이나 난이도표가 바뀌어도 청크를 다시 만들지 않습니다.
+그 청크에 그 난이도표 태그가 붙습니다. 태그는 요청할 때 계산하므로 곡이나 난이도표가 바뀌어도 바로 맞습니다.
+사전 청크는 속한 난이도표 조합이 같은 곡끼리 묶으므로(pre_rebalance.py) 표를 더하거나 다시 읽으면 뒤에서 곡을 옮깁니다.
 """
 import json
 import logging
@@ -29,7 +30,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import auth, constant, db
+from . import auth, constant, db, pre_rebalance
 from .accounts import User
 from .admin import _forbidden, web_admin
 from .auth import current_user
@@ -226,10 +227,13 @@ def chunk_tags() -> dict[int, list[int]]:
     """{사전 청크 id: 그 청크에 곡이 있는 난이도표 id들}. 난이도표의 곡이 없는 청크는 빠집니다."""
     with db.connect() as con, con.cursor() as cur:
         songs, _ = _matches(cur)
+        cur.execute("SELECT id, pre_chunk FROM song WHERE pre_chunk IS NOT NULL")
+        chunk_of = dict(cur.fetchall())
     tags: dict[int, set[int]] = defaultdict(set)
     for table_id, song_ids in songs.items():
         for song_id in song_ids:
-            tags[song_id // constant.SONGS_PER_PRE_CHUNK].add(table_id)
+            if song_id in chunk_of:
+                tags[chunk_of[song_id]].add(table_id)
     return {chunk: sorted(ids) for chunk, ids in sorted(tags.items())}
 
 
@@ -270,6 +274,7 @@ def refresh_table(table_id: int, get: Callable[[str], bytes] | None = None) -> d
         else:
             _store(table_id, table)
             logger.info(f"difficulty table {table_id}: {table['name']} with {len(table['charts'])} charts")
+            pre_rebalance.kick()
     return get_table(table_id)
 
 
@@ -292,6 +297,7 @@ def add_table(url: str, get: Callable[[str], bytes] | None = None) -> dict:
             con.commit()
         _store(table_id, table)
     logger.info(f"difficulty table {table_id}: added {table['name']} ({url})")
+    pre_rebalance.kick()
     return get_table(table_id)
 
 
@@ -301,6 +307,7 @@ def delete_table(table_id: int) -> None:
         cur.execute("DELETE FROM difficulty_table_chart WHERE table_id = %s", (table_id,))
         cur.execute("DELETE FROM difficulty_table WHERE id = %s", (table_id,))
         con.commit()
+    pre_rebalance.kick()
 
 
 def refresh_all(get: Callable[[str], bytes] | None = None) -> None:
