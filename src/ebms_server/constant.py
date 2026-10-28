@@ -76,9 +76,15 @@ CHART_CHUNK_FILENAME_TEMPLATE = "chart_chunk_{:05d}.zip"
 # 곡 하나가 바뀌어도 청크를 통째로 다시 만들고 클라이언트가 다시 받으므로 작게 둡니다(곡당 파일 목록이 커서 100곡에 gzip 약 2MB).
 # 바꾸면 서버 시작 뒤 매니페스트 청크를 모두 다시 만듭니다(Database.rechunk_manifest).
 SONGS_PER_MANIFEST_CHUNK = 100
-# 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 들어가는 song id 개수. chunk_id = song_id // SONGS_PER_PRE_CHUNK
-# 난이도표를 고른 클라이언트가 표에 없는 곡을 덜 받도록 작게 둡니다. 바꾸면 서버 시작 뒤 사전 청크를 모두 다시 만듭니다.
+# 사전 청크(곡의 배너·프리뷰 등 사전 파일 묶음) 하나에 넣는 최대 곡 수. 곡은 속한 난이도표 조합이 같은 곡끼리 묶습니다
+# (pre_rebalance.py). 곡 하나가 바뀌면 청크를 통째로 다시 받으므로 작게 둡니다.
 SONGS_PER_PRE_CHUNK = 8
+# 사전 청크 재배치(pre_rebalance.py) 한 번에 다시 쓰는 청크 용량의 대략적인 한도와, 일감이 남았을 때 다음 번까지 쉬는 시간(초).
+# 한 번에 다 옮기지 않아 임포트·다운로드에 디스크를 양보하고, 클라이언트가 다시 받는 양도 나눕니다.
+PRE_REBALANCE_BYTES = int(os.environ.get("EBMS_PRE_REBALANCE_BYTES", str(2 * 1024 ** 3)))
+PRE_REBALANCE_PAUSE_SECONDS = float(os.environ.get("EBMS_PRE_REBALANCE_PAUSE_SECONDS", "600"))
+# 사전 청크 재배치를 뒤에서 돌릴지. 끄면 새 곡만 제자리에 넣고 기존 곡은 옮기지 않습니다.
+PRE_REBALANCE_ENABLED = os.environ.get("EBMS_PRE_REBALANCE", "1") not in ("0", "false", "no", "")
 # 미리듣기 음원이 없는 곡에 서버가 미리듣기를 만들어 사전 파일로 줄지(preview.py, ffmpeg 필요).
 PREVIEW_ENABLED = os.environ.get("EBMS_PREVIEW", "1") not in ("0", "false", "no", "")
 PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"

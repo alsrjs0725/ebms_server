@@ -20,7 +20,7 @@ from collections.abc import Iterator
 
 import pymysql
 
-from . import charset, constant, media_match, preview, store
+from . import charset, constant, media_match, pre_rebalance, preview, store
 
 SCHEMA = [
     """
@@ -78,8 +78,9 @@ SCHEMA = [
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
-    # 사전 청크. song id 구간(SONGS_PER_PRE_CHUNK)마다 곡들의 사전 파일(차트 제외)을 무압축 zip으로 묶습니다.
-    # 항목 이름은 "{song_id}/{곡 zip 안 경로}"이고, 데이터는 pre_chunk_part에 BLOB_READ_SIZE씩 나눠 둡니다.
+    # 사전 청크. song.pre_chunk가 이 청크인 곡들(SONGS_PER_PRE_CHUNK곡까지)의 사전 파일(차트 제외)을 무압축 zip으로 묶습니다.
+    # 곡은 속한 난이도표 조합(sig)이 같은 곡끼리 묶습니다(pre_rebalance.py).
+    # 항목 이름은 "{song_id}/{곡 zip 안 경로}"이고, 데이터는 저장소 파일(path)이나 pre_chunk_part에 둡니다.
     """
         CREATE TABLE IF NOT EXISTS pre_chunk(
             id INT UNSIGNED NOT NULL,
@@ -393,6 +394,11 @@ MISSING_COLUMNS = [
     ("song", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("chart_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
     ("pre_chunk", "path", "VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+    # 곡이 든 사전 청크 번호와, 사전 청크가 모으는 난이도표 조합(pre_rebalance.signature, NULL이면 아직 정하지 않음)·
+    # 청크를 만들 때 든 곡 id들(쉼표로 이음. song.pre_chunk와 다르면 다시 만듭니다).
+    ("song", "pre_chunk", "INT UNSIGNED"),
+    ("pre_chunk", "sig", "VARCHAR(1024)"),
+    ("pre_chunk", "songs", "VARCHAR(1024)"),
     # 티켓 하나로 받은 바이트(#35). 이전 행은 0부터 셉니다.
     ("download_grant", "bytes_used", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
 ]
@@ -402,6 +408,7 @@ MISSING_INDEXES = [
     ("chart", "chart_title_key", "title_key"),
     ("chart", "chart_artist_key", "artist_key"),
     ("chart", "chart_bpm_genre_key", "bpm_key, genre_key"),
+    ("song", "song_pre_chunk", "pre_chunk"),
 ]
 # 더 이상 수집하지 않는 개인정보 컬럼(#102). 서버 시작 시 있으면 값과 함께 지웁니다.
 DROPPED_COLUMNS = [
@@ -431,11 +438,14 @@ FILE_KINDS_VERSION = 3
 FILE_KINDS_SETTING = "file_kinds_version"
 # backfill_file_kinds가 어디까지 판정했는지("버전:마지막 곡 번호"). 도중에 꺼지면 다음 시작 때 그 뒤부터 이어서 합니다.
 FILE_KINDS_PROGRESS_SETTING = "file_kinds_progress"
-# 지금 차트 청크·사전 청크·매니페스트 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_PRE_CHUNK, SONGS_PER_MANIFEST_CHUNK)를
+# 지금 차트 청크·매니페스트 청크를 만든 크기(CHARTS_PER_CHUNK, SONGS_PER_MANIFEST_CHUNK)를
 # 저장하는 setting 이름. 상수와 다르면 서버 시작 뒤 다시 묶습니다. 없으면(이전 버전) 다른 것으로 봅니다.
 CHART_CHUNK_SETTING = "chart_chunk_charts"
-PRE_CHUNK_SETTING = "pre_chunk_songs"
 MANIFEST_CHUNK_SETTING = "manifest_chunk_songs"
+# 이전 버전에서 사전 청크를 song id 구간으로 묶던 크기. 곡마다 청크 번호(song.pre_chunk)를 정한 뒤에는 지웁니다.
+PRE_CHUNK_SETTING = "pre_chunk_songs"
+# 곡마다 사전 청크 번호를 정했는지("tables"). 없으면 서버 시작 때 이전 구간(id // 크기)으로 정합니다.
+PRE_LAYOUT_SETTING = "pre_chunk_layout"
 # DB BLOB을 저장소 파일로 다 옮기고 BLOB 테이블의 공간을 돌려받은 테이블(쉼표로 이음). migrate_to_store가 다시 비우지 않게 합니다.
 STORE_RECLAIMED_SETTING = "store_reclaimed"
 # migrate_to_store가 옮기는 순서. 작은 테이블부터 옮기고 비워, 큰 테이블(곡)을 옮길 때 쓸 공간을 먼저 확보합니다.
@@ -781,6 +791,11 @@ class _Progress:
 def pre_arcname(song_id: int, path: str) -> str:
     """사전 청크 안의 항목 이름."""
     return f"{song_id}/{path}"
+
+
+def _song_list(song_ids) -> str:
+    """pre_chunk.songs에 적는 곡 id 목록."""
+    return ",".join(str(i) for i in sorted(song_ids))
 
 
 def is_pre_chunk_entry(entry: dict) -> bool:
@@ -1243,7 +1258,33 @@ class Database:
             # 할당량 전역 기본값. 이미 있는 값(관리자가 바꾼 값)은 그대로 둡니다.
             for name, value in constant.DEFAULT_SETTINGS.items():
                 cur.execute("INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (name, str(value)))
+            self._migrate_pre_layout(cur)
             con.commit()
+
+    def _migrate_pre_layout(self, cur) -> None:
+        """이전 버전(사전 청크 = song id // 크기)의 곡에 그 청크 번호를 song.pre_chunk로 적습니다. 청크는 그대로 두고
+        든 곡만 적으므로 클라이언트는 다시 받지 않습니다. 이후 재배치(pre_rebalance.py)가 표 조합대로 조금씩 옮깁니다.
+        이전 크기를 모르면 청크를 지우고 backfill_pre_chunks가 다시 만듭니다."""
+        if self._setting(cur, PRE_LAYOUT_SETTING) is not None:
+            return
+        legacy = self._setting(cur, PRE_CHUNK_SETTING)
+        size = int(legacy) if legacy and legacy.isdigit() and int(legacy) > 0 else None
+        if size is None:
+            cur.execute("DELETE FROM pre_chunk")
+        size = size or constant.SONGS_PER_PRE_CHUNK
+        cur.execute("SELECT id FROM song WHERE pre_chunk IS NULL")
+        song_ids = [row[0] for row in cur.fetchall()]
+        if song_ids:
+            for song_id in song_ids:
+                cur.execute("UPDATE song SET pre_chunk = %s WHERE id = %s", (song_id // size, song_id))
+        members = self._pre_members(cur)
+        cur.execute("SELECT id FROM pre_chunk")
+        for (chunk_no,) in cur.fetchall():
+            cur.execute("UPDATE pre_chunk SET songs = %s WHERE id = %s", (_song_list(members.get(chunk_no, [])), chunk_no))
+        self._set_setting(cur, PRE_CHUNK_SETTING, None)
+        self._set_setting(cur, PRE_LAYOUT_SETTING, "tables")
+        if song_ids:
+            self.logger.info(f"generate_database: Recorded pre chunks of {len(song_ids)} songs (id // {size}).")
 
     def _append_charts_to_chunk(self, cur, charts: list[tuple[str, bytes]]) -> None:
         """마지막 chart chunk에 chart (항목 이름, 내용)들을 추가합니다. 청크마다 CHARTS_PER_CHUNK개까지 넣고,
@@ -1428,13 +1469,14 @@ class Database:
                 }
             )
 
-        previews = self._previews(cur, lo, hi)
         cur.execute(
             "SELECT id, folder, size, sha256, files FROM song WHERE id >= %s AND id < %s ORDER BY id",
             (lo, hi),
         )
+        rows = cur.fetchall()
+        previews = self._previews(cur, [row[0] for row in rows])
         songs = []
-        for song_id, folder, size, sha256, files in cur.fetchall():
+        for song_id, folder, size, sha256, files in rows:
             song = {
                 "song_id": song_id,
                 "folder": folder,
@@ -1499,14 +1541,16 @@ class Database:
             self.logger.info(f"rechunk_manifest: Built {len(wanted)} manifest chunks, dropped {len(stale)}.")
         return len(wanted)
 
-    def _previews(self, cur, lo: int, hi: int) -> dict[int, dict]:
-        """song id가 [lo, hi)인 곡 중 지금 판의 미리듣기가 있는 곡. 곡 zip이 바뀌었는지는 song_sha256으로 봅니다."""
+    def _previews(self, cur, song_ids: list[int]) -> dict[int, dict]:
+        """song_ids 중 지금 판의 미리듣기가 있는 곡. 곡 zip이 바뀌었는지는 song_sha256으로 봅니다."""
+        if not song_ids:
+            return {}
         cur.execute(
-            """
+            f"""
             SELECT song_id, song_sha256, path, size, crc32 FROM song_preview
-            WHERE song_id >= %s AND song_id < %s AND version = %s AND path IS NOT NULL
+            WHERE song_id IN ({", ".join(["%s"] * len(song_ids))}) AND version = %s AND path IS NOT NULL
             """,
-            (lo, hi, preview.PREVIEW_VERSION),
+            (*song_ids, preview.PREVIEW_VERSION),
         )
         return {
             row[0]: {"song_sha256": row[1], "path": row[2], "size": row[3], "crc32": row[4]}
@@ -1530,12 +1574,12 @@ class Database:
 
     def render_previews(self) -> int:
         """미리듣기가 없거나 판·곡 zip이 바뀐 곡의 미리듣기를 만듭니다(preview.py). 바뀐 곡 수를 반환합니다.
-        렌더링은 쓰기 잠금 밖에서 하고, 사전 청크(SONGS_PER_PRE_CHUNK곡)마다 결과를 넣고 청크를 다시 만들어 커밋합니다.
+        렌더링은 쓰기 잠금 밖에서 하고, 사전 청크마다 결과를 넣고 청크를 다시 만들어 커밋합니다.
         도중에 꺼져도 다음 시작 때 남은 곡부터 이어서 만듭니다."""
         with connect() as con, con.cursor() as cur:
             cur.execute(
                 """
-                SELECT s.id, s.sha256 FROM song s LEFT JOIN song_preview p ON p.song_id = s.id
+                SELECT s.id, s.sha256, s.pre_chunk FROM song s LEFT JOIN song_preview p ON p.song_id = s.id
                 WHERE p.song_id IS NULL OR p.song_sha256 <> s.sha256 OR p.version <> %s
                 ORDER BY s.id
                 """,
@@ -1546,11 +1590,11 @@ class Database:
             return 0
         self.logger.info(f"render_previews: Rendering previews of {len(pending)} songs.")
         groups: dict[int, list[tuple[int, str]]] = defaultdict(list)
-        for song_id, sha256 in pending:
-            groups[song_id // constant.SONGS_PER_PRE_CHUNK].append((song_id, sha256))
+        for song_id, sha256, chunk_no in pending:
+            groups[-1 if chunk_no is None else chunk_no].append((song_id, sha256))
         done = seen = 0
         progress = _Progress(self.logger, "render_previews", len(pending))
-        for chunk_no, songs in sorted(groups.items()):
+        for _, songs in sorted(groups.items()):
             progress.update(seen)
             seen += len(songs)
             results = []
@@ -1602,7 +1646,9 @@ class Database:
                         if out is not None or (old is not None and old[0] is not None):
                             changed.add(song_id)
                     if changed:
-                        self._rebuild_pre_chunk(cur, chunk_no)
+                        # 렌더링하는 동안 재배치로 청크가 바뀌었을 수 있어 지금 든 청크를 다시 만듭니다.
+                        for chunk_no in self._pre_chunks_of(cur, changed):
+                            self._rebuild_pre_chunk(cur, chunk_no)
                         for manifest_no in {i // constant.SONGS_PER_MANIFEST_CHUNK for i in changed}:
                             self._rebuild_manifest_chunk(cur, manifest_no)
                     con.commit()
@@ -1659,12 +1705,15 @@ class Database:
         return data
 
     def _rebuild_pre_chunk(self, cur, chunk_no: int) -> None:
-        """chunk_no에 속한 곡들의 사전 파일을 다시 묶어 저장합니다. 곡이 사전 파일이 없어도 빈 zip을 둡니다."""
-        lo = chunk_no * constant.SONGS_PER_PRE_CHUNK
-        hi = lo + constant.SONGS_PER_PRE_CHUNK
-        previews = self._previews(cur, lo, hi)
-        cur.execute("SELECT id, files, sha256 FROM song WHERE id >= %s AND id < %s ORDER BY id", (lo, hi))
+        """chunk_no에 든 곡들의 사전 파일을 다시 묶어 저장합니다. 곡이 사전 파일이 없어도 빈 zip을 두고,
+        든 곡이 없으면 청크를 지웁니다."""
+        cur.execute("SELECT id, files, sha256 FROM song WHERE pre_chunk = %s ORDER BY id", (chunk_no,))
         songs = cur.fetchall()
+        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
+        if not songs:
+            cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
+            return
+        previews = self._previews(cur, [row[0] for row in songs])
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
             for song_id, files, sha256 in songs:
@@ -1691,53 +1740,205 @@ class Database:
 
         sha256 = hashlib.sha256(data).hexdigest()
         path = store.write(store.pre_chunk_path(chunk_no, sha256), data)
-        cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
         cur.execute(
             """
-            INSERT INTO pre_chunk (id, size, sha256, path) VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), path = VALUES(path)
+            INSERT INTO pre_chunk (id, size, sha256, path, songs) VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), path = VALUES(path),
+                songs = VALUES(songs)
             """,
-            (chunk_no, len(data), sha256, path),
+            (chunk_no, len(data), sha256, path, _song_list(row[0] for row in songs)),
         )
 
-    def backfill_pre_chunks(self) -> int:
-        """곡은 있는데 사전 청크가 없는 구간(이전 버전에서 넣은 곡)의 사전 청크를 만듭니다. 만든 청크 수를 반환합니다.
-        청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 남은 청크부터 이어서 만듭니다."""
-        with self._write_lock, connect() as con, con.cursor() as cur:
-            if self._setting(cur, PRE_CHUNK_SETTING) != str(constant.SONGS_PER_PRE_CHUNK):
-                # 청크 크기가 바뀌었으면 모두 다시 만듭니다. 조각(pre_chunk_part)은 청크를 다시 만들 때 덮어쓰고,
-                # 남는 번호의 조각은 아래에서 지웁니다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받습니다.
-                cur.execute("SELECT COUNT(*) FROM pre_chunk")
-                if cur.fetchone()[0]:
-                    self.logger.info(
-                        f"backfill_pre_chunks: Rebuilding every pre chunk with {constant.SONGS_PER_PRE_CHUNK} songs."
-                    )
-                cur.execute("DELETE FROM pre_chunk")
-                self._set_setting(cur, PRE_CHUNK_SETTING, str(constant.SONGS_PER_PRE_CHUNK))
-                con.commit()
+    def _pre_members(self, cur, chunk_ids: list[int] | None = None) -> dict[int, list[int]]:
+        """{사전 청크 번호: 든 곡 id들}. chunk_ids가 있으면 그 청크만."""
+        if chunk_ids is None:
+            cur.execute("SELECT id, pre_chunk FROM song WHERE pre_chunk IS NOT NULL")
+        elif not chunk_ids:
+            return {}
+        else:
+            cur.execute(
+                f"SELECT id, pre_chunk FROM song WHERE pre_chunk IN ({', '.join(['%s'] * len(chunk_ids))})",
+                tuple(chunk_ids),
+            )
+        members: dict[int, list[int]] = defaultdict(list)
+        for song_id, chunk_no in cur.fetchall():
+            members[chunk_no].append(song_id)
+        return members
+
+    def _pre_chunks_of(self, cur, song_ids) -> list[int]:
+        """곡들이 든 사전 청크 번호."""
+        song_ids = list(song_ids)
+        if not song_ids:
+            return []
+        cur.execute(
+            f"SELECT DISTINCT pre_chunk FROM song WHERE id IN ({', '.join(['%s'] * len(song_ids))}) AND pre_chunk IS NOT NULL",
+            tuple(song_ids),
+        )
+        return sorted(row[0] for row in cur.fetchall())
+
+    def _stale_pre_chunks(self, cur, chunk_ids: list[int] | None = None) -> list[int]:
+        """다시 만들 사전 청크: 든 곡(song.pre_chunk)이 만들 때 든 곡(pre_chunk.songs)과 다르거나, 곡이 있는데 청크가 없거나,
+        청크가 있는데 곡이 없는 청크. chunk_ids가 있으면 그 청크만 봅니다."""
+        members = self._pre_members(cur, chunk_ids)
+        if chunk_ids is None:
+            cur.execute("SELECT id, songs FROM pre_chunk")
+        elif not chunk_ids:
+            return []
+        else:
+            cur.execute(
+                f"SELECT id, songs FROM pre_chunk WHERE id IN ({', '.join(['%s'] * len(chunk_ids))})", tuple(chunk_ids)
+            )
+        built = {row[0]: row[1] for row in cur.fetchall()}
+        return sorted(
+            chunk_no for chunk_no in set(members) | set(built)
+            if _song_list(members.get(chunk_no, [])) != built.get(chunk_no)
+        )
+
+    def _song_tables(self, cur, song_ids: list[int] | None = None) -> dict[int, set[int]]:
+        """{곡 id: 곡의 차트가 든 난이도표 id들}. 표에 없는 곡은 빠집니다. 차트는 md5 또는 sha256으로 맞춥니다(tables.py)."""
+        found: dict[int, set[int]] = defaultdict(set)
+        if song_ids is not None and not song_ids:
+            return found
+        for column, key in (("md5", "md5"), ("id", "sha256")):
+            sql = f"""
+                SELECT c.song_id, t.table_id FROM difficulty_table_chart t
+                JOIN chart c ON c.{column} = t.{key}
+                WHERE t.{key} <> '' AND c.song_id IS NOT NULL
+            """
+            if song_ids is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql + f" AND c.song_id IN ({', '.join(['%s'] * len(song_ids))})", tuple(song_ids))
+            for song_id, table_id in cur.fetchall():
+                found[song_id].add(table_id)
+        return found
+
+    def _next_pre_chunk_id(self, cur) -> int:
+        cur.execute("SELECT MAX(id) FROM pre_chunk")
+        top = cur.fetchone()[0]
+        cur.execute("SELECT MAX(pre_chunk) FROM song")
+        song_top = cur.fetchone()[0]
+        used = [i for i in (top, song_top) if i is not None]
+        return max(used) + 1 if used else 0
+
+    def _place_song(self, cur, song_id: int) -> int:
+        """곡을 속한 난이도표 조합이 같은, 곡이 SONGS_PER_PRE_CHUNK보다 적은 사전 청크에 넣습니다(없으면 새 청크).
+        청크 번호를 반환합니다. 청크는 호출한 쪽이 같은 트랜잭션에서 다시 만들어야 합니다(새 청크는 그때까지 빈 행)."""
+        sig = pre_rebalance.signature(self._song_tables(cur, [song_id]).get(song_id, ()))
+        cur.execute(
+            """
+            SELECT p.id FROM pre_chunk p
+            WHERE p.sig = %s AND (SELECT COUNT(*) FROM song s WHERE s.pre_chunk = p.id) < %s
+            ORDER BY p.id DESC LIMIT 1
+            """,
+            (sig, constant.SONGS_PER_PRE_CHUNK),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            chunk_no = row[0]
+        else:
+            chunk_no = self._next_pre_chunk_id(cur)
+            cur.execute(
+                "INSERT INTO pre_chunk (id, size, sha256, sig, songs) VALUES (%s, 0, '', %s, '')", (chunk_no, sig)
+            )
+        cur.execute("UPDATE song SET pre_chunk = %s WHERE id = %s", (chunk_no, song_id))
+        return chunk_no
+
+    def rebalance_pre_chunks(self, budget: int | None = None) -> int:
+        """여러 난이도표 조합의 곡이 섞인 사전 청크에서 곡을 조합이 같은 청크로 옮깁니다(pre_rebalance.plan).
+        한 번에 다시 쓰는 청크 용량은 대략 budget(기본 PRE_REBALANCE_BYTES)까지입니다. 옮긴 곡 수를 반환합니다.
+
+        옮길 청크(대상)마다 곡의 청크 번호를 바꾸고 대상을 다시 만들어 커밋한 뒤, 곡이 빠진 청크를 다시 만듭니다.
+        그 사이 빠진 청크에는 옮긴 곡의 파일이 남아 있을 뿐이고(태그는 song.pre_chunk로 셈), 도중에 꺼지면
+        backfill_pre_chunks가 든 곡이 바뀐 청크를 다시 만듭니다."""
+        budget = constant.PRE_REBALANCE_BYTES if budget is None else budget
         with connect() as con, con.cursor() as cur:
-            cur.execute("SELECT id FROM song")
-            wanted = {row[0] // constant.SONGS_PER_PRE_CHUNK for row in cur.fetchall()}
-            cur.execute("SELECT id FROM pre_chunk")
-            missing = sorted(wanted - {row[0] for row in cur.fetchall()})
-        if missing:
-            self.logger.info(f"backfill_pre_chunks: Building {len(missing)} pre chunks.")
-        progress = _Progress(self.logger, "backfill_pre_chunks", len(missing))
-        for i, chunk_no in enumerate(missing, 1):
+            song_sig = {
+                song_id: pre_rebalance.signature(ids) for song_id, ids in self._song_tables(cur).items()
+            }
+            members = self._pre_members(cur)
+            cur.execute("SELECT id, size, sig FROM pre_chunk")
+            chunks = cur.fetchall()
+        chunk_size = {row[0]: row[1] for row in chunks}
+        chunk_sig = {row[0]: row[2] for row in chunks}
+        plan = pre_rebalance.plan(
+            members, song_sig, chunk_sig, chunk_size, budget, constant.SONGS_PER_PRE_CHUNK
+        )
+        if plan.adopt:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                for chunk_no, sig in plan.adopt.items():
+                    cur.execute("UPDATE pre_chunk SET sig = %s WHERE id = %s", (sig, chunk_no))
+                con.commit()
+        if not plan.moves:
+            return 0
+        self.logger.info(
+            f"rebalance_pre_chunks: Moving songs out of {len(plan.sources)} mixed pre chunks "
+            f"into {len(plan.moves)} chunks."
+        )
+        moved = 0
+        # 새 청크를 먼저 채워, 기존 청크를 다시 만들 때는 빠질 곡이 이미 빠져 있게 합니다.
+        progress = _Progress(self.logger, "rebalance_pre_chunks", len(plan.moves) + len(plan.sources))
+        step = 0
+        for move in sorted(plan.moves, key=lambda m: m.target is not None):
             with self._write_lock, connect() as con, con.cursor() as cur:
                 try:
-                    cur.execute("SELECT id FROM pre_chunk WHERE id = %s", (chunk_no,))
-                    if cur.fetchone() is None:
+                    # 계획한 뒤 임포트·삭제·다른 이동으로 청크가 바뀐 곡은 건너뜁니다.
+                    songs = []
+                    for song_id, source in move.songs:
+                        cur.execute("SELECT pre_chunk FROM song WHERE id = %s", (song_id,))
+                        row = cur.fetchone()
+                        if row is not None and row[0] == source:
+                            songs.append(song_id)
+                    if songs:
+                        target = self._next_pre_chunk_id(cur) if move.target is None else move.target
+                        for song_id in songs:
+                            cur.execute("UPDATE song SET pre_chunk = %s WHERE id = %s", (target, song_id))
+                        self._rebuild_pre_chunk(cur, target)
+                        cur.execute("UPDATE pre_chunk SET sig = %s WHERE id = %s", (move.sig, target))
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            moved += len(songs)
+            step += 1
+            progress.update(step)
+        for chunk_no in plan.sources:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    if self._stale_pre_chunks(cur, [chunk_no]):
+                        self._rebuild_pre_chunk(cur, chunk_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            step += 1
+            progress.update(step)
+        self.logger.info(f"rebalance_pre_chunks: Moved {moved} songs.")
+        return moved
+
+    def backfill_pre_chunks(self) -> int:
+        """곡은 있는데 사전 청크가 없거나(이전 버전에서 넣은 곡) 든 곡이 바뀐 사전 청크를 다시 만들고, 곡이 없는 청크는 지웁니다.
+        다시 만든(지운) 청크 수를 반환합니다. 청크마다 따로 커밋하므로 도중에 꺼져도 다음 시작 때 남은 청크부터 이어서 합니다.
+        다 만들기 전에는 클라이언트가 파일별 사전 API로 받습니다."""
+        with connect() as con, con.cursor() as cur:
+            todo = self._stale_pre_chunks(cur)
+        if todo:
+            self.logger.info(f"backfill_pre_chunks: Building {len(todo)} pre chunks.")
+        progress = _Progress(self.logger, "backfill_pre_chunks", len(todo))
+        for i, chunk_no in enumerate(todo, 1):
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    if self._stale_pre_chunks(cur, [chunk_no]):
                         self._rebuild_pre_chunk(cur, chunk_no)
                     con.commit()
                 except Exception:
                     con.rollback()
                     raise
             progress.update(i)
-        if missing:
-            self.logger.info(f"backfill_pre_chunks: Built {len(missing)} pre chunks.")
+        if todo:
+            self.logger.info(f"backfill_pre_chunks: Built {len(todo)} pre chunks.")
         self._drop_orphan_pre_parts()
-        return len(missing)
+        return len(todo)
 
     def _drop_orphan_pre_parts(self) -> None:
         """청크가 없는 사전 청크 조각(청크 크기를 바꾸기 전 번호)을 지웁니다."""
@@ -2121,7 +2322,7 @@ class Database:
                             batch_changed.append(song_id)
                     for chunk_no in sorted({s // constant.SONGS_PER_MANIFEST_CHUNK for s in batch_changed}):
                         self._rebuild_manifest_chunk(cur, chunk_no)
-                    for chunk_no in sorted({s // constant.SONGS_PER_PRE_CHUNK for s in batch_changed}):
+                    for chunk_no in self._pre_chunks_of(cur, batch_changed):
                         cur.execute("DELETE FROM pre_chunk_part WHERE chunk_id = %s", (chunk_no,))
                         cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
                     if not failed:
@@ -2641,11 +2842,13 @@ class Database:
         try:
             with connect() as con, con.cursor() as cur:
                 try:
-                    cur.execute("SELECT folder, size, sha256 FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    cur.execute(
+                        "SELECT folder, size, sha256, pre_chunk FROM song WHERE id = %s FOR UPDATE", (song_id,)
+                    )
                     row = cur.fetchone()
                     if row is None:
                         return False
-                    folder, size, sha256 = row
+                    folder, size, sha256, pre_chunk = row
                     data = self._get_song_data_with_cur(cur, song_id)
                     if data is None or hashlib.sha256(data).hexdigest() != sha256:
                         raise ValueError(f"song {song_id}: zip data is missing or does not match its sha256")
@@ -2680,7 +2883,8 @@ class Database:
                     cur.execute("DELETE FROM song_part WHERE song_id = %s", (song_id,))
                     cur.execute("DELETE FROM song WHERE id = %s", (song_id,))
                     self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
-                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    if pre_chunk is not None:
+                        self._rebuild_pre_chunk(cur, pre_chunk)
                     con.commit()
                 except Exception:
                     con.rollback()
@@ -2750,7 +2954,7 @@ class Database:
                         self._append_charts_to_chunk(cur, [(arcname, content) for *_, arcname, content in readd])
                     cur.execute("DELETE FROM deleted_song WHERE song_id = %s", (song_id,))
                     self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
-                    self._rebuild_pre_chunk(cur, song_id // constant.SONGS_PER_PRE_CHUNK)
+                    self._rebuild_pre_chunk(cur, self._place_song(cur, song_id))
                     con.commit()
                 except Exception:
                     con.rollback()
@@ -3099,6 +3303,15 @@ class SongBatch:
                     return None
                 song_bytes, added, conflicts, similar, kept_charts, resolved = merged
             new_charts, reattached = self.db._insert_or_update_charts(root, bms_files, song_id, cur)
+            pre_chunk = None
+            if new_song:
+                # 차트를 등록한 뒤라 곡이 든 난이도표로 청크를 고릅니다.
+                pre_chunk = self.db._place_song(cur, song_id)
+            elif added:
+                cur.execute("SELECT pre_chunk FROM song WHERE id = %s", (song_id,))
+                pre_chunk = cur.fetchone()[0]
+                if pre_chunk is None:
+                    pre_chunk = self.db._place_song(cur, song_id)
             cur.execute("RELEASE SAVEPOINT song")
         except Exception:
             cur.execute("ROLLBACK TO SAVEPOINT song")
@@ -3110,8 +3323,8 @@ class SongBatch:
         self._songs += 1
         if new_song or new_charts or reattached or added:
             self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
-        if new_song or added:
-            self._pre_chunks.add(song_id // constant.SONGS_PER_PRE_CHUNK)
+        if pre_chunk is not None:
+            self._pre_chunks.add(pre_chunk)
         if remove and not conflicts:
             self._remove.append(root)
         elif remove:

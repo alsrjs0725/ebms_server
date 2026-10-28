@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, api_keys, audit, auth, constant, downloads, home, importer, notices, policies, preview, proxy, retention, staging, tables
+from . import admin, api_keys, audit, auth, constant, downloads, home, importer, notices, policies, pre_rebalance, preview, proxy, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -94,6 +94,8 @@ def backfill_pre_chunks() -> None:
         Database().backfill_pre_chunks()
     except Exception:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+    # 사전 청크에 난이도표 조합이 섞인 곡을 조합이 같은 청크로 조금씩 옮긴다(이전 버전에서 넣은 곡, 바뀐 난이도표).
+    pre_rebalance.kick()
     # 난이도표는 차트를 md5로 가리킵니다. 다 채우기 전에는 sha256을 주는 표만 맞습니다.
     try:
         Database().backfill_chart_md5()
