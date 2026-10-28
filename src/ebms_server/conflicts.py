@@ -196,7 +196,13 @@ def web_file(stage_id: str, unit_id: str, path: str, side: str, raw: bool = Fals
     if raw or kind == "other":
         return content, MEDIA_TYPES.get(suffix, "application/octet-stream"), filename
     if (kind == "image" and suffix in WEB_IMAGE) or (kind == "sound" and suffix in WEB_SOUND):
-        return content, MEDIA_TYPES[suffix], filename
+        # 파일로 돌려줘야 Range 요청을 받아 재생 중 위치를 옮길 수 있습니다.
+        out = _cache_dir(stage, unit) / f"{_cache_name(name, content, 'raw')}{suffix}"
+        if not out.is_file():
+            part = out.with_name(out.name + ".part")
+            part.write_bytes(content)
+            part.replace(out)
+        return out, MEDIA_TYPES[suffix], filename
     if kind == "image":
         ext, args = ".png", ["-frames:v", "1", "-f", "image2", "-c:v", "png"]
     elif kind == "sound":
@@ -241,7 +247,7 @@ def _peaks(samples: np.ndarray) -> list[float]:
 
 
 def sound_compare(stage_id: str, unit_id: str, path: str) -> dict:
-    """키음 둘의 길이·파형·상관계수(media_match.same_sound와 같은 방식)."""
+    """키음 둘의 길이·파형·상관계수(media_match.same_sound와 같은 방식, 지연 보정 없음)."""
     stage, unit = _unit(stage_id, unit_id)
     old_name, old = _side(stage, unit, path, "old")
     new_name, new = _side(stage, unit, path, "new")
@@ -254,23 +260,22 @@ def sound_compare(stage_id: str, unit_id: str, path: str) -> dict:
             return {"error": "키음을 풀지 못했습니다."}
         a = np.frombuffer(raw_a, dtype="<f4").astype(np.float64)
         b = np.frombuffer(raw_b, dtype="<f4").astype(np.float64)
-        correlation = None
-        lag = media_match._best_lag(a, b, int(media_match.SOUND_MAX_LAG * rate))
-        x, y = (a[lag:], b) if lag > 0 else (a, b[-lag:]) if lag < 0 else (a, b)
-        n = min(len(x), len(y))
-        denom = np.sqrt(np.dot(x[:n], x[:n]) * np.dot(y[:n], y[:n])) if n else 0
-        if denom > 0:
-            correlation = round(float(np.dot(x[:n], y[:n]) / denom), 4)
+        # 판정(correlation)은 싱크를 맞추지 않습니다(싱크도 같아야 같은 소재).
+        # 참고로 싱크 오차(offset_ms)와 그 오차를 맞췄을 때의 상관계수(aligned_correlation)도 보여 줍니다.
+        value = media_match.correlation(a, b)
+        offset = media_match._best_lag(a, b, int(media_match.SOUND_OFFSET_SEARCH * rate))
+        aligned = media_match.correlation(a[offset:], b) if offset >= 0 else media_match.correlation(a, b[-offset:])
         return {
             "old": {"seconds": round(len(a) / rate, 3), "peaks": _peaks(a)},
             "new": {"seconds": round(len(b) / rate, 3), "peaks": _peaks(b)},
-            "lag_ms": round(lag / rate * 1000, 1),
-            "correlation": correlation,
+            "offset_ms": round(offset / rate * 1000, 1),
+            "correlation": None if value is None else round(value, 4),
+            "aligned_correlation": None if aligned is None else round(aligned, 4),
             "min_correlation": media_match.SOUND_MIN_CORRELATION,
             "same": bool(media_match.same_sound(a.astype("<f4"), b.astype("<f4"))),
         }
 
-    key = _cache_name(path, hashlib.sha256(old + b"\0" + new).digest(), "sound")
+    key = _cache_name(path, hashlib.sha256(old + b"\0" + new).digest(), "sound-sync")
     return _cached_json(stage, unit, key, make)
 
 

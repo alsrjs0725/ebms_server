@@ -301,8 +301,10 @@ async function showSounds(item, left, right, body) {
         waves.push(() => drawWave(canvas, side.peaks, side.seconds, max, color));
     }
     waves.forEach((f) => f());
-    const corr = data.correlation == null ? "계산 불가(무음)" : data.correlation.toFixed(3);
-    status.textContent = `상관계수 ${corr} (같은 소재 기준 ${data.min_correlation} 이상, 길이 차이 2%·0.1초 이내) · 맞춘 지연 ${data.lag_ms}ms`
+    const fmt = (v) => v == null ? "계산 불가(무음)" : v.toFixed(3);
+    const sync = data.offset_ms ? `${Math.abs(data.offset_ms)}ms (새 파일이 ${data.offset_ms > 0 ? "빠름" : "늦음"})` : "0ms";
+    status.textContent = `판정 상관계수 ${fmt(data.correlation)} (싱크 보정 없음, 같은 소재 기준 ${data.min_correlation} 이상, 길이 차이 2%·0.1초 이내)`
+        + ` · 싱크 맞춘 상관계수 ${fmt(data.aligned_correlation)} · 싱크 오차 ${sync}`
         + (data.same ? " · 지금 기준으로는 같은 소재" : "");
 }
 
