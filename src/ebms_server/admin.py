@@ -697,6 +697,28 @@ def conflict_compare(stage_id: str, unit_id: str, path: str, admin: Annotated[Us
     return _stage_call(fn, stage_id, unit_id, path)
 
 
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/charts")
+def conflict_charts(stage_id: str, unit_id: str, path: str, admin: Annotated[User, Depends(web_admin)]):
+    """충돌 파일을 채보로 들어볼 때 고를 차트(기존·새 쪽)."""
+    return _stage_call(conflicts.render_charts, stage_id, unit_id, path)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/render")
+def conflict_render(
+    stage_id: str, unit_id: str, song: int, side: str, chart: str, admin: Annotated[User, Depends(web_admin)],
+):
+    """차트의 바탕 음원과 충돌 키음 시각표. 만드는 중이면 진행률을 돌려주므로 다 될 때까지 다시 부릅니다."""
+    return _stage_call(conflicts.render, stage_id, unit_id, song, side, chart)
+
+
+@router.get("/api/admin/import/stages/{stage_id}/units/{unit_id}/conflicts/render/bed")
+def conflict_render_bed(
+    stage_id: str, unit_id: str, song: int, side: str, chart: str, admin: Annotated[User, Depends(web_admin)],
+):
+    """차트의 바탕 음원(충돌 키음을 뺀 소리, FLAC)."""
+    return FileResponse(_stage_call(conflicts.render_bed, stage_id, unit_id, song, side, chart), media_type="audio/flac")
+
+
 class ConflictChoices(BaseModel):
     choices: dict[str, str | None]
 
