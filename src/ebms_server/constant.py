@@ -86,14 +86,8 @@ TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
 TABLE_PAGE_DIR = BASE_DIR / "src" / "ebms_server" / "table"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.
 API_VERSION = 3
-# 다운로드 본문(BLOB 조각) 읽기에 쓰는 스레드 수 한도. API·로그인이 쓰는 기본 스레드 한도(40)와 따로 셉니다.
-# 큰 곡을 동시에 많이 받아도 다른 요청이 스레드를 기다리지 않게 합니다. 늘리면 MySQL 동시 연결도 그만큼 늘어납니다.
-DOWNLOAD_THREADS = int(os.environ.get("EBMS_DOWNLOAD_THREADS", "16"))
 # 파일을 나눠 읽거나 복사할 때 한 번에 다루는 크기
 READ_SIZE = 1024 * 1024
-# 다운로드 하나가 보내기 전에 미리 읽어 메모리에 쌓아 두는 조각 수 상한(조각당 READ_SIZE).
-# 디스크 읽기가 전송을 기다리지 않고 연달아 이어지게 합니다. 메모리는 동시 다운로드 수 × 이 값 × 1MB까지 씁니다.
-READ_AHEAD_CHUNKS = int(os.environ.get("EBMS_READ_AHEAD_CHUNKS", "64"))
 # 연결 풀에 남겨 둘 유휴 MySQL 연결 수 상한
 DB_POOL_SIZE = int(os.environ.get("EBMS_DB_POOL_SIZE", "32"))
 

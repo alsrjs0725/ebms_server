@@ -105,41 +105,39 @@ def authorize(request: Request) -> Response:
         return _deny(401, "login required")
     user = session[0]
 
-    blob = Database().open_file(table, row_id)
-    if blob is None:
+    file = Database().open_file(table, row_id)
+    if file is None:
         if table == "song":
             status, detail = missing_song(row_id)
-            download_log.record(user.id, row_id, download_log.failure_result(status, detail))
+            download_log.record(user.id, row_id, download_log.failure_result(status))
             return _deny(status, detail)
         return _deny(404, "File not found")
     # 권한만 묻는 요청이라 열어 둔 파일은 바로 닫습니다.
-    blob.close()
-    etag = f'"{blob.sha256}"'
-    headers = {"X-Ebms-Sha256": blob.sha256, "X-Ebms-Limit-Rate": "0", "X-Ebms-User": user.id}
+    file.close()
+    etag = f'"{file.sha256}"'
+    headers = {"X-Ebms-Sha256": file.sha256, "X-Ebms-Limit-Rate": "0", "X-Ebms-User": user.id}
 
     # 304는 프록시가 캐시의 ETag로 답합니다. 차감·사용량 기록 없음.
     if _not_modified(request, etag):
         return Response(status_code=204, headers=headers)
-    nbytes = _requested_bytes(request, etag, blob.size)
+    nbytes = _requested_bytes(request, etag, file.size)
 
     if kind == "play":
+        # 만족할 수 없는 범위(416)는 차감하지 않습니다.
         if nbytes:
             resumed = download_log.is_resume(request)
             try:
-                # 프록시는 보낸 바이트를 알려주지 않으므로 요청한 만큼을 미리 셉니다.
-                charged = quota.charge_play(user.id, row_id, nbytes, blob.size)
+                charged = quota.charge_play(user.id, row_id)
             except quota.NoTicket as e:
                 download_log.record(user.id, row_id, "no_ticket", resumed)
                 return _deny(429, "no download ticket", e.retry_after)
             download_log.record(user.id, row_id, "charged" if charged else "free", resumed)
     else:
-        # 프록시는 보낸 바이트를 알려주지 않으므로 요청한 만큼을 미리 더합니다.
-        limits = quota.limits_for(user.id)
-        used = quota.pre_used(user.id)
-        quota.add_pre_usage(user.id, nbytes)
-        if used >= limits.pre_monthly_bytes:
-            # 감속은 연결 단위(nginx limit_rate)입니다. 동시 요청이 속도를 나눠 쓰지는 않습니다.
-            headers["X-Ebms-Limit-Rate"] = str(limits.pre_throttled_kbps * 1000 // 8)
+        # 직접 받을 때와 같이 요청한 바이트를 미리 더합니다.
+        rate = quota.meter_pre(user.id, nbytes)
+        if rate:
+            # 감속은 연결 단위(nginx limit_rate)입니다.
+            headers["X-Ebms-Limit-Rate"] = str(rate)
     return Response(status_code=204, headers=headers)
 
 

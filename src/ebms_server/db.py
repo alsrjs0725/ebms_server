@@ -212,14 +212,12 @@ SCHEMA = [
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     # 티켓을 쓴 곡. expires_at 전에는 같은 곡을 다시 받아도 차감하지 않습니다.
-    # bytes_used는 이 티켓으로 받은 바이트 합계이고, 곡 크기 × quota.PLAYS_PER_TICKET를 넘으면 티켓을 다시 씁니다.
     """
         CREATE TABLE IF NOT EXISTS download_grant(
             user_id CHAR(36) NOT NULL,
             song_id INT UNSIGNED NOT NULL,
             charged_at BIGINT UNSIGNED NOT NULL,
             expires_at BIGINT UNSIGNED NOT NULL,
-            bytes_used BIGINT UNSIGNED NOT NULL DEFAULT 0,
 
             PRIMARY KEY (user_id, song_id),
             FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
@@ -381,6 +379,8 @@ MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk")]
 # 곡·청크를 저장소 파일로 옮기기 전(#152) 데이터를 두던 테이블·컬럼. 다 옮긴 DB에서 서버 시작 때 지웁니다.
 BLOB_TABLES = ("song_part", "pre_chunk_part")
 BLOB_COLUMNS = [("song", "data"), ("chart_chunk", "data")]
+# 더 쓰지 않는 컬럼(티켓당 받은 바이트, #35). 서버 시작 때 있으면 지웁니다.
+DROPPED_COLUMNS = [("download_grant", "bytes_used")]
 BLOB_NOT_MOVED = (
     "곡·청크 데이터가 아직 DB BLOB에 있습니다. 저장소 파일로 옮기는 이전 버전(#152)으로 먼저 올려 "
     "로그에 'migrate_to_store: Reclaimed disk space of song BLOBs.'가 나온 뒤 이 버전으로 올리세요(docs/deployment.md)."
@@ -1032,6 +1032,10 @@ class Database:
                     cur.execute(f"ALTER TABLE {table} ADD INDEX {name} ({column})")
                     self.logger.info(f"generate_database: Added index {table}.{name}")
             self._drop_blobs(cur)
+            for table, column in DROPPED_COLUMNS:
+                if self._has_column(cur, table, column):
+                    cur.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+                    self.logger.info(f"generate_database: Dropped column {table}.{column}")
             # 할당량 전역 기본값. 이미 있는 값(관리자가 바꾼 값)은 그대로 둡니다.
             for name, value in constant.DEFAULT_SETTINGS.items():
                 cur.execute("INSERT IGNORE INTO setting (name, value) VALUES (%s, %s)", (name, str(value)))

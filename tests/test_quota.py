@@ -2,14 +2,12 @@
 import datetime
 import io
 import os
-import threading
 import time
 import zipfile
 
-import anyio
-import anyio.to_thread
+import pytest
 
-from ebms_server import constant, db as db_module, quota
+from ebms_server import constant, db as db_module, downloads, quota
 from ebms_server.db import Database, file_kinds
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
@@ -190,7 +188,7 @@ def test_pre_endpoints_and_usage(tmp_path, client, monkeypatch):
     assert client.get("/api/pre/song/1/file", params={"path": "nope.png"}, headers=h).status_code == 404
     assert client.get("/api/pre/song/9/file", params={"path": "banner.jpg"}, headers=h).status_code == 404
 
-    # 압축 해제한(실제 전송한) 바이트를 더합니다. 해시 목록과 304는 세지 않습니다.
+    # 보낼(압축 해제한) 바이트를 요청 때 더합니다. 해시 목록과 304는 세지 않습니다.
     # 매니페스트는 gzip 그대로 보냅니다(httpx가 풀어서 보여줌).
     gz = len(Database().get_manifest_chunk(0))
     sent = len(chunk.content) + 10 + gz + len(banner.content) + len(stage.content)
@@ -209,8 +207,8 @@ def test_pre_throttled_after_monthly_limit(tmp_path, client, monkeypatch):
     async def fake_sleep(seconds):
         delays.append(seconds)
 
-    monkeypatch.setattr(quota.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(quota, "THROTTLE_PIECE", 100)
+    monkeypatch.setattr(downloads.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(downloads, "THROTTLE_PIECE", 100)
     url = "/api/pre/song/1/file?path=banner.jpg"
 
     # 한도 안에서는 감속하지 않습니다.
@@ -219,10 +217,9 @@ def test_pre_throttled_after_monthly_limit(tmp_path, client, monkeypatch):
 
     quota.set_overrides(user_id, {"pre_monthly_bytes": 0, "pre_throttled_kbps": 64})  # 8000 B/s
     assert client.get(url, headers=bearer(key)).content == full
-    assert len(delays) == len(full) // 100 - 1  # 첫 조각은 바로 보냄
-    # 같은 사용자의 요청은 하나의 버킷을 나눠 쓰므로, 테스트처럼 실제로 기다리지 않으면 대기가 계속 늘어납니다.
-    assert delays[-1] > delays[0] > 0
-    assert abs(delays[-1] - (len(full) - 100) / 8000) < 0.5
+    # 100바이트씩 나눠 보내고 조각마다 그 속도만큼 쉽니다(연결 단위).
+    assert len(delays) == -(-len(full) // 100)
+    assert sum(delays) == pytest.approx(len(full) / 8000)
     assert client.get("/api/me", headers=bearer(key)).json()["pre"]["throttled"] is True
 
 
@@ -485,37 +482,9 @@ def test_admin_user_update_role(client, monkeypatch):
     assert client.put(f"/api/admin/users/{admin_id}", json={"role": "user"}).status_code == 400
 
 
-def test_concurrent_downloads_limit(tmp_path, client, monkeypatch):
-    key, user_id = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-
-    # 10개까지는 슬롯 확보 성공
-    for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER):
-        assert quota.acquire_download_slot(user_id) is True
-
-    # 11번째는 초과
-    assert quota.acquire_download_slot(user_id) is False
-    res = client.get("/api/play/song/1", headers=bearer(key))
-    assert res.status_code == 429
-    assert res.json()["detail"] == "too many concurrent downloads"
-
-    # 반납 후에는 다시 가능
-    quota.release_download_slot(user_id)
-    assert quota.acquire_download_slot(user_id) is True
-
-    # 정리
-    for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER):
-        quota.release_download_slot(user_id)
-
-
-def _slots(user_id):
-    return quota._download_tracker._counts.get(user_id, 0)
-
-
 def _serve(response, fail_at):
     """응답을 ASGI로 보내되 fail_at번째 send에서 연결이 끊긴 것처럼 OSError를 냅니다."""
     import anyio
-    import pytest
     from starlette.requests import ClientDisconnect
 
     sent = []
@@ -534,183 +503,28 @@ def _serve(response, fail_at):
     return sent
 
 
-def test_download_slot_released_on_early_disconnect(tmp_path, client, monkeypatch):
-    """본문을 시작하기 전(http.response.start)이나 도중에 끊겨도 슬롯은 정확히 한 번 반납됩니다."""
-    from starlette.requests import Request
-
-    from ebms_server import downloads
-    from ebms_server.accounts import User
-
-    key, user_id = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-    user = User(user_id, "Alice", "user", "active")
-    request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
-
-    # 다른 다운로드 하나가 슬롯을 쥐고 있는 상태. 반납이 두 번 되면 이 슬롯까지 빠집니다.
-    assert quota.acquire_download_slot(user_id)
-    try:
-        def responses():
-            yield downloads.blob_response(request, "song", 1, "1.zip", "x", user_id=user_id)
-            yield downloads.blob_response(request, "chart_chunk", 0, "c.zip", "x", user_id=user_id, meter_user=user_id)
-            yield downloads.pre_song_file(1, "banner.jpg", request, user)
-
-        for fail_at in (0, 1):  # 0: 시작 전, 1: 본문 첫 조각에서
-            for response in responses():
-                assert _slots(user_id) == 2
-                _serve(response, fail_at)
-                assert _slots(user_id) == 1, fail_at
-
-        # 새지 않았으므로 한도까지 다시 잡을 수 있습니다.
-        for _ in range(quota.MAX_CONCURRENT_DOWNLOADS_PER_USER - 1):
-            assert quota.acquire_download_slot(user_id) is True
-        assert quota.acquire_download_slot(user_id) is False
-    finally:
-        quota._download_tracker._counts.pop(user_id, None)
-
-
-def test_metered_closes_when_limits_lookup_fails(monkeypatch):
-    """한도 조회에서 예외가 나도 close가 불립니다."""
-    import anyio
-    import pytest
-
-    closed = []
-
-    def boom(user_id):
-        raise RuntimeError("db down")
-
-    monkeypatch.setattr(quota, "limits_for", boom)
-
-    async def run():
-        async for _ in quota.metered("u", iter([b"x"]), close=lambda: closed.append(1)):
-            pass
-
-    with pytest.raises(RuntimeError):
-        anyio.run(run)
-    assert closed == [1]
-
-
 def test_min_throttled_kbps_validation():
-    import pytest
     with pytest.raises(ValueError, match="pre_throttled_kbps must be between 64 and"):
         quota.validate("pre_throttled_kbps", 10)
 
     assert quota.validate("pre_throttled_kbps", 64) == 64
 
 
-# ---- 다운로드 스레드 (#41) ----
-
-def test_metered_reads_in_download_limiter_and_writes_usage_off_loop_when_cancelled(monkeypatch):
-    """본문 조각은 다운로드 전용 스레드 한도에서 읽고, 취소돼도 사용량은 이벤트 루프 밖 스레드에서 기록합니다."""
-    limits = quota.Limits(5, 60, 1800, 0, 500)  # 한도 0 → 감속(500Kbps)
-    monkeypatch.setattr(quota, "limits_for", lambda user_id: limits)
-    monkeypatch.setattr(quota, "pre_used", lambda user_id: 0)
-    writes = []
-    monkeypatch.setattr(
-        quota, "add_pre_usage", lambda user_id, nbytes: writes.append((user_id, nbytes, threading.get_ident()))
-    )
-    closed = []
-
-    async def main():
-        loop_thread = threading.get_ident()
-        limiter = quota.download_limiter()
-        default = anyio.to_thread.current_default_thread_limiter()
-        tokens = []
-
-        def chunks():
-            tokens.append((limiter.borrowed_tokens, default.borrowed_tokens, threading.get_ident()))
-            yield b"x" * (2 * quota.THROTTLE_PIECE)
-
-        got = []
-
-        async def consume():
-            async for piece in quota.metered("u-cancel", chunks(), close=lambda: closed.append(True)):
-                got.append(piece)
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(consume)
-            with anyio.fail_after(5):
-                while not got:
-                    await anyio.sleep(0.01)
-            # 두 번째 조각은 감속 대기(약 0.26초) 중. 여기서 취소합니다(연결 끊김).
-            await anyio.sleep(0.05)
-            tg.cancel_scope.cancel()
-        return loop_thread, tokens, got
-
-    loop_thread, tokens, got = anyio.run(main)
-    assert tokens == [(1, 0, tokens[0][2])] and tokens[0][2] != loop_thread
-    assert len(got) == 1
-    assert closed == [True]
-    assert [(u, n) for u, n, _ in writes] == [("u-cancel", quota.THROTTLE_PIECE)]
-    assert writes[0][2] != loop_thread
-
-
-# ---- 티켓당 받을 수 있는 양(#35) ----
-
-def song_size(song_id=1):
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT size FROM song WHERE id = %s", (song_id,))
-        return cur.fetchone()[0]
-
-
-def test_ticket_covers_three_downloads(tmp_path, client, monkeypatch):
-    key, _ = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-    h = bearer(key)
-    for _ in range(quota.PLAYS_PER_TICKET):
-        assert client.get("/api/play/song/1", headers=h).status_code == 200
-    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 4
-    # 네 번째는 티켓을 다시 씁니다.
-    assert client.get("/api/play/song/1", headers=h).status_code == 200
-    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 3
-
-
-def test_ticket_counts_range_bytes(tmp_path, client, monkeypatch):
-    """이어받기·부분 요청은 받은 바이트만큼만 셉니다."""
-    key, _ = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-    h = bearer(key)
-    half = song_size() // 2
-    ranges = [f"bytes=0-{half - 1}", f"bytes={half}-"] * quota.PLAYS_PER_TICKET
-    for rng in ranges:
-        assert client.get("/api/play/song/1", headers={**h, "Range": rng}).status_code == 206
-    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 4
-    assert client.get("/api/play/song/1", headers={**h, "Range": "bytes=0-0"}).status_code == 206
-    assert client.get("/api/me", headers=h).json()["tickets"]["available"] == 3
-
-
-def test_ticket_budget_exhausted_without_tickets(tmp_path, client, monkeypatch):
-    key, user_id = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-    size = song_size()
-    for _ in range(quota.PLAYS_PER_TICKET):
-        quota.charge_play(user_id, 1, size, size)
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("UPDATE user_ticket SET tickets = 0")
-        con.commit()
-    try:
-        quota.charge_play(user_id, 1, 1, size)
-        assert False, "NoTicket expected"
-    except quota.NoTicket:
-        pass
-
-
-def test_unsent_bytes_are_refunded(tmp_path, client, monkeypatch):
-    """끊긴 다운로드는 보내지 못한 만큼을 되돌려 이어받기가 티켓을 더 쓰지 않습니다."""
+def test_disconnect_closes_file(tmp_path, client, monkeypatch):
+    """본문을 보내다 끊기면 열어 둔 저장소 파일을 닫습니다."""
     from starlette.requests import Request
 
-    from ebms_server import downloads
+    from ebms_server import db as db_mod
 
-    _, user_id = client_login(client, monkeypatch)
     add_songs(tmp_path, 1)
-    size = song_size()
+    closed = []
+    real_close = db_mod.StoreFile.close
 
-    def charge(nbytes, total):
-        quota.charge_play(user_id, 1, nbytes, total)
-        return lambda unsent: quota.refund_play(user_id, 1, unsent)
+    def close(self):
+        closed.append(self._fd is not None)
+        real_close(self)
 
+    monkeypatch.setattr(db_mod.StoreFile, "close", close)
     request = Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
-    for fail_at in (0, 1):  # 0: 본문 시작 전, 1: 첫 조각에서 끊김
-        _serve(downloads.blob_response(request, "song", 1, "1.zip", "x", before_send=charge), fail_at)
-        with db_module.connect() as con, con.cursor() as cur:
-            cur.execute("SELECT bytes_used FROM download_grant WHERE user_id = %s", (user_id,))
-            assert cur.fetchone()[0] == 0, fail_at
+    _serve(downloads.file_response(request, "song", 1, "1.zip", "x"), fail_at=1)
+    assert True in closed

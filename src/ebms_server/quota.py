@@ -2,25 +2,14 @@
 
 - 플레이 다운로드(/api/play/*)는 곡 1개당 티켓 1개를 씁니다. 티켓은 타이머 없이 요청 때
   `min(최대, 저장값 + 경과초 / 리필초)`로 계산합니다. 차감한 곡은 grant_seconds 동안 다시 차감하지 않습니다.
-  단, 티켓 하나로 받을 수 있는 양은 곡 크기 × PLAYS_PER_TICKET 바이트까지이고, 넘으면 티켓을 다시 씁니다(#35).
-- 사전 다운로드(/api/pre/*)는 실제 전송한 바이트를 월별로 더하고, 한도를 넘으면 끊지 않고 감속합니다.
-  감속 상태는 프로세스 메모리에 둡니다(워커 1개 전제).
+- 사전 다운로드(/api/pre/*)는 요청 때 보낼 바이트를 월별로 더하고, 한도를 넘었으면 끊지 않고 감속합니다(연결 단위).
 
 수치는 setting 테이블의 전역 기본값을 쓰고, user 테이블의 같은 이름 컬럼이 NULL이 아니면 그 값이 우선합니다.
 """
-import asyncio
 import datetime
-import logging
 import math
-import threading
 import time
-from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
-
-import anyio
-import anyio.to_thread
-from anyio.lowlevel import RunVar
-from fastapi.concurrency import run_in_threadpool
 
 from . import constant, db
 
@@ -37,52 +26,6 @@ MINIMUMS = {
 # 정수 컬럼 범위를 넘지 않도록
 MAXIMUMS = {name: 2 ** 31 - 1 for name in MINIMUMS} | {"pre_monthly_bytes": 2 ** 62}
 KST = datetime.timezone(datetime.timedelta(hours=9))
-# 사용량을 DB에 반영하는 간격(바이트). 다운로드가 끝나거나 끊길 때도 반영합니다.
-USAGE_FLUSH_BYTES = 8 * 1024 * 1024
-# 감속할 때 한 번에 보내는 크기
-THROTTLE_PIECE = 16 * 1024
-# 티켓 하나로 같은 곡을 받을 수 있는 횟수(곡 크기 기준 바이트 합계로 셉니다. 이어받기는 받은 만큼만 셈)
-PLAYS_PER_TICKET = 3
-# 사용자당 최대 동시 다운로드 수
-MAX_CONCURRENT_DOWNLOADS_PER_USER = 10
-
-
-class ConcurrentDownloadTracker:
-    """사용자별 동시 다운로드 수 제한."""
-
-    def __init__(self, limit: int = MAX_CONCURRENT_DOWNLOADS_PER_USER):
-        self.limit = limit
-        self._counts: dict[str, int] = {}
-        self._lock = threading.Lock()
-
-    def acquire(self, user_id: str) -> bool:
-        """다운로드 슬롯을 얻습니다. 한도를 초과하면 False."""
-        with self._lock:
-            current = self._counts.get(user_id, 0)
-            if current >= self.limit:
-                return False
-            self._counts[user_id] = current + 1
-            return True
-
-    def release(self, user_id: str) -> None:
-        """다운로드 슬롯을 반납합니다."""
-        with self._lock:
-            current = self._counts.get(user_id, 0)
-            if current <= 1:
-                self._counts.pop(user_id, None)
-            else:
-                self._counts[user_id] = current - 1
-
-
-_download_tracker = ConcurrentDownloadTracker()
-
-
-def acquire_download_slot(user_id: str) -> bool:
-    return _download_tracker.acquire(user_id)
-
-
-def release_download_slot(user_id: str) -> None:
-    _download_tracker.release(user_id)
 
 
 def validate(name: str, value) -> int:
@@ -242,13 +185,9 @@ class NoTicket(Exception):
         self.retry_after = retry_after
 
 
-def charge_play(user_id: str, song_id: int, nbytes: int = 0, size: int = 0) -> bool:
+def charge_play(user_id: str, song_id: int) -> bool:
     """곡 플레이 다운로드에 티켓 1개를 씁니다. 유효한 grant가 있으면 차감하지 않습니다.
-
-    nbytes: 이번 요청으로 보낼 바이트, size: 곡 전체 크기. grant 안에서 받은 바이트가
-    size × PLAYS_PER_TICKET를 넘게 되면 grant가 끝난 것으로 보고 티켓을 다시 씁니다.
-    반환값: 이번에 차감했으면 True, grant 안이라 차감하지 않았으면 False. 티켓이 없으면 NoTicket.
-    """
+    반환값: 이번에 차감했으면 True, grant 안이라 차감하지 않았으면 False. 티켓이 없으면 NoTicket."""
     limits = limits_for(user_id)
     # updated_at이 정수 컬럼이므로 시각도 정수로 맞춥니다(소수점 버림으로 티켓이 더 차지 않게).
     now = int(time.time())
@@ -260,20 +199,14 @@ def charge_play(user_id: str, song_id: int, nbytes: int = 0, size: int = 0) -> b
             cur.execute("SELECT tickets, updated_at FROM user_ticket WHERE user_id = %s FOR UPDATE", (user_id,))
             row = cur.fetchone()
             cur.execute(
-                "SELECT expires_at, bytes_used FROM download_grant WHERE user_id = %s AND song_id = %s",
-                (user_id, song_id),
+                "SELECT expires_at FROM download_grant WHERE user_id = %s AND song_id = %s", (user_id, song_id)
             )
             grant = cur.fetchone()
-            charged = grant is None or grant[0] <= now or grant[1] + nbytes > size * PLAYS_PER_TICKET
+            charged = grant is None or grant[0] <= now
             tickets = _current_tickets(row, limits, now)
-            if not charged:
-                cur.execute(
-                    "UPDATE download_grant SET bytes_used = bytes_used + %s WHERE user_id = %s AND song_id = %s",
-                    (nbytes, user_id, song_id),
-                )
-            elif tickets < 1:
+            if charged and tickets < 1:
                 retry_after = _state(tickets, limits, now).retry_after(now)
-            else:
+            elif charged:
                 cur.execute(
                     "UPDATE user_ticket SET tickets = %s, updated_at = %s WHERE user_id = %s",
                     (tickets - 1, now, user_id),
@@ -281,15 +214,13 @@ def charge_play(user_id: str, song_id: int, nbytes: int = 0, size: int = 0) -> b
                 # 위에서 행 유무를 이미 봤으므로 UPDATE/INSERT 중 하나만 합니다(없는 행 DELETE의 gap lock으로 인한 데드락 방지).
                 if grant is None:
                     cur.execute(
-                        "INSERT INTO download_grant (user_id, song_id, charged_at, expires_at, bytes_used)"
-                        " VALUES (%s, %s, %s, %s, %s)",
-                        (user_id, song_id, now, now + limits.grant_seconds, nbytes),
+                        "INSERT INTO download_grant (user_id, song_id, charged_at, expires_at) VALUES (%s, %s, %s, %s)",
+                        (user_id, song_id, now, now + limits.grant_seconds),
                     )
                 else:
                     cur.execute(
-                        "UPDATE download_grant SET charged_at = %s, expires_at = %s, bytes_used = %s"
-                        " WHERE user_id = %s AND song_id = %s",
-                        (now, now + limits.grant_seconds, nbytes, user_id, song_id),
+                        "UPDATE download_grant SET charged_at = %s, expires_at = %s WHERE user_id = %s AND song_id = %s",
+                        (now, now + limits.grant_seconds, user_id, song_id),
                     )
             con.commit()
         except Exception:
@@ -298,19 +229,6 @@ def charge_play(user_id: str, song_id: int, nbytes: int = 0, size: int = 0) -> b
     if retry_after is not None:
         raise NoTicket(retry_after)
     return charged
-
-
-def refund_play(user_id: str, song_id: int, nbytes: int) -> None:
-    """charge_play에서 셈한 바이트 중 보내지 못한 만큼을 되돌립니다(연결이 중간에 끊긴 경우)."""
-    if nbytes <= 0:
-        return
-    with db.connect() as con, con.cursor() as cur:
-        cur.execute(
-            "UPDATE download_grant SET bytes_used = IF(bytes_used > %s, bytes_used - %s, 0)"
-            " WHERE user_id = %s AND song_id = %s",
-            (nbytes, nbytes, user_id, song_id),
-        )
-        con.commit()
 
 
 def refill_tickets(user_id: str) -> None:
@@ -360,96 +278,13 @@ def add_pre_usage(user_id: str, nbytes: int) -> None:
         con.commit()
 
 
-class Throttle:
-    """사용자별 토큰 버킷. 같은 사용자의 동시 요청이 하나의 속도를 나눠 씁니다."""
-
-    _buckets: dict[str, "Throttle"] = {}
-    _lock = threading.Lock()
-
-    def __init__(self):
-        self._available_at = 0.0
-        self._lock = threading.Lock()
-
-    @classmethod
-    def for_user(cls, user_id: str) -> "Throttle":
-        with cls._lock:
-            bucket = cls._buckets.get(user_id)
-            if bucket is None:
-                bucket = cls._buckets[user_id] = Throttle()
-            return bucket
-
-    def reserve(self, nbytes: int, bytes_per_second: float) -> float:
-        """nbytes를 보내기 전에 기다릴 초를 반환합니다."""
-        with self._lock:
-            now = time.monotonic()
-            start = max(now, self._available_at)
-            self._available_at = start + nbytes / bytes_per_second
-            return start - now
-
-
-# 이벤트 루프마다 하나씩 둡니다(테스트처럼 루프가 여러 번 만들어져도 섞이지 않게).
-_download_limiter: RunVar[anyio.CapacityLimiter] = RunVar("download_limiter")
-
-
-def download_limiter() -> anyio.CapacityLimiter:
-    """다운로드 본문 읽기 전용 스레드 한도(constant.DOWNLOAD_THREADS)."""
-    try:
-        return _download_limiter.get()
-    except LookupError:
-        limiter = anyio.CapacityLimiter(constant.DOWNLOAD_THREADS)
-        _download_limiter.set(limiter)
-        return limiter
-
-
-async def next_download_chunk(chunks: Iterator[bytes]) -> bytes | None:
-    """동기 iterator(DB 읽기)에서 다음 조각을 다운로드 전용 스레드 한도 안에서 꺼냅니다. 끝이면 None.
-
-    큰 곡을 동시에 많이 받아 스레드가 느린 BLOB 읽기에 묶여도 기본 스레드 한도를 쓰는 API·로그인은 기다리지 않습니다(#41).
-    """
-    return await anyio.to_thread.run_sync(next, chunks, None, limiter=download_limiter())
-
-
-async def metered(user_id: str, chunks: Iterator[bytes], close=None) -> AsyncIterator[bytes]:
-    """사전 다운로드 응답 본문. 보낸 바이트를 이번 달 사용량에 더하고, 한도를 넘으면 감속합니다.
-
-    chunks는 동기 iterator(DB 읽기)라 다운로드 전용 스레드 한도 안에서 꺼내고, 감속 대기는 스레드를 붙잡지 않습니다.
-    """
-    pending = 0
-    try:
-        # 한도 조회도 try 안에서 합니다. 여기서 취소되거나 DB 오류가 나도 close()가 불려야 합니다.
-        limits = await run_in_threadpool(limits_for, user_id)
-        used = await run_in_threadpool(pre_used, user_id)
-        rate = limits.pre_throttled_kbps * 1000 / 8
-        bucket = Throttle.for_user(user_id)
-        while True:
-            chunk = await next_download_chunk(chunks)
-            if chunk is None:
-                break
-            throttled = used >= limits.pre_monthly_bytes
-            pieces = [chunk[i:i + THROTTLE_PIECE] for i in range(0, len(chunk), THROTTLE_PIECE)] if throttled else [chunk]
-            for piece in pieces:
-                if throttled:
-                    delay = bucket.reserve(len(piece), rate)
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                yield piece
-                used += len(piece)
-                pending += len(piece)
-            if pending >= USAGE_FLUSH_BYTES:
-                await run_in_threadpool(add_pre_usage, user_id, pending)
-                pending = 0
-    finally:
-        try:
-            if close is not None:
-                close()
-        finally:
-            if pending:
-                # 연결이 끊겨 취소된 경우에도 반영되도록 취소를 막고, 이벤트 루프를 멈추지 않도록 스레드에서 씁니다.
-                with anyio.CancelScope(shield=True):
-                    try:
-                        await run_in_threadpool(add_pre_usage, user_id, pending)
-                    except Exception:
-                        logging.getLogger(__name__).exception(f"add_pre_usage failed: lost {pending} bytes of {user_id}")
+def meter_pre(user_id: str, nbytes: int) -> int | None:
+    """사전 다운로드로 보낼 nbytes를 이번 달 사용량에 더합니다. 더하기 전에 이미 한도를 넘었으면 감속할 속도(바이트/초),
+    아니면 None. 요청 때 미리 더하므로 중간에 끊긴 다운로드도 다 받은 것으로 셉니다."""
+    limits = limits_for(user_id)
+    used = pre_used(user_id)
+    add_pre_usage(user_id, nbytes)
+    return limits.pre_throttled_kbps * 1000 // 8 if used >= limits.pre_monthly_bytes else None
 
 
 def pre_state(user_id: str, limits: Limits | None = None) -> dict:

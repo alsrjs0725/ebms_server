@@ -132,17 +132,15 @@ def test_deleted_song_is_gone(tmp_path, client, monkeypatch):
     assert state.available == state.max_tickets
 
 
-def test_authz_play_counts_requested_bytes_per_ticket(tmp_path, client, monkeypatch):
-    """티켓 하나로 곡 크기 × PLAYS_PER_TICKET 바이트까지 받고, Range는 요청한 길이만 셉니다."""
+def test_authz_play_charges_once_per_grant(tmp_path, client, monkeypatch):
+    """grant 안에서는 몇 번을 받아도(Range 포함) 티켓 하나만 쓰고, 만족할 수 없는 범위는 차감하지 않습니다."""
     monkeypatch.setattr(constant, "PROXY_SECRET", SECRET)
     key, user_id = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
+    add_songs(tmp_path, 2)
     h = bearer(key)
-    _, size = song_sha(1)
-    assert authz(client, "/api/play/song/1", {**h, "Range": "bytes=0-0"}).status_code == 204
-    for _ in range(quota.PLAYS_PER_TICKET - 1):
-        assert authz(client, "/api/play/song/1", h).status_code == 204
-    assert authz(client, "/api/play/song/1", {**h, "Range": f"bytes=1-{size - 1}"}).status_code == 204
+    _, size = song_sha(2)
+    assert authz(client, "/api/play/song/2", {**h, "Range": f"bytes={size}-"}).status_code == 204
+    assert quota.ticket_state(user_id).available == 5
+    for headers in ({**h, "Range": "bytes=0-0"}, h, h, {**h, "Range": f"bytes=1-{size - 1}"}):
+        assert authz(client, "/api/play/song/1", headers).status_code == 204
     assert quota.ticket_state(user_id).available == 4
-    assert authz(client, "/api/play/song/1", {**h, "Range": "bytes=0-0"}).status_code == 204
-    assert quota.ticket_state(user_id).available == 3

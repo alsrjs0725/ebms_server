@@ -19,7 +19,6 @@ RESULTS = {
     "charged": "받음(티켓 차감)",
     "free": "받음(재차감 면제)",
     "no_ticket": "티켓 없음",
-    "busy": "동시 다운로드 초과",
     "not_found": "없는 곡",
     "deleted": "지운 곡",
 }
@@ -35,15 +34,9 @@ def is_resume(request: Request) -> bool:
     return first.isdigit() and int(first) > 0
 
 
-def failure_result(status: int, detail: str) -> str | None:
+def failure_result(status: int) -> str | None:
     """다운로드를 거절한 HTTP 상태를 기록할 결과로 바꿉니다. 기록하지 않을 거절이면 None."""
-    if status == 404:
-        return "not_found"
-    if status == 410:
-        return "deleted"
-    if status == 429 and detail == "too many concurrent downloads":
-        return "busy"
-    return None
+    return {404: "not_found", 410: "deleted"}.get(status)
 
 
 def record(user_id: str, song_id: int, result: str, resumed: bool = False) -> None:
