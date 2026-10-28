@@ -172,32 +172,12 @@ EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
 
 큰 zip은 조각으로 나눠 올리므로 앞단 리버스 프록시의 요청 크기 제한을 바꾸지 않아도 됩니다. 서버(`var` 볼륨)에 zip 크기 + 2GB의 여유 공간이 필요합니다.
 
-## 이전 버전 데이터 마이그레이션
+## 이전 버전에서 올리기
 
-서버가 시작할 때 없는 컬럼을 추가하고 기존 곡의 매니페스트를 채웁니다. 차트 청크의 항목 이름 변경은 한 번 직접 실행합니다 (청크 해시가 바뀌어 클라이언트가 다시 받습니다).
+서버가 시작할 때 없는 테이블·컬럼을 만들고, 이전 버전에서 넣은 곡의 사전 청크를 뒤에서 만듭니다.
 
-```bash
-docker compose exec ebms python -m ebms_server.migrate
-```
+곡 zip·청크를 MySQL BLOB(`song_part`, `chart_chunk.data`, `pre_chunk_part`)에 두던 버전(#152 이전)에서는 바로 올릴 수 없습니다. 저장소 파일로 옮기는 버전(`ghcr.io/alsrjs0725/ebms_server:sha-72754848c22a24e0446692f4cc4f756bf4fa0ee2`)으로 먼저 올리고, 로그에 `migrate_to_store: Reclaimed disk space of song BLOBs.`가 나온 뒤 올리세요. 옮기지 않은 행이 있으면 서버가 시작하지 않습니다. 다 옮긴 DB면 시작할 때 남은 BLOB 테이블·컬럼을 지웁니다.
 
-### DB BLOB을 저장소 파일로 옮기기 (#152)
+아무 행도 가리키지 않는 저장소 파일(지운 곡, 바뀌기 전 청크, 커밋하지 못한 파일)은 `EBMS_STORE_GC_HOURS`(기본 1)마다 지웁니다.
 
-이전 버전은 곡 zip·청크를 MySQL BLOB(`song_part`, `chart_chunk.data`, `pre_chunk_part`)에 두었습니다. 이 버전으로 올리면 서버가 켜진 채로 백그라운드에서 하나씩 저장소 파일로 옮깁니다. 옮기기 전 것은 그대로 DB에서 받으므로 서비스는 멈추지 않습니다.
-
-- **속도**: 하나 옮길 때마다 일한 시간의 `EBMS_STORE_MIGRATE_REST_RATIO`배(기본 3, 디스크 사용 약 25%)만큼 쉬고, 곡 임포트가 쓰기 잠금을 잡고 있으면 기다립니다. `EBMS_STORE_MIGRATE=0`이면 옮기지 않습니다.
-- **순서와 공간 회수**: 사전 청크 → 차트 청크 → 곡 순서로 옮기고, 테이블 하나를 다 옮기면 그 BLOB 공간을 디스크에 돌려줍니다(`pre_chunk_part`·`song_part`는 `TRUNCATE`, `chart_chunk`·`song`은 BLOB을 비운 뒤라 빠르게 끝나는 `OPTIMIZE`). InnoDB는 행을 지워도 파일을 줄이지 않으므로 그 전까지는 공간이 돌아오지 않습니다. 곡 수십 개마다 `OPTIMIZE`하는 것은 남은 테이블 전체를 매번 다시 쓰고 복사본 공간도 필요해서 하지 않습니다.
-- **필요한 여유 공간**: 가장 큰 테이블(보통 `song_part`) 크기 + `EBMS_STORE_MIN_FREE`(기본 20G). 모자라면 옮기기를 멈추고 10분마다 다시 확인합니다(로그 `migrate_to_store: Paused`). 크기는 다음으로 확인합니다.
-
-  ```sql
-  SELECT table_name, ROUND((data_length + index_length) / 1024 / 1024 / 1024, 1) AS gb
-  FROM information_schema.tables WHERE table_schema = 'ebms' ORDER BY gb DESC;
-  ```
-- **진행도**: 로그의 `migrate_to_store(song): 1234/56789 (2%, ...)`. 도중에 꺼져도 다음 시작 때 남은 것부터 이어서 합니다.
-- **정리**: 아무 행도 가리키지 않는 저장소 파일(지운 곡, 바뀌기 전 청크, 커밋하지 못한 파일)은 `EBMS_STORE_GC_HOURS`(기본 1)마다 지웁니다.
-
-### 청크 크기 변경
-
-차트 청크(`CHARTS_PER_CHUNK`, 100개)나 사전 청크(`SONGS_PER_PRE_CHUNK`, 8곡) 크기가 바뀐 버전으로 올리면, 서버가 시작한 뒤 백그라운드에서 기존 청크를 다시 묶습니다. 클라이언트는 바뀐 청크를 한 번 모두 다시 받습니다.
-
-- 차트 청크: 기존 마지막 번호 뒤에 새 크기로 다시 쓴 뒤 옛 청크를 지웁니다. 그동안 클라이언트는 차트를 중복으로 볼 수는 있어도 빠뜨리지는 않습니다. 작업 중에는 곡 임포트가 기다리며, 도중에 꺼지면 다음 시작 때 이어서 합니다(`setting`의 `chart_rechunk_*`).
-- 사전 청크: 기존 청크를 지우고 새 크기로 다시 만듭니다. 다 만들기 전에는 클라이언트가 없는 청크 대신 파일 단위로 받습니다.
+차트 청크 크기(`CHARTS_PER_CHUNK`)·매니페스트 청크 크기(`SONGS_PER_MANIFEST_CHUNK`)나 pre/play 판정 규칙을 바꿔도 서버가 기존 데이터를 자동으로 다시 만들지 않습니다. 바꿀 때는 기존 청크·매니페스트를 다시 만드는 스크립트를 함께 준비합니다.

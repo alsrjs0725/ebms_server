@@ -27,7 +27,7 @@ from starlette.types import Receive, Scope, Send
 from . import constant, download_log, proxy, quota
 from .accounts import User
 from .auth import current_user, optional_api_session
-from .db import BlobReader, Database
+from .db import StoreFile, Database
 
 router = APIRouter()
 
@@ -218,7 +218,7 @@ def blob_response(
     release = _once(lambda: quota.release_download_slot(user_id) if user_id else None)
 
     try:
-        blob = Database().open_blob(table, row_id)
+        blob = Database().open_file(table, row_id)
         if blob is None:
             if table == "song":
                 status, detail = proxy.missing_song(row_id)
@@ -373,7 +373,7 @@ def pre_manifest(chunk_id: int, request: Request, user: Annotated[User, Depends(
     return manifest_response(request, chunk_id, meter_user=user.id)
 
 
-def _zip_member(blob: BlobReader, entry: dict) -> tuple[int, object]:
+def _zip_member(blob: StoreFile, entry: dict) -> tuple[int, object]:
     """곡 zip에서 항목 데이터가 시작하는 위치와 압축 해제기를 구합니다."""
     if entry["method"] == zipfile.ZIP_STORED:
         decompressor = None
@@ -392,11 +392,11 @@ def _zip_member(blob: BlobReader, entry: dict) -> tuple[int, object]:
     return entry["offset"] + 30 + name_len + extra_len, decompressor
 
 
-def _iter_member(blob: BlobReader, start: int, comp_size: int, decompressor):
+def _iter_member(blob: StoreFile, start: int, comp_size: int, decompressor):
     try:
         pos, end = start, start + comp_size
         while pos < end:
-            n = min(constant.BLOB_READ_SIZE, end - pos)
+            n = min(constant.READ_SIZE, end - pos)
             raw = blob.read(pos, n)
             pos += n
             out = decompressor.decompress(raw) if decompressor else raw
@@ -438,7 +438,7 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
             release()
             return Response(status_code=304, headers=headers)
 
-        blob = Database().open_blob("song", song_id)
+        blob = Database().open_file("song", song_id)
         if blob is None:
             status, detail = proxy.missing_song(song_id)
             raise HTTPException(status_code=status, detail=detail)

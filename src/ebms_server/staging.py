@@ -155,7 +155,7 @@ def _extract(pack: pathlib.Path, out: pathlib.Path) -> None:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as fin, open(target, "wb") as fout:
-                shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
+                shutil.copyfileobj(fin, fout, constant.READ_SIZE)
 
 
 def _unpack(stage: dict, unit: dict, work: pathlib.Path) -> pathlib.Path:
@@ -641,7 +641,7 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
                         with zf.open(info) as fin, pack.open(
                             "/".join(rel), "w", force_zip64=info.file_size >= zipfile.ZIP64_LIMIT
                         ) as fout:
-                            shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
+                            shutil.copyfileobj(fin, fout, constant.READ_SIZE)
             except Exception as e:
                 logger.exception(f"staging failed[{filename}:{folder}]")
                 shutil.rmtree(work, ignore_errors=True)

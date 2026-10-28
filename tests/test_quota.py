@@ -1,7 +1,6 @@
 """사전/플레이 다운로드, 티켓, 월 사용량·감속, 관리자 설정 테스트."""
 import datetime
 import io
-import json
 import os
 import threading
 import time
@@ -129,73 +128,9 @@ def test_file_kinds_strict_rules(tmp_path):
         }
 
 
-def test_backfill_file_kinds_recomputes_old_rules(tmp_path, client, monkeypatch):
-    """이전 규칙으로 판정한 곡은 시작할 때 다시 판정하고, 사전 청크도 새 규칙으로 다시 만듭니다 (#36)"""
+def test_manifest_kind(tmp_path, client, monkeypatch):
     key, _ = client_login(client, monkeypatch)
     add_songs(tmp_path, 1)
-    db = Database()
-    db.backfill_pre_chunks()
-    # 이전 규칙: 키음·BGA도 pre로 판정돼 있던 상태
-    with db_module.connect() as con, con.cursor() as cur:
-        files = db.get_song_files(1)
-        cur.execute(
-            "UPDATE song SET files = %s WHERE id = 1",
-            (json.dumps([{**e, "kind": "pre"} for e in files]),),
-        )
-        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
-        con.commit()
-    with db_module.connect() as con, con.cursor() as cur:
-        db._rebuild_pre_chunk(cur, 0)
-        con.commit()
-    h = bearer(key)
-    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 200
-
-    assert db.backfill_file_kinds() == 1
-    assert {p: f["kind"] for p, f in manifest_files(client, key).items()} == EXPECTED_KINDS
-    assert client.get("/api/pre/song/1/file", params={"path": "sound.wav"}, headers=h).status_code == 403
-    # 사전 청크는 지워졌다가 뒤에서 새 규칙으로 다시 만들어짐
-    assert db.get_pre_chunk_hash() == {}
-    assert db.backfill_pre_chunks() == 1
-    asset = client.get("/api/pre/asset/0", headers=h)
-    with zipfile.ZipFile(io.BytesIO(asset.content)) as zf:
-        assert sorted(zf.namelist()) == ["1/banner.jpg", "1/preview_auto.ogg", "1/sub/PV.wav", "1/ステージ.bmp"]
-    # 버전을 기록했으므로 다음 시작 때는 다시 하지 않음
-    assert db.backfill_file_kinds() == 0
-
-
-def test_backfill_file_kinds_skips_broken_song(tmp_path, client, monkeypatch):
-    """판정하지 못한 곡은 건너뛰고 다른 곡은 고치며, 버전은 올리지 않아 다음에 다시 시도합니다 (#36)"""
-    add_songs(tmp_path, 2)
-    db = Database()
-    with db_module.connect() as con, con.cursor() as cur:
-        for song_id in (1, 2):
-            files = db.get_song_files(song_id)
-            if song_id == 1:
-                files = [{**e, "crc32": "00000000"} if e["path"] == "a.bms" else e for e in files]
-            cur.execute(
-                "UPDATE song SET files = %s WHERE id = %s",
-                (json.dumps([{**e, "kind": "pre"} for e in files]), song_id),
-            )
-        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
-        con.commit()
-    assert db.backfill_file_kinds() == 1
-    assert {e["path"]: e["kind"] for e in db.get_song_files(2)} == EXPECTED_KINDS
-    assert {e["kind"] for e in db.get_song_files(1)} == {"pre"}
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT value FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
-        assert cur.fetchone() is None
-
-
-def test_manifest_kind_and_backfill(tmp_path, client, monkeypatch):
-    key, _ = client_login(client, monkeypatch)
-    add_songs(tmp_path, 1)
-    assert {p: f["kind"] for p, f in manifest_files(client, key).items()} == EXPECTED_KINDS
-
-    # 이전 버전에서 넣은 곡(kind 없음)은 시작할 때 다시 채웁니다.
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("UPDATE song SET files = %s", ('[{"path": "a.bms"}]',))
-        con.commit()
-    Database().backfill_manifest()
     assert {p: f["kind"] for p, f in manifest_files(client, key).items()} == EXPECTED_KINDS
 
 
@@ -707,32 +642,6 @@ def test_metered_reads_in_download_limiter_and_writes_usage_off_loop_when_cancel
     assert closed == [True]
     assert [(u, n) for u, n, _ in writes] == [("u-cancel", quota.THROTTLE_PIECE)]
     assert writes[0][2] != loop_thread
-
-
-def test_backfill_file_kinds_resumes_after_restart(tmp_path, client, monkeypatch):
-    """도중에 꺼지면 다음 시작 때 기록한 곡 뒤부터 이어서 판정합니다."""
-    add_songs(tmp_path, 2)
-    db = Database()
-    with db_module.connect() as con, con.cursor() as cur:
-        for song_id in (1, 2):
-            files = db.get_song_files(song_id)
-            cur.execute(
-                "UPDATE song SET files = %s WHERE id = %s",
-                (json.dumps([{**e, "kind": "pre"} for e in files]), song_id),
-            )
-        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.FILE_KINDS_SETTING,))
-        # 곡 1까지 판정하고 꺼진 상태
-        cur.execute(
-            "INSERT INTO setting (name, value) VALUES (%s, %s)",
-            (db_module.FILE_KINDS_PROGRESS_SETTING, f"{db_module.FILE_KINDS_VERSION}:1"),
-        )
-        con.commit()
-    assert db.backfill_file_kinds() == 1
-    assert {e["kind"] for e in db.get_song_files(1)} == {"pre"}
-    assert {e["path"]: e["kind"] for e in db.get_song_files(2)} == EXPECTED_KINDS
-    with db_module.connect() as con, con.cursor() as cur:
-        assert db._setting(cur, db_module.FILE_KINDS_PROGRESS_SETTING) is None
-        assert db._setting(cur, db_module.FILE_KINDS_SETTING) == str(db_module.FILE_KINDS_VERSION)
 
 
 # ---- 티켓당 받을 수 있는 양(#35) ----

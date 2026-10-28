@@ -143,7 +143,7 @@ def _insert(
         logger.exception(f"import failed[{song_dir}]")
         return {"folder": folder, "error": str(e) or type(e).__name__}
     if info is None:
-        return {"folder": folder, "error": "등록하지 못했습니다(곡 크기가 DB 패킷 한도를 넘었을 수 있습니다). 서버 로그를 보세요."}
+        return {"folder": folder, "error": "등록하지 못했습니다(폴더가 없거나 차트 파일이 없습니다). 서버 로그를 보세요."}
     info["folder"] = folder
     return info
 
@@ -280,7 +280,7 @@ def import_zip(path: pathlib.Path, filename: str, job: Job | None = None) -> lis
                     target = song_dir.joinpath(*rel)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info) as fin, open(target, "wb") as fout:
-                        shutil.copyfileobj(fin, fout, constant.BLOB_READ_SIZE)
+                        shutil.copyfileobj(fin, fout, constant.READ_SIZE)
                 # 곡 데이터는 배치 트랜잭션과 메모리에 들어가므로 풀어둔 폴더는 바로 지워도 됩니다.
                 _add(batch, job, song_dir, "/".join((stem, *root)), remove=False)
             except Exception as e:

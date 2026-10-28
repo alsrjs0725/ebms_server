@@ -8,40 +8,13 @@
 """
 import os
 import pathlib
-import shutil
-import threading
 import time
 import uuid
-from contextlib import contextmanager
-from typing import Iterable, Iterator
+from typing import Iterable
 
 from . import constant
 
 TMP_MARK = ".tmp-"
-
-# 쓰기 잠금 밖에서 쓰고 아직 커밋하지 않은 파일(hold). gc가 지우지 않습니다.
-_held: dict[str, int] = {}
-_held_lock = threading.Lock()
-
-
-@contextmanager
-def hold(rel: str) -> Iterator[None]:
-    """with 안에서는 rel을 gc가 지우지 않습니다. 쓰기 잠금 밖에서 파일을 쓰고 나중에 커밋할 때 씁니다."""
-    with _held_lock:
-        _held[rel] = _held.get(rel, 0) + 1
-    try:
-        yield
-    finally:
-        with _held_lock:
-            _held[rel] -= 1
-            if not _held[rel]:
-                del _held[rel]
-
-
-def held() -> set[str]:
-    with _held_lock:
-        return set(_held)
-
 
 def song_path(song_id: int, sha256: str) -> str:
     """곡 zip의 상대 경로. 폴더마다 1000곡."""
@@ -64,7 +37,7 @@ def write(rel: str, data: bytes) -> str:
     """data를 rel에 씁니다. 같은 내용의 파일이 이미 있으면 그대로 둡니다. rel을 반환합니다."""
     path = full_path(rel)
     if path.is_file() and path.stat().st_size == len(data):
-        # 이름에 sha256이 들어 있어 크기가 같으면 같은 내용입니다(예: 롤백 뒤 다시 넣기, 이어서 하는 마이그레이션).
+        # 이름에 sha256이 들어 있어 크기가 같으면 같은 내용입니다(예: 롤백 뒤 다시 넣기).
         return rel
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}{TMP_MARK}{uuid.uuid4().hex}")
@@ -101,14 +74,6 @@ def read(rel: str) -> bytes:
 def read_range(rel: str, start: int, length: int) -> bytes:
     with open(full_path(rel), "rb") as f:
         return os.pread(f.fileno(), length, start)
-
-
-def free_bytes() -> int:
-    """STORE_DIR이 있는 디스크의 남은 공간."""
-    path = constant.STORE_DIR
-    while not path.exists() and path != path.parent:
-        path = path.parent
-    return shutil.disk_usage(path).free
 
 
 def files(older_than: float) -> list[str]:

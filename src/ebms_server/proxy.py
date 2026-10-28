@@ -105,7 +105,7 @@ def authorize(request: Request) -> Response:
         return _deny(401, "login required")
     user = session[0]
 
-    blob = Database().open_blob(table, row_id)
+    blob = Database().open_file(table, row_id)
     if blob is None:
         if table == "song":
             status, detail = missing_song(row_id)

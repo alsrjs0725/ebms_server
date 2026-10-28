@@ -68,52 +68,17 @@ def configure_access_log() -> None:
     access_logger.propagate = False
 
 
-def backfill_pre_chunks() -> None:
-    # pre/play 판정 규칙(FILE_KINDS_VERSION)이 바뀌었으면 기존 곡의 kind를 다시 판정한다. 곡이 많으면 오래 걸리므로
-    # 시작(healthcheck)을 막지 않게 여기서 한다. 그동안은 곡마다 바뀌기 전 규칙의 kind로 나간다.
-    try:
-        Database().backfill_file_kinds()
-    except Exception:
-        logging.getLogger(__name__).exception("backfill_file_kinds failed")
-    # 청크 크기(CHARTS_PER_CHUNK)가 바뀌었으면 차트 청크를 다시 묶는다. 그동안 임포트는 기다린다.
-    try:
-        Database().rechunk_charts()
-    except Exception:
-        logging.getLogger(__name__).exception("rechunk_charts failed")
-    # 매니페스트 청크 크기(SONGS_PER_MANIFEST_CHUNK)가 바뀌었으면 매니페스트 청크를 모두 다시 만든다.
-    try:
-        Database().rechunk_manifest()
-    except Exception:
-        logging.getLogger(__name__).exception("rechunk_manifest failed")
-    # .bmson처럼 나중에 차트 확장자에 더한 파일을 기존 곡에서 차트로 등록한다. 등록 전에는 곡 zip에서만 받는다.
-    try:
-        Database().backfill_chart_formats()
-    except Exception:
-        logging.getLogger(__name__).exception("backfill_chart_formats failed")
+def background_startup() -> None:
+    """시작(healthcheck)을 막지 않게 뒤에서 하는 일. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받습니다."""
+    # 곡은 있는데 사전 청크가 없거나 든 곡이 바뀐 사전 청크를 다시 만든다(이전 버전에서 넣은 곡, 도중에 꺼진 작업).
     try:
         Database().backfill_pre_chunks()
     except Exception:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
     # 사전 청크에 난이도표 조합이 섞인 곡을 조합이 같은 청크로 조금씩 옮긴다(이전 버전에서 넣은 곡, 바뀐 난이도표).
     pre_rebalance.kick()
-    # 난이도표는 차트를 md5로 가리킵니다. 다 채우기 전에는 sha256을 주는 표만 맞습니다.
-    try:
-        Database().backfill_chart_md5()
-    except Exception:
-        logging.getLogger(__name__).exception("backfill_chart_md5 failed")
-    # 검토 대기 곡의 비슷한 곡 후보는 차트의 이름·작곡가·BPM·장르 키로 찾습니다. 다 채우기 전에는 새로 넣은 곡만 후보가 됩니다.
-    try:
-        Database().backfill_chart_meta()
-    except Exception:
-        logging.getLogger(__name__).exception("backfill_chart_meta failed")
     # 미리듣기 음원이 없는 곡의 미리듣기를 만든다. 곡마다 키음을 풀어 섞으므로 오래 걸린다.
     preview.kick()
-    # DB BLOB에 남은 곡·청크를 저장소 파일로 천천히 옮긴다(#152). 디스크를 서비스에 양보하며 하나씩 옮긴다.
-    if constant.STORE_MIGRATE_ENABLED:
-        try:
-            Database().migrate_to_store()
-        except Exception:
-            logging.getLogger(__name__).exception("migrate_to_store failed")
 
 
 def store_gc_loop(stop: threading.Event) -> None:
@@ -187,8 +152,7 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info("DB is now loading...")
     Database()
     logging.getLogger(__name__).info("DB is loaded.")
-    # 이전 버전에서 넣은 곡의 사전 청크는 시간이 걸리므로 뒤에서 만든다. 다 만들기 전에는 클라이언트가 파일별 사전 API로 받는다.
-    threading.Thread(target=backfill_pre_chunks, name="backfill_pre_chunks", daemon=True).start()
+    threading.Thread(target=background_startup, name="background_startup", daemon=True).start()
     store_stop = threading.Event()
     if constant.STORE_GC_HOURS > 0:
         threading.Thread(target=store_gc_loop, args=(store_stop,), name="store_gc", daemon=True).start()

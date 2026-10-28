@@ -72,7 +72,7 @@ def test_authz_pre_meters_requested_bytes(tmp_path, client, monkeypatch):
     key, user_id = client_login(client, monkeypatch)
     add_songs(tmp_path, 1)
     h = bearer(key)
-    blob = Database().open_blob("chart_chunk", 0)
+    blob = Database().open_file("chart_chunk", 0)
 
     assert authz(client, "/api/pre/chart/0", h).headers["x-ebms-sha256"] == blob.sha256
     assert quota.pre_used(user_id) == blob.size

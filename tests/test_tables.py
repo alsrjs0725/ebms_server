@@ -189,23 +189,13 @@ def test_register_and_chunk_tags(client, monkeypatch):
     assert client.get("/api/pre/tables").json()["chunks"] == {"0": [other["id"]]}
 
 
-def test_backfill_chart_md5(client, monkeypatch):
+def test_chart_md5_recorded(client, monkeypatch):
     admin_login(client, monkeypatch)
     upload(client, "a.zip", make_zip({"x.bms": A}))
     upload(client, "b.zip", make_zip({"y.bms": B}))
-    database = db_module.Database()
     with db_module.connect() as con, con.cursor() as cur:
         cur.execute("SELECT id, md5 FROM chart ORDER BY song_id")
         assert cur.fetchall() == ((sha256(A), md5(A)), (sha256(B), md5(B)))
-        # 이전 버전에서 넣은 차트, 어느 청크에도 없는 차트
-        cur.execute("UPDATE chart SET md5 = NULL")
-        cur.execute("INSERT INTO chart (id, song_id, size, filename) VALUES (%s, NULL, 1, 'z.bms')", ("e" * 64,))
-        con.commit()
-    assert database.backfill_chart_md5() == 2
-    with db_module.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT id, md5 FROM chart ORDER BY id")
-        assert dict(cur.fetchall()) == {sha256(A): md5(A), sha256(B): md5(B), "e" * 64: ""}
-    assert database.backfill_chart_md5() == 0
 
 
 class FakeResponse:

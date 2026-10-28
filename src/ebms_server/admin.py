@@ -498,7 +498,7 @@ def download_song_file(song_id: int, path: str, admin: Annotated[User, Depends(w
     entry = next((f for f in files if f["path"] == path), None)
     if entry is None:
         raise HTTPException(status_code=404, detail="file not found")
-    blob = db.Database().open_blob("song", song_id)
+    blob = db.Database().open_file("song", song_id)
     if blob is None:
         raise HTTPException(status_code=404, detail="song not found")
     try:
