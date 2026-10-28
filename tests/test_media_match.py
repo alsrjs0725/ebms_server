@@ -47,9 +47,11 @@ def test_same_sound_math():
     rate = media_match.SOUND_RATE
     t = np.arange(rate) / rate
     a = np.sin(2 * np.pi * 440 * t).astype(np.float32)
-    # 음량만 다르고 인코더 지연(20ms)이 있어도 같음
-    delayed = np.concatenate([np.zeros(int(0.02 * rate), np.float32), 0.5 * a])
-    assert media_match.same_sound(a, delayed)
+    # 음량만 다르면 같음
+    assert media_match.same_sound(a, 0.5 * a)
+    # 싱크가 어긋나면(1ms 늦게 시작) 지연을 보정하지 않으므로 다름
+    delayed = np.concatenate([np.zeros(int(0.001 * rate), np.float32), a])[: len(a)]
+    assert not media_match.same_sound(a, delayed)
     assert not media_match.same_sound(a, np.sin(2 * np.pi * 523 * t).astype(np.float32))
     # 길이가 많이 다르면 다름
     assert not media_match.same_sound(a, np.concatenate([a, a]))

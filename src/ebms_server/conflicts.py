@@ -241,7 +241,7 @@ def _peaks(samples: np.ndarray) -> list[float]:
 
 
 def sound_compare(stage_id: str, unit_id: str, path: str) -> dict:
-    """키음 둘의 길이·파형·상관계수(media_match.same_sound와 같은 방식)."""
+    """키음 둘의 길이·파형·상관계수(media_match.same_sound와 같은 방식, 지연 보정 없음)."""
     stage, unit = _unit(stage_id, unit_id)
     old_name, old = _side(stage, unit, path, "old")
     new_name, new = _side(stage, unit, path, "new")
@@ -254,23 +254,19 @@ def sound_compare(stage_id: str, unit_id: str, path: str) -> dict:
             return {"error": "키음을 풀지 못했습니다."}
         a = np.frombuffer(raw_a, dtype="<f4").astype(np.float64)
         b = np.frombuffer(raw_b, dtype="<f4").astype(np.float64)
-        correlation = None
-        lag = media_match._best_lag(a, b, int(media_match.SOUND_MAX_LAG * rate))
-        x, y = (a[lag:], b) if lag > 0 else (a, b[-lag:]) if lag < 0 else (a, b)
-        n = min(len(x), len(y))
-        denom = np.sqrt(np.dot(x[:n], x[:n]) * np.dot(y[:n], y[:n])) if n else 0
-        if denom > 0:
-            correlation = round(float(np.dot(x[:n], y[:n]) / denom), 4)
+        # 상관계수는 지연을 보정하지 않습니다(싱크도 같아야 같은 소재). 시작 위치 차이는 참고로만 보여 줍니다.
+        value = media_match.correlation(a, b)
+        offset = media_match._best_lag(a, b, int(media_match.SOUND_OFFSET_SEARCH * rate))
         return {
             "old": {"seconds": round(len(a) / rate, 3), "peaks": _peaks(a)},
             "new": {"seconds": round(len(b) / rate, 3), "peaks": _peaks(b)},
-            "lag_ms": round(lag / rate * 1000, 1),
-            "correlation": correlation,
+            "offset_ms": round(offset / rate * 1000, 1),
+            "correlation": None if value is None else round(value, 4),
             "min_correlation": media_match.SOUND_MIN_CORRELATION,
             "same": bool(media_match.same_sound(a.astype("<f4"), b.astype("<f4"))),
         }
 
-    key = _cache_name(path, hashlib.sha256(old + b"\0" + new).digest(), "sound")
+    key = _cache_name(path, hashlib.sha256(old + b"\0" + new).digest(), "sound-nolag")
     return _cached_json(stage, unit, key, make)
 
 

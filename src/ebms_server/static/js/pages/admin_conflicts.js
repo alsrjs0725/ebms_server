@@ -302,7 +302,8 @@ async function showSounds(item, left, right, body) {
     }
     waves.forEach((f) => f());
     const corr = data.correlation == null ? "계산 불가(무음)" : data.correlation.toFixed(3);
-    status.textContent = `상관계수 ${corr} (같은 소재 기준 ${data.min_correlation} 이상, 길이 차이 2%·0.1초 이내) · 맞춘 지연 ${data.lag_ms}ms`
+    status.textContent = `상관계수 ${corr} (지연 보정 없이 시작을 맞춰 비교, 같은 소재 기준 ${data.min_correlation} 이상, 길이 차이 2%·0.1초 이내)`
+        + (data.offset_ms ? ` · 참고: 새 파일이 ${Math.abs(data.offset_ms)}ms ${data.offset_ms > 0 ? "빠름" : "늦음"}` : "")
         + (data.same ? " · 지금 기준으로는 같은 소재" : "");
 }
 

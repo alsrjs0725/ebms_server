@@ -6,7 +6,7 @@
 ffmpeg로 풀고, 풀지 못하거나(ffmpeg 없음, 깨진 파일) 다르다고 보이면 지금처럼 충돌입니다.
 
 - 키음: 모노 SOUND_RATE Hz로 풀어(최대 SOUND_SECONDS초) 길이가 SOUND_LENGTH_TOLERANCE 안이고,
-  인코더 지연(SOUND_MAX_LAG초 안)을 맞춘 뒤 정규화 상관계수가 SOUND_MIN_CORRELATION 이상이면 같습니다.
+  시작을 맞춘 그대로(지연을 보정하지 않음, 싱크가 어긋나면 다른 소재) 정규화 상관계수가 SOUND_MIN_CORRELATION 이상이면 같습니다.
   둘 다 거의 무음이면 길이만 봅니다. 음량만 다른 것은 같은 것으로 봅니다(상관계수는 크기에 무관).
 - 이미지: IMAGE_SIZE×IMAGE_SIZE RGBA로 (면적 평균으로) 줄여 픽셀 차이 평균이 IMAGE_MAX_MEAN_DIFF 이하이고
   어느 채널이든 IMAGE_PIXEL_DIFF보다 많이 다른 픽셀이 IMAGE_MAX_CHANGED 이하이면 같습니다(움직이는 gif는 첫 프레임).
@@ -43,8 +43,8 @@ SOUND_SECONDS = 600.0
 # 길이 차이 허용: 이 비율과 SOUND_LENGTH_SECONDS 중 큰 값
 SOUND_LENGTH_TOLERANCE = 0.02
 SOUND_LENGTH_SECONDS = 0.1
-# mp3·vorbis 인코더 지연·앞 무음 차이로 어긋나는 최대 시간(초)
-SOUND_MAX_LAG = 0.1
+# 비교 화면에 참고로 보여 주는 시작 위치 차이를 찾는 범위(초). 판정에는 쓰지 않습니다.
+SOUND_OFFSET_SEARCH = 0.1
 SOUND_MIN_CORRELATION = 0.75
 # 이 RMS 미만이면 무음으로 봅니다.
 SOUND_SILENCE_RMS = 1e-4
@@ -179,15 +179,16 @@ def same_sound(a: np.ndarray, b: np.ndarray, rate: int = SOUND_RATE) -> bool:
     quiet_b = len(b) == 0 or np.sqrt(np.mean(b * b)) < SOUND_SILENCE_RMS
     if quiet_a or quiet_b:
         return quiet_a and quiet_b
-    lag = _best_lag(a, b, int(SOUND_MAX_LAG * rate))
-    if lag > 0:
-        a = a[lag:]
-    elif lag < 0:
-        b = b[-lag:]
+    value = correlation(a, b)
+    return value is not None and value >= SOUND_MIN_CORRELATION
+
+
+def correlation(a: np.ndarray, b: np.ndarray) -> float | None:
+    """시작을 맞춘 그대로의 정규화 상관계수(짧은 쪽 길이까지). 무음이면 None."""
     n = min(len(a), len(b))
-    a, b = a[:n], b[:n]
-    denom = np.sqrt(np.dot(a, a) * np.dot(b, b))
-    return denom > 0 and np.dot(a, b) / denom >= SOUND_MIN_CORRELATION
+    a, b = a[:n].astype(np.float64), b[:n].astype(np.float64)
+    denom = np.sqrt(np.dot(a, a) * np.dot(b, b)) if n else 0
+    return float(np.dot(a, b) / denom) if denom > 0 else None
 
 
 def _best_lag(a: np.ndarray, b: np.ndarray, max_lag: int) -> int:
