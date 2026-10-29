@@ -31,7 +31,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from . import cache, constant, preview
+from . import cache, constant, decode_cache, preview
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ SEGMENT_SECONDS = 9.3
 # 구간이 맞았다고 보는 상관계수
 SEGMENT_CORR = 0.5
 # 이 값보다 onset이 약한 구간은 무음으로 보고 세지 않습니다.
+FLOOR = 3.5  # 약 30dB(로그 에너지)
 SILENCE = 0.3
 # 지연 후보를 찾는 범위(초)와 후보 수, 후보 사이 최소 간격(초)
 MAX_LAG_SECONDS = 30.0
@@ -236,16 +237,20 @@ def features(buf: np.ndarray) -> np.ndarray:
         spec = np.abs(np.fft.rfft(buf[index] * window, axis=1))[:, keep]
         energy = np.zeros((count, BANDS), dtype=np.float64)
         np.add.at(energy.T, band[keep], spec.T)
-        out[start : start + count] = np.log1p(energy * 10)
+        level = np.log1p(energy * 10)
+        # 프레임에서 가장 센 밴드보다 FLOOR 넘게 약한 밴드(창 누설 등)는 0으로 둡니다. 안 그러면 소리가 시작할 때
+        # 모든 밴드가 함께 튀어 박자만 같고 음색이 다른 소리도 같다고 봅니다.
+        out[start : start + count] = np.maximum(level - (level.max(1, keepdims=True) - FLOOR), 0)
     return np.maximum(np.diff(out, axis=0, prepend=out[:1]), 0)
 
 
 def fingerprints(
-    names: list[str], read: Callable[[str], bytes], charts: list[str], deadline: float | None = None
+    names: list[str], read: Callable[[str], bytes], charts: list[str], deadline: float | None = None,
+    nice: bool = True,
 ) -> dict[str, Fingerprint]:
     """곡 안 차트들의 렌더 특징. names는 곡 안 모든 파일 경로, read(경로)는 그 내용, charts는 렌더할 차트 경로입니다.
-    키음은 곡마다 한 번만 풉니다. deadline(time.monotonic 기준)을 넘기면 남은 분기는 건너뛰고 truncated로 둡니다.
-    ffmpeg가 없으면 RuntimeError."""
+    키음은 내용(sha256) 기준으로 한 번만 풉니다(decode_cache). deadline(time.monotonic 기준)을 넘기면 남은 분기는
+    건너뛰고 truncated로 둡니다. nice는 ffmpeg 우선순위를 낮출지(commit 중에는 False). ffmpeg가 없으면 RuntimeError."""
     ffmpeg = preview._ffmpeg()
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found")
@@ -270,12 +275,15 @@ def fingerprints(
     decoded: dict[str, np.ndarray] = {}
     if members:
         with tempfile.TemporaryDirectory(dir=cache.work_dir()) as tmp:
-            disk = []
+            disk, hashes = [], []
             for i, member in enumerate(members):
                 target = pathlib.Path(tmp) / f"{i}{posixpath.splitext(member)[1].lower()}"
-                target.write_bytes(read(member))
+                data = read(member)
+                target.write_bytes(data)
                 disk.append(target)
-            for member, data in zip(members, preview._decode_sounds(ffmpeg, disk, MAX_SECONDS, rate=RATE)):
+                hashes.append(decode_cache.sha256_bytes(data))
+            found_all = decode_cache.decode_sounds(ffmpeg, disk, MAX_SECONDS, rate=RATE, nice=nice, hashes=hashes)
+            for member, data in zip(members, found_all):
                 if data is not None:
                     decoded[member] = data
     out = {}

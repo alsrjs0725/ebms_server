@@ -16,6 +16,8 @@
   키음이 곡 안에 다 있으면(따로 선 곡) 항목이 하나 이상 같고 그 키음을 혼자 SIMILAR_SOUNDS 이상 가진 기존 곡을
   중복 의심 후보로 보여주기만 하고(complete), auto는 새 곡입니다(같은 곡을 채보만 고쳐 다시 올린 경우).
   키음이 없는 차트뿐인 곡은 항목만으로 판정합니다(SIMILAR_MIN_FIELDS개 이상 같은 곡이 후보, 가장 많이 겹치는 곡이 하나면 auto).
+- 기존 곡에 더하는 차트는 commit 직전에 올린 그대로의 소리와 병합 뒤 날 소리를 렌더해 비교하고(render_match), 다르면(같은 이름의
+  다른 곡 키음으로 울리게 되면) 그 차트를 넣지 않고 묶음에 남깁니다(result.render_held). 충돌 키음을 새 파일로 고르거나 차트를 새 곡으로 두면 들어갑니다.
 - 새 곡으로 넣는 차트가 곡 안에 없는 키음을 쓰면(차분) 비슷한 곡 후보에서 그 키음만 복사해 넣습니다(병합했을 때와 같은 소리로 플레이).
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
@@ -34,7 +36,7 @@ import time
 import uuid
 import zipfile
 
-from . import cache, constant, db, importer, rar, sevenzip, store
+from . import cache, constant, db, decode_cache, importer, rar, render_match, sevenzip, store
 from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,8 @@ SIMILAR_LIMIT = 10
 SIMILAR_SOUNDS = 0.8
 # auto로 추가하려면 이 값 이상(BeMusicSeeker InstallDestinationAutoApplyMinAudioHealth 기본값 100%)
 SIMILAR_AUTO_SOUNDS = 1.0
+# commit 직전 렌더 검증에서 올린 그대로의 렌더 특징을 기억하는 차트 하나의 최대 크기(바이트)
+RENDER_MEMO_BYTES = 4 << 20
 # rar·7z는 풀린 크기를 미리 알 수 없어 압축 파일 크기의 이 배수로 추정합니다(캐시에 둘지 정할 때).
 EXTRACT_RATIO = 2
 
@@ -1174,6 +1178,78 @@ def _borrow_sounds(song_dir: pathlib.Path, charts: list[str], song_ids: list[int
     return borrowed
 
 
+def _merge_song(unit: dict, target: str | int) -> int | None:
+    """이 대상으로 넣으면 더해질 기존 곡 번호(새 곡이 되거나 정할 수 없으면 None)."""
+    effective = _auto(unit, target)
+    if isinstance(effective, int):
+        return effective
+    suggestion = unit.get("suggestion") or {}
+    if effective is None and suggestion.get("kind") == "add" and suggestion.get("songs"):
+        return suggestion["songs"][0]
+    return None
+
+
+def _render_check(unit: dict, song_dir: pathlib.Path, charts: list[str], song_id: int) -> tuple[list[dict], list[str]]:
+    """기존 곡에 더할 차트를 올린 그대로 렌더한 소리와, 병합 뒤 실제로 날 소리(같은 경로·확장자만 다른 키음은
+    기존 곡 것, 충돌에서 "new"를 고른 것은 올린 것)로 렌더한 소리를 비교합니다. 다른 곡 키음으로 울리게 되는 차트
+    [{chart, score}](render_match.SAME 미만)와 기존 곡과 내용이 다른 키음 경로들을 돌려줍니다. 올린 키음이 없는 차트(차분)와 렌더가 잘린 차트는 보지 않습니다.
+    기존 곡과 내용이 다른 키음이 없으면 렌더하지 않습니다. 올린 그대로의 렌더는 곡·차트 기준으로 기억합니다."""
+    files = {path.relative_to(song_dir).as_posix(): path for path in song_dir.rglob("*") if path.is_file()}
+    audio = {posixpath.splitext(p.lower())[0]: p for p in files if posixpath.splitext(p.lower())[1] in constant.AUDIO_FORMAT}
+    resolutions = unit.get("resolutions") or {}
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT path FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+    if row is None or not row[0]:
+        return [], []
+    replaced: dict[str, bytes] = {}
+    try:
+        with zipfile.ZipFile(store.full_path(row[0])) as zf:
+            for info in zf.infolist():
+                stem, ext = posixpath.splitext(info.filename.lower())
+                mine = audio.get(stem)
+                if info.is_dir() or ext not in constant.AUDIO_FORMAT or mine is None or resolutions.get(mine) == "new":
+                    continue
+                theirs = zf.read(info)
+                if theirs != files[mine].read_bytes():
+                    replaced[mine] = theirs
+    except (OSError, zipfile.BadZipFile):
+        logger.warning(f"render check: unreadable song zip[{song_id}]")
+        return [], []
+    if not replaced:
+        return [], []
+    sha = {c["path"]: c["sha256"] for c in unit["charts"]}
+    names = list(files)
+    mine_read = lambda p: files[p].read_bytes()
+    before: dict[str, render_match.Fingerprint] = {}
+    todo = []
+    for chart in charts:
+        key = ("render_fp", unit["id"], sha.get(chart, chart))
+        cached = decode_cache.memo_get(key)
+        if cached is None:
+            todo.append(chart)
+        else:
+            before[chart] = cached
+    if todo:
+        for chart, fp in render_match.fingerprints(names, mine_read, todo, nice=False).items():
+            # 아주 긴 차트의 특징은 커서 기억하지 않습니다(메모는 개수로만 제한).
+            if sum(f.nbytes for f in fp.features) <= RENDER_MEMO_BYTES:
+                decode_cache.memo_put(("render_fp", unit["id"], sha.get(chart, chart)), fp)
+            before[chart] = fp
+    check = [c for c in charts if c in before and before[c].sounds[0] > 0 and not before[c].truncated]
+    if not check:
+        return [], sorted(replaced)
+    after = render_match.fingerprints(names, lambda p: replaced.get(p) or mine_read(p), check, nice=False)
+    held = []
+    for chart in check:
+        if chart not in after or after[chart].truncated:
+            continue
+        value = render_match.score(before[chart], after[chart], paired=True)
+        if value is not None and value < render_match.SAME:
+            held.append({"chart": chart, "score": round(value, 3)})
+    return held, sorted(replaced)
+
+
 def _groups(unit: dict) -> list[tuple[str | int, list[str]]]:
     """(대상, 차트 경로 목록). skip은 뺍니다. 모든 차트가 같은 대상이면 하나."""
     groups: dict = {}
@@ -1226,8 +1302,11 @@ def commit(stage_id: str, job: importer.Job) -> None:
         for unit, infos in pending:
             errors = [info["error"] for info in infos if info.get("error")]
             conflicts = sorted({c for info in infos for c in info.get("conflicts", [])})
-            if errors or conflicts:
-                unit["result"] = {"error": "; ".join(errors) or None, "conflicts": conflicts, "songs": infos}
+            held = [h for info in infos for h in info.get("render_held", [])]
+            if errors or conflicts or held:
+                unit["result"] = {
+                    "error": "; ".join(errors) or None, "conflicts": conflicts, "render_held": held, "songs": infos,
+                }
             else:
                 done.add(unit["id"])
                 removable.append(unit["id"])
@@ -1272,13 +1351,24 @@ def commit(stage_id: str, job: importer.Job) -> None:
                             _borrow_sounds(song_dir, charts, (unit.get("suggestion") or {}).get("songs") or [])
                             if _new_song(unit, target) else {}
                         )
-                        job.apply_limits(batch)
-                        info = importer._insert(
-                            batch, song_dir, label, remove=False, target=_auto(unit, target),
-                            resolutions=unit.get("resolutions"),
-                        )
+                        # 렌더는 배치 쓰기 전에 합니다(쓰기 잠금을 오래 잡지 않게).
+                        merge_into = _merge_song(unit, target)
+                        held, replaced = _render_check(unit, song_dir, charts, merge_into) if merge_into is not None else ([], [])
+                        for item in held:
+                            (song_dir / item["chart"]).unlink(missing_ok=True)
+                        if held and len(held) == len(charts):
+                            # 아무것도 넣지 않았으니 충돌 키음은 여기서 알려 줍니다(새 파일로 고를 수 있게).
+                            info = {"folder": label, "song_id": merge_into, "new_charts": 0, "conflicts": replaced}
+                        else:
+                            job.apply_limits(batch)
+                            info = importer._insert(
+                                batch, song_dir, label, remove=False, target=_auto(unit, target),
+                                resolutions=unit.get("resolutions"),
+                            )
                         if borrowed:
                             info["borrowed_sounds"] = borrowed
+                        if held:
+                            info["render_held"] = held
                     except Exception as e:
                         logger.exception(f"commit failed[{label}]")
                         info = {"folder": label, "error": str(e) or type(e).__name__}
