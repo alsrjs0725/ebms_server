@@ -578,3 +578,35 @@ def test_download_old_unpacked_unit(client, monkeypatch):
         assert sorted(zf.namelist()) == ["a.bms", "k.wav"]
     # 임시로 묶은 zip은 보낸 뒤 지웁니다.
     assert not list(unit_root.glob(".download-*"))
+
+
+def test_new_song_borrows_missing_sounds(client, monkeypatch):
+    """비슷한 곡이 있는 차분을 새 곡으로 넣어도, 곡 안에 없는 키음은 비슷한 곡에서 복사해 플레이할 수 있게 합니다."""
+    admin_login(client, monkeypatch)
+    upload_new(client, "base.zip", make_zip({
+        "b/a.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n#WAV02 sound\\snare.wav\n#WAV03 hat.wav\n",
+        "b/kick.ogg": b"k", "b/sound/snare.wav": b"s", "b/hat.wav": b"h", "b/other.wav": b"o",
+    }))
+    job = stage(client, "pack.zip", make_zip({
+        # kick·snare는 곡에 없고 own은 있음 → 새 곡으로 넣으면 kick.ogg·sound/snare.wav만 복사(hat·other는 안 씀)
+        "diff/x.bms": b"#TITLE Song [X]\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n#WAV02 sound/snare.wav\n#WAV03 own.wav\n",
+        "diff/own.wav": b"w",
+    }))
+    sid = job["stage_id"]
+    unit = units(client, sid)["pack/diff"]
+    assert unit["suggestion"]["kind"] == "similar" and unit["suggestion"]["songs"] == [1]
+    assert set_target(client, sid, unit, "new").status_code == 200
+    result = commit_stage(client, sid)
+    assert [s.get("borrowed_sounds") for s in result["songs"]] == [{"1": 2}]
+    assert song_files(2) == ["kick.ogg", "own.wav", "sound/snare.wav", "x.bms"]
+    # 기존 곡은 그대로
+    assert song_files(1) == ["a.bms", "hat.wav", "kick.ogg", "other.wav", "sound/snare.wav"]
+
+
+def test_merge_does_not_borrow(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload_new(client, "base.zip", make_zip({"b/a.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n", "b/kick.wav": b"k"}))
+    job = stage(client, "pack.zip", make_zip({"d/x.bms": b"#TITLE Song [X]\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n"}))
+    result = commit_stage(client, job["stage_id"])
+    assert [s.get("borrowed_sounds") for s in result["songs"]] == [None]
+    assert song_files(1) == ["a.bms", "kick.wav", "x.bms"]

@@ -16,6 +16,7 @@
   키음이 곡 안에 다 있으면(따로 선 곡) 항목이 하나 이상 같고 그 키음을 혼자 SIMILAR_SOUNDS 이상 가진 기존 곡을
   중복 의심 후보로 보여주기만 하고(complete), auto는 새 곡입니다(같은 곡을 채보만 고쳐 다시 올린 경우).
   키음이 없는 차트뿐인 곡은 항목만으로 판정합니다(SIMILAR_MIN_FIELDS개 이상 같은 곡이 후보, 가장 많이 겹치는 곡이 하나면 auto).
+- 새 곡으로 넣는 차트가 곡 안에 없는 키음을 쓰면(차분) 비슷한 곡 후보에서 그 키음만 복사해 넣습니다(병합했을 때와 같은 소리로 플레이).
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
 """
@@ -33,7 +34,7 @@ import time
 import uuid
 import zipfile
 
-from . import cache, constant, db, importer, rar, sevenzip
+from . import cache, constant, db, importer, rar, sevenzip, store
 from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
@@ -1116,6 +1117,63 @@ def _subset(unit_dir: pathlib.Path, charts: list[str], all_charts: list[str], wo
     return out
 
 
+def _new_song(unit: dict, target: str | int) -> bool:
+    """이 대상으로 넣으면 새 곡이 되는지(겹치는 차트가 없는 곡을 new로 두거나, 비슷한 곡이 있지만 auto가 아무 곡도 고르지 않음)."""
+    effective = _auto(unit, target)
+    return effective == "new" or (effective is None and (unit.get("suggestion") or {}).get("kind") == "similar")
+
+
+def _borrow_sounds(song_dir: pathlib.Path, charts: list[str], song_ids: list[int]) -> dict[str, int]:
+    """새 곡으로 넣는 차트가 쓰는데 곡 폴더에 없는 키음을 비슷한 곡(song_ids 순)에서 같은 경로로 복사합니다.
+    차분을 새 곡으로 넣어도 병합했을 때와 같은 소리로 플레이할 수 있게 합니다. {곡 번호(문자열): 복사한 파일 수}."""
+    own = _sound_stems(path.relative_to(song_dir).as_posix() for path in song_dir.rglob("*") if path.is_file())
+    missing: list[frozenset[str]] = []
+    for path in charts:
+        try:
+            content = (song_dir / path).read_bytes()
+        except OSError:
+            continue
+        missing.extend(sound for sound in chart_sounds(content, posixpath.dirname(path)) if not sound & own)
+    borrowed: dict[str, int] = {}
+    if not missing or not song_ids:
+        return borrowed
+    with db.connect() as con, con.cursor() as cur:
+        for song_id in song_ids:
+            if not missing:
+                break
+            cur.execute("SELECT path FROM song WHERE id = %s", (song_id,))
+            row = cur.fetchone()
+            if row is None or not row[0]:
+                continue
+            try:
+                zf = zipfile.ZipFile(store.full_path(row[0]))
+            except (OSError, zipfile.BadZipFile):
+                logger.warning(f"borrow sounds: unreadable song zip[{song_id}]")
+                continue
+            with zf:
+                audio: dict[str, zipfile.ZipInfo] = {}
+                for info in zf.infolist():
+                    stem, ext = posixpath.splitext(info.filename.lower())
+                    if not info.is_dir() and ext in constant.AUDIO_FORMAT:
+                        audio.setdefault(stem, info)
+                rest = []
+                for sound in missing:
+                    found = next((audio[stem] for stem in sorted(sound) if stem in audio), None)
+                    if found is None:
+                        rest.append(sound)
+                        continue
+                    target = song_dir / found.filename
+                    if not target.resolve().is_relative_to(song_dir.resolve()):
+                        rest.append(sound)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(found) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    borrowed[str(song_id)] = borrowed.get(str(song_id), 0) + 1
+                missing = rest
+    return borrowed
+
+
 def _groups(unit: dict) -> list[tuple[str | int, list[str]]]:
     """(대상, 차트 경로 목록). skip은 뺍니다. 모든 차트가 같은 대상이면 하나."""
     groups: dict = {}
@@ -1210,11 +1268,17 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     work = work_root / uuid.uuid4().hex
                     try:
                         song_dir = _subset(unit_dir, charts, all_charts, work) if split else unit_dir
+                        borrowed = (
+                            _borrow_sounds(song_dir, charts, (unit.get("suggestion") or {}).get("songs") or [])
+                            if _new_song(unit, target) else {}
+                        )
                         job.apply_limits(batch)
                         info = importer._insert(
                             batch, song_dir, label, remove=False, target=_auto(unit, target),
                             resolutions=unit.get("resolutions"),
                         )
+                        if borrowed:
+                            info["borrowed_sounds"] = borrowed
                     except Exception as e:
                         logger.exception(f"commit failed[{label}]")
                         info = {"folder": label, "error": str(e) or type(e).__name__}
