@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import audit, auth, cache, conflicts, constant, db, download_log, downloads, importer, logs, media_match, quota, staging
+from . import audit, auth, cache, conflicts, constant, db, download_log, downloads, importer, logs, media_match, quota, render_check, staging
 from .accounts import User
 from .templating import templates
 
@@ -515,6 +515,26 @@ def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depend
         raise HTTPException(status_code=404, detail="song not found")
     logger.info(f"song {song_id} charts detached by {admin.id}: {result}")
     return result
+
+
+class RenderCompare(BaseModel):
+    songs: list[int]
+    # 곡 id → 볼 차트 경로들. 없는 곡은 모든 차트
+    charts: dict[int, list[str]] = {}
+
+
+@router.post("/api/admin/render/compare")
+def render_compare(body: RenderCompare, admin: Annotated[User, Depends(web_admin)]):
+    """곡들의 차트를 서버에서 렌더해 같은 곡끼리 묶는 작업을 시작합니다(render_check). 진행·결과는
+    /api/admin/import/jobs/{id}의 done/total과 result({groups, unrendered})로 봅니다."""
+    try:
+        job = render_check.start(body.songs, body.charts)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logger.info(f"render compare {job.id} by {admin.id}: songs {body.songs}")
+    return job.json()
 
 
 @router.get("/api/admin/songs/{song_id}/zip")
