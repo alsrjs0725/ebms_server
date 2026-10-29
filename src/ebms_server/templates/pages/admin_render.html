@@ -25,6 +25,7 @@
         <div>마지막 색인: <span data-time="{{ state.finished_at }}"></span>, {{ state.songs }}곡{% if state.error %} <span class="text-danger">실패: {{ state.error }}</span>{% endif %}</div>
         {% endif %}
         <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="run" {% if state.running %}disabled{% endif %}>지금 색인</button>
+        <a class="btn btn-sm btn-outline-secondary mt-2" href="/admin/logs?logger=ebms_server.render_index">로그 보기</a>
     </div>
 </div>
 
