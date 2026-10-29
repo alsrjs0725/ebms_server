@@ -11,11 +11,13 @@ tools/list는 그 권한으로 쓸 수 있는 도구만 보여 주며 권한 밖
   관리자가 충돌 화면에서 추천을 보고 "AI 추천대로 고르기"로 옮긴 뒤 적용합니다.
 - 응답은 요청마다 JSON 하나이고, 서버가 먼저 보내는 스트림(GET SSE)은 없습니다.
 """
+import base64
 import hashlib
 import json
 import logging
 import pathlib
 import posixpath
+import subprocess
 import tempfile
 import time
 from typing import Annotated, Any
@@ -43,13 +45,21 @@ DIFF_MAX_LINES = 2000
 USED_BY_LIST = 5
 REASON_MAX = 500
 TEXT_MAX = 2000
+# get_sound_clip: 한 번에 자르는 길이(초), 소리는 mp3(원본 채널·44.1kHz), 스펙트로그램은 png
+CLIP_SECONDS = 10.0
+CLIP_MAX_SECONDS = 30.0
+CLIP_BITRATE = "192k"
+SPECTRUM_SIZE = "640x240"
+CLIP_TIMEOUT = 120
 
 INSTRUCTIONS = """\
 EBMS 곡 임포트에서 기존 곡에 병합하려다 같은 경로에 내용이 다른 파일이 있어 멈춘 곡(충돌)을 판단합니다.
 파일마다 old(기존 곡 파일 유지)·new(새 파일로 바꿈)·unsure(사람이 봐야 함) 중 하나를 추천하고 submit_recommendation으로 남깁니다.
 추천은 저장만 되고 바로 적용되지 않습니다. 관리자가 화면에서 확인한 뒤 적용합니다.
 
-순서: list_conflict_units → get_conflict_case(offset을 늘려 가며 모든 충돌) → 필요하면 get_file_diff → submit_recommendation.
+순서: list_conflict_units → get_conflict_case(offset을 늘려 가며 모든 충돌) → 필요하면 get_file_diff·get_sound_clip → submit_recommendation.
+수치로 판단하기 어려운 키음(상관계수가 애매함, 싱크·품질 차이, 리믹스 의심)은 get_sound_clip으로 기존·새 소리를 직접 들어 봅니다.
+소리를 들을 수 없으면 같이 오는 스펙트로그램(세로축 주파수, 위쪽이 비어 있으면 손실 압축으로 고음이 잘린 것)을 봅니다.
 
 판단 기준:
 1. 다른 곡 의심이 먼저입니다. existing_songs와 new_charts의 제목·아티스트가 다르거나, 키음 상관계수(correlation과
@@ -114,6 +124,27 @@ TOOLS = [
                 "unit_id": {"type": "string"},
                 "path": {"type": "string"},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": DIFF_MAX_LINES},
+            },
+            "required": ["stage_id", "unit_id", "path"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "get_sound_clip",
+        "description": (
+            "키음 충돌의 기존(old)·새(new) 소리를 같은 구간으로 잘라 mp3 오디오와 스펙트로그램(png)으로 줍니다. "
+            "수치로 애매한 충돌을 귀나 눈으로 확인할 때 씁니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stage_id": {"type": "string"},
+                "unit_id": {"type": "string"},
+                "path": {"type": "string"},
+                "start": {"type": "number", "minimum": 0, "description": "자르기 시작(초, 기본 0)"},
+                "seconds": {"type": "number", "minimum": 0.5, "maximum": CLIP_MAX_SECONDS, "description": f"길이(초, 기본 {CLIP_SECONDS:g})"},
+                "audio": {"type": "boolean", "description": "오디오를 넣을지(기본 true)"},
+                "spectrogram": {"type": "boolean", "description": "스펙트로그램을 넣을지(기본 true)"},
             },
             "required": ["stage_id", "unit_id", "path"],
         },
@@ -420,6 +451,58 @@ def get_file_diff(stage_id: str, unit_id: str, path: str, max_lines: int = DIFF_
     return result
 
 
+class Content(list):
+    """도구가 MCP content(텍스트·오디오·이미지 항목)를 그대로 돌려줄 때 씁니다."""
+
+
+def _clip(content: bytes, name: str, start: float, seconds: float, out_args: list[str], suffix: str) -> bytes | None:
+    """content(이름 name)의 start초부터 seconds초를 ffmpeg out_args로 바꾼 결과. 실패하면 None."""
+    ffmpeg = conflicts._ffmpeg()
+    with tempfile.TemporaryDirectory(prefix="ebms-mcp-") as tmp:
+        source = pathlib.Path(tmp) / f"in{posixpath.splitext(name)[1].lower()}"
+        source.write_bytes(content)
+        out = pathlib.Path(tmp) / f"out{suffix}"
+        cmd = [ffmpeg, "-v", "error", "-nostdin", "-y", "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}", "-i", str(source), *out_args, str(out)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=CLIP_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:
+            return None
+        return out.read_bytes() if result.returncode == 0 and out.is_file() and out.stat().st_size else None
+
+
+def get_sound_clip(
+    stage_id: str, unit_id: str, path: str, start: float = 0.0, seconds: float = CLIP_SECONDS,
+    audio: bool = True, spectrogram: bool = True,
+) -> Content:
+    stage, unit = conflicts._unit(stage_id, unit_id)
+    if conflicts._kind(path) != "sound":
+        raise ToolError("키음(소리) 충돌만 자를 수 있습니다.")
+    start = max(0.0, float(start))
+    seconds = max(0.5, min(float(seconds), CLIP_MAX_SECONDS))
+    content = Content()
+    info = {"path": path, "start": start, "seconds": seconds}
+    for side in ("old", "new"):
+        name, data = conflicts._side(stage, unit, path, side)
+        info[f"{side}_path"] = name
+        parts = []
+        if audio:
+            clip = _clip(data, name, start, seconds, ["-vn", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", CLIP_BITRATE], ".mp3")
+            if clip:
+                parts.append({"type": "audio", "data": base64.b64encode(clip).decode(), "mimeType": "audio/mpeg"})
+        if spectrogram:
+            image = _clip(data, name, start, seconds, ["-lavfi", f"showspectrumpic=s={SPECTRUM_SIZE}:legend=1", "-frames:v", "1"], ".png")
+            if image:
+                parts.append({"type": "image", "data": base64.b64encode(image).decode(), "mimeType": "image/png"})
+        label = "기존(old)" if side == "old" else "새(new)"
+        if not parts:
+            content.append({"type": "text", "text": f"{label} {name}: 이 구간을 풀지 못했습니다(구간이 소리 길이를 넘었거나 깨진 파일)."})
+            continue
+        content.append({"type": "text", "text": f"{label} {name} ({start:g}~{start + seconds:g}초)"})
+        content.extend(parts)
+    content.insert(0, {"type": "text", "text": json.dumps(info, ensure_ascii=False)})
+    return content
+
+
 def _text(value, limit: int = TEXT_MAX) -> str:
     return str(value or "").strip()[:limit]
 
@@ -497,6 +580,7 @@ HANDLERS = {
     "list_conflict_units": list_conflict_units,
     "get_conflict_case": get_conflict_case,
     "get_file_diff": get_file_diff,
+    "get_sound_clip": get_sound_clip,
     "submit_recommendation": submit_recommendation,
 }
 
@@ -535,6 +619,8 @@ def _call(request: Request, user, params: dict) -> dict:
     except (ToolError, StageError, ValueError) as e:
         message = e.detail if isinstance(e, StageError) else str(e)
         return {"content": [{"type": "text", "text": str(message)}], "isError": True}
+    if isinstance(value, Content):
+        return {"content": list(value)}
     if name == "submit_recommendation":
         # 접속기록은 ebms.log에도 같은 줄이 남습니다.
         audit.record(request, user.id, "mcp.recommend", f"{args.get('stage_id')}/{args.get('unit_id')}", saved=value["saved"])

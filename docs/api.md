@@ -165,6 +165,7 @@ AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) �
 | `list_conflict_units` | 관리자 | 검토 대기 묶음에서 병합 충돌이 남은 곡. `pending_only`(기본 true)면 AI 추천이 덜 된 곡만 |
 | `get_conflict_case` | 관리자 | 곡 하나의 판단 자료: 겨룬 기존 곡과 차트, 새 차트의 상태(`same_as_registered`/`conflict`/`new_chart`), 충돌 파일마다 비교 수치(키음 상관계수·싱크 오차, 그림 차이, 영상 프레임 차이, 품질, 차트 diff 앞부분·`#WAV` 번호 바뀜)와 그 파일을 쓰는 차트(`used_by_old/new`, 차트면 `conflict_sounds_old/new`). `offset`·`limit`(기본 50, 최대 200)으로 나눠 받습니다 |
 | `get_file_diff` | 관리자 | 텍스트 충돌 파일의 전체 diff(최대 2000줄) |
+| `get_sound_clip` | 관리자 | 키음 충돌의 기존·새 소리를 같은 구간(`start`초부터 `seconds`초, 기본 10초·최대 30초)으로 잘라 MCP content로 줍니다: 오디오(`audio/mpeg`, 192kbps)와 스펙트로그램(`image/png`). `audio`·`spectrogram`을 false로 하면 뺍니다. 오디오를 못 받는 모델은 스펙트로그램을 봅니다 |
 | `submit_recommendation` | 관리자 | 충돌 파일마다 `old`/`new`/`unsure` 추천(`confidence`, `reason`)과 곡 전체 판단(`summary`, `split_recommended`, `issues`, `model`)을 저장합니다 |
 
 추천은 묶음의 곡 정보(`unit.ai`)에 따로 저장하고 관리자가 고른 것(`resolutions`)은 바꾸지 않습니다. 충돌 해결 창에 파일마다 AI 추천과 이유가 보이고, **AI 추천대로 고르기**를 누르면 고르지 않은 파일 중 old·new로 추천된 것만 고릅니다(unsure는 직접 고름). 적용은 관리자가 합니다. 판단 기준은 `initialize` 응답의 `instructions`로 클라이언트에 알려 줍니다.
