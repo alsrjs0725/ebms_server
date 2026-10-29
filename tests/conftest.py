@@ -156,6 +156,9 @@ def mock_pymysql_if_no_mysql(monkeypatch, tmp_path):
     # 미리듣기는 뒤 스레드에서 만들므로 테스트에서는 끄고, test_preview가 직접 부릅니다.
     monkeypatch.setattr(constant, "PREVIEW_ENABLED", False)
     monkeypatch.setattr(constant, "PRE_REBALANCE_ENABLED", False)
+    # 렌더 색인은 뒤 스레드로 돌지 않게 끄고, test_render_index가 직접 부릅니다.
+    monkeypatch.setattr(constant, "RENDER_INDEX_DIR", tmp_path / "render_index")
+    monkeypatch.setattr(constant, "RENDER_INDEX_HOURS", 0)
     original_connect = db_module.connect
     try:
         con = original_connect(database=None)
