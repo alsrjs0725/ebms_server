@@ -5,6 +5,7 @@
 """
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 import uuid
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 import pymysql
 
 from . import constant, db
+
+logger = logging.getLogger(__name__)
 
 # 세션 종류별 유효기간(초). 쓸 때마다 이만큼 연장됩니다.
 SESSION_SECONDS = {"web": constant.WEB_SESSION_SECONDS, "client": constant.CLIENT_SESSION_SECONDS}
@@ -74,6 +77,8 @@ def _promote_admin(cur, user_id: str) -> None:
     """
     if user_id in constant.ADMIN_USER_IDS:
         cur.execute("UPDATE user SET role = 'admin' WHERE id = %s AND role <> 'admin'", (user_id,))
+        if cur.rowcount:
+            logger.info(f"user {user_id} promoted to admin by EBMS_ADMIN_USER_IDS")
 
 
 def get_user(user_id: str) -> User | None:
@@ -142,6 +147,7 @@ def signup(profile: Profile, nickname: str, agreed: tuple[int | None, int | None
             if user is None:
                 raise
             return user
+    logger.info(f"user {user_id} signed up with {profile.oauth}")
     return get_user(user_id)
 
 
@@ -414,4 +420,6 @@ def delete_user(user_id: str) -> str:
         except Exception:
             con.rollback()
             raise
+    if result == "ok":
+        logger.info(f"user {user_id} deleted their account" + (" while suspended" if user.is_banned else ""))
     return result

@@ -2,6 +2,7 @@
 
 공지 조회는 로그인 없이 쓸 수 있습니다(로그인 전이나 세션이 만료된 클라이언트에도 알려야 하므로).
 """
+import logging
 import time
 from typing import Annotated, Literal
 
@@ -13,6 +14,8 @@ from . import auth, db
 from .accounts import User
 from .admin import _forbidden, web_admin
 from .templating import templates
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -121,6 +124,7 @@ def admin_create(body: NoticeBody, admin: Annotated[User, Depends(web_admin)]):
         )
         notice_id = cur.lastrowid
         con.commit()
+    logger.info(f"notice {notice_id} created by {admin.id}: {body.title!r} published={body.published}")
     return get_notice(notice_id)
 
 
@@ -141,6 +145,7 @@ def admin_update(notice_id: int, body: NoticeBody, admin: Annotated[User, Depend
             ),
         )
         con.commit()
+    logger.info(f"notice {notice_id} updated by {admin.id}: {body.title!r} published={body.published}")
     return get_notice(notice_id)
 
 
@@ -150,4 +155,5 @@ def admin_delete(notice_id: int, admin: Annotated[User, Depends(web_admin)]):
     with db.connect() as con, con.cursor() as cur:
         cur.execute("DELETE FROM notice WHERE id = %s", (notice_id,))
         con.commit()
+    logger.info(f"notice {notice_id} deleted by {admin.id}")
     return {"ok": True}

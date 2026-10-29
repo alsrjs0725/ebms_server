@@ -4,10 +4,6 @@ cp932와 cp949는 서로의 바이트를 오류 없이 푸는 경우가 많아 d
 잘못 풀면 늘어나는 문자(odd_chars)가 가장 적은 인코딩을 씁니다. 맞는 인코딩이 없으면 대체하지 않고
 (None, 이유들)을 돌려주며, 부르는 쪽이 오류로 처리합니다."""
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 def odd_chars(text: str) -> int:
     """잘못된 인코딩으로 풀면 늘어나는 문자 수. cp949 이름을 cp932로 풀면 반각 가타카나가,
@@ -34,7 +30,6 @@ def guess_encoding(raws: list[bytes], encodings: tuple[str, ...]) -> tuple[str |
         except UnicodeDecodeError as e:
             failures.append(f"{encoding}: {e.object[max(0, e.start - 20):e.end + 20]!r}")
             continue
-        logger.debug(f"encoding candidate[{encoding}] odd chars={score}")
         if best is None or score < best[1]:
             best = (encoding, score)
     return (best[0] if best else None), failures

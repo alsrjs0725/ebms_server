@@ -9,6 +9,7 @@
 """
 import asyncio
 import gzip
+import logging
 import mimetypes
 import re
 import struct
@@ -25,6 +26,8 @@ from . import constant, download_log, proxy, quota
 from .accounts import User
 from .auth import current_user, optional_api_session
 from .db import Database, StoreFile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -301,8 +304,9 @@ def pre_song_file(song_id: int, path: str, request: Request, user: Annotated[Use
         raise HTTPException(status_code=status, detail=detail)
     try:
         start, decompressor = zip_member(file, entry)
-    except ValueError:
+    except ValueError as e:
         file.close()
+        logger.error(f"broken song file: song {song_id} {path}: {e}")
         raise HTTPException(status_code=500, detail="broken song file. report this to admin.")
     rate = quota.meter_pre(user.id, entry["size"])
     return StreamingResponse(

@@ -319,9 +319,11 @@ def get_settings(admin: Annotated[User, Depends(web_admin)]):
 def put_settings(values: dict, admin: Annotated[User, Depends(web_admin)]):
     """보낸 항목만 바꿉니다. 하나라도 틀리면 아무것도 바꾸지 않고 400."""
     try:
-        return quota.update_settings(values)
+        settings = quota.update_settings(values)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    logger.info(f"settings changed by {admin.id}: {values}")
+    return settings
 
 
 @router.get("/api/admin/users")
@@ -614,7 +616,9 @@ def finish_uploads(body: UploadFinish, admin: Annotated[User, Depends(web_admin)
 @router.post("/api/admin/import/tmp")
 def import_tmp(admin: Annotated[User, Depends(web_admin)]):
     """`var/tmp/` 아래 곡을 대기 묶음으로 옮기는 작업을 백그라운드로 시작합니다."""
-    return importer.start_tmp_job().json()
+    job = importer.start_tmp_job()
+    logger.info(f"import job {job.id} by {admin.id}: {job.name}")
+    return job.json()
 
 
 def _stage_call(fn, *args, **kwargs):

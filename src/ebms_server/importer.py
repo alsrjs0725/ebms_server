@@ -609,7 +609,12 @@ def _start(job: Job, run) -> Job:
             job.error = (str(e) or type(e).__name__) + (f" ({job.source})" if job.source else "")
         if job.status == "done" and job.total == 0:
             job.error = "차트 파일(" + ", ".join(constant.BMS_FORMAT) + ")이 있는 폴더가 없습니다."
-        logger.info(f"import job {job.status}[{job.name}]: {len(job.songs)} songs")
+        failed = sum(1 for song in job.songs if song.get("error"))
+        logger.log(
+            logging.WARNING if job.status == "failed" else logging.INFO,
+            f"import job {job.status}[{job.name}]: {len(job.songs)} songs, {failed} failed, "
+            f"{int(time.time()) - job.started_at}s (job {job.id})" + (f": {job.error}" if job.error else ""),
+        )
 
     with _lock:
         _jobs[job.id] = job
