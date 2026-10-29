@@ -7,7 +7,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 from .db import Database
-from . import admin, api_keys, audit, auth, constant, downloads, home, importer, mcp, notices, policies, pre_rebalance, preview, proxy, retention, staging, tables
+from . import admin, api_keys, audit, auth, constant, downloads, home, importer, mcp, notices, policies, pre_rebalance, preview, proxy, render_index, retention, staging, tables
 from .templating import templates
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -187,12 +187,16 @@ async def lifespan(app: FastAPI):
     retention_stop = retention.start()
     # 등록한 난이도표를 주기적으로 다시 읽는다(새로 실린 곡)
     tables_stop = tables.start()
+    # 모든 곡 차트를 조금씩 렌더 색인해 중복·섞임 의심을 관리자 목록에 쌓는다(render_index.py)
+    render_index_stop = render_index.start()
     yield
     store_stop.set()
     if retention_stop is not None:
         retention_stop.set()
     if tables_stop is not None:
         tables_stop.set()
+    if render_index_stop is not None:
+        render_index_stop.set()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -222,6 +226,7 @@ app.include_router(api_keys.router)
 app.include_router(mcp.router)
 app.include_router(notices.router)
 app.include_router(tables.router)
+app.include_router(render_index.router)
 app.include_router(policies.router)
 app.include_router(home.router)
 app.middleware("http")(auth.refresh_session_cookie)

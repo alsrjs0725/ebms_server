@@ -12,7 +12,8 @@ document.querySelectorAll("[data-tab]").forEach((btn) => btn.addEventListener("c
 // ---- 곡 목록 ----
 const songRows = document.getElementById("song-rows");
 const songDetail = document.getElementById("song-detail");
-let songQuery = "";
+// 다른 화면(중복·섞임 점검 등)에서 /admin/songs?q=곡번호로 열면 그 검색어로 시작합니다.
+let songQuery = new URLSearchParams(location.search).get("q") || "";
 let songPage = 1;
 let currentSong = null;
 
@@ -320,6 +321,7 @@ document.getElementById("song-delete").addEventListener("click", async () => {
     }
 });
 
+document.getElementById("song-q").value = songQuery;
 loadSongs(1);
 
 // ---- 곡 임포트 ----

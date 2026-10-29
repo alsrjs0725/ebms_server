@@ -75,6 +75,9 @@ services:
       EBMS_RETENTION_INTERVAL_HOURS: ${EBMS_RETENTION_INTERVAL_HOURS:-24}
       # 등록한 난이도표를 다시 읽는 주기(시간). 0이면 관리자 페이지에서 직접(docs/admin.md)
       EBMS_TABLE_REFRESH_HOURS: ${EBMS_TABLE_REFRESH_HOURS:-24}
+      # 모든 곡 렌더 색인(중복·섞임 점검, docs/admin.md): 한 번에 몇 분씩, 자동으로 몇 시간마다(0이면 관리자가 직접만).
+      EBMS_RENDER_INDEX_HOURS: ${EBMS_RENDER_INDEX_HOURS:-0}
+      EBMS_RENDER_INDEX_MINUTES: ${EBMS_RENDER_INDEX_MINUTES:-120}
       # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
       EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
     ports:
