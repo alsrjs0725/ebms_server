@@ -1,4 +1,6 @@
 """모든 곡 렌더 색인(render_index): 다른 곡 번호의 같은 곡(중복)과 곡 안에 섞인 다른 곡(섞임) 찾기."""
+import logging
+
 import numpy as np
 
 from ebms_server import render_index, render_match
@@ -82,3 +84,37 @@ def test_run_with_zero_minutes_leaves_work(client, monkeypatch):
     upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
     assert render_index.run(0) is True
     assert render_index.status_()["indexed_songs"] == 0 and render_index.status_()["left"] is True
+
+
+def test_parse_output_joins_traceback_and_raw_stderr():
+    lines = [
+        "Traceback (most recent call last):\n",  # 로그 설정 전에 죽은 경우(stderr)
+        '  File "<string>", line 1\n',
+        "FileNotFoundError: x\n",
+        "INFO|ebms_server.render_index|start\n",
+        "ERROR|ebms_server.render_index|run failed\n",
+        "Traceback (most recent call last):\n",
+        "OSError: y\n",
+        "INFO|result|1\n",
+    ]
+    out = list(render_index.parse_output(lines))
+    assert out[0][0] == logging.ERROR and out[0][1] == "ebms_server.render_index.process" and "FileNotFoundError: x" in out[0][2]
+    assert out[1] == (logging.INFO, "ebms_server.render_index", "start")
+    assert out[2][0] == logging.ERROR and out[2][2].endswith("OSError: y")
+    assert out[3] == (logging.INFO, "result", "1")
+
+
+def test_worker_process_logs_reach_server(monkeypatch, tmp_path, caplog):
+    """색인 프로세스의 로그(오류 traceback 포함)가 웹 서버 로거로 남고, 끝나면 done이 섭니다."""
+    monkeypatch.setenv("EBMS_RENDER_INDEX_DIR", str(tmp_path / "ri"))
+    monkeypatch.setenv("EBMS_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("EBMS_DB_PORT", "1")  # 연결 실패 → run이 오류를 남기고 끝남
+    monkeypatch.setenv("EBMS_RENDER_INDEX_CPUS", "none")
+    caplog.set_level(logging.INFO)
+    proc = render_index._spawn(1)
+    assert render_index._spawn(1) is None  # 돌고 있으면 새로 띄우지 않음
+    assert proc.done.wait(120)
+    assert proc.left is False and proc.proc.returncode == 0
+    messages = [r.getMessage() for r in caplog.records if r.name.startswith("ebms_server.render_index")]
+    assert any("render index process" in m for m in messages)
+    assert any("render index run failed" in m and "Traceback" in m for m in messages)

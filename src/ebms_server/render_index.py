@@ -415,69 +415,60 @@ def _cpus() -> set[int] | None:
     return (wanted & available) or None
 
 
-class _QueueLog(logging.Handler):
-    """색인 프로세스의 로그를 웹 서버로 보냅니다(웹 서버가 ebms.log에 남겨 관리자 로그에서 보이게)."""
-
-    def __init__(self, queue):
-        super().__init__()
-        self.queue = queue
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            if record.exc_info:
-                record.exc_text = logging.Formatter().formatException(record.exc_info)
-                record.exc_info = None
-            record.msg, record.args = record.getMessage(), None
-            self.queue.put(("log", record))
-        except Exception:
-            pass
-
-
-def _process_main(minutes: float, queue) -> None:
-    """색인 프로세스: 웹 서버와 GIL을 나누지 않도록 따로 띄우고, 정한 코어에 붙여 낮은 우선순위로 돕니다(ffmpeg도 물려받음)."""
-    logging.basicConfig(level=logging.INFO, handlers=[_QueueLog(queue)], force=True)
-    left = False
-    try:
-        cpus = _cpus()
-        if cpus:
-            os.sched_setaffinity(0, cpus)
-        os.nice(NICE)
-        logger.info(f"render index process {os.getpid()}: cpus {sorted(cpus) if cpus else 'any'}, {minutes} min")
-        left = run(minutes)
-    except Exception:
-        logger.exception("render index process failed")
-    queue.put(("result", left))
-
-
 class _Run:
-    """띄운 색인 프로세스 하나. done이 서면 끝났고 left는 할 일이 남았는지."""
+    """띄운 색인 프로세스 하나(python -m ebms_server.render_index_worker). 프로세스의 stdout·stderr를 모두 받아
+    웹 서버 로거로 다시 남기므로(ebms.log → 관리자 로그 화면) 로그 설정 전에 죽어도 traceback이 남습니다.
+    done이 서면 끝났고, left는 할 일이 남았는지."""
 
-    def __init__(self, proc, queue):
-        self.proc = proc
-        self.queue = queue
+    def __init__(self, minutes: float):
+        import subprocess
+        import sys
+
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "ebms_server.render_index_worker", str(minutes)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, text=True, encoding="utf-8", errors="replace",
+        )
         self.left = False
         self.done = threading.Event()
         threading.Thread(target=self._pump, name="render_index_pump", daemon=True).start()
 
     def _pump(self) -> None:
-        import queue as queue_module
-
-        while True:
-            try:
-                kind, value = self.queue.get(timeout=5)
-            except queue_module.Empty:
-                if not self.proc.is_alive():
-                    break
-                continue
-            if kind == "log":
-                logging.getLogger(value.name).handle(value)
-            elif kind == "result":
-                self.left = value
-                break
-        self.proc.join(30)
-        if self.proc.exitcode not in (0, None):
-            logger.error(f"render index process exited with {self.proc.exitcode}")
+        for level, name, message in parse_output(self.proc.stdout):
+            if name == RESULT:
+                self.left = message == "1"
+            else:
+                logging.getLogger(name).log(level, message)
+        code = self.proc.wait()
+        if code != 0:
+            logger.error(f"render index process exited with {code}")
         self.done.set()
+
+
+RESULT = "result"
+_LEVELS = {name: getattr(logging, name) for name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")}
+
+
+def parse_output(lines):
+    """색인 프로세스 출력 → (수준, 로거 이름, 메시지). 로그 줄은 "수준|로거|메시지"이고, 그 뒤에 붙는 줄(traceback 등)과
+    로그 설정 전에 stderr로 나온 줄은 앞 기록에 붙이거나 따로 ERROR로 남깁니다."""
+    current = None
+    for raw in lines:
+        line = raw.rstrip("\n")
+        level, sep, rest = line.partition("|")
+        if sep and level in _LEVELS and "|" in rest:
+            if current:
+                yield current
+            name, _, message = rest.partition("|")
+            current = (_LEVELS[level], name, message)
+        elif current:
+            current = (max(current[0], logging.ERROR if line.startswith("Traceback") else current[0]), current[1],
+                       current[2] + "\n" + line)
+        elif line.strip():
+            current = (logging.ERROR, __name__ + ".process", line)
+    if current:
+        yield current
 
 
 _proc_lock = threading.Lock()
@@ -486,17 +477,11 @@ _current: _Run | None = None  # 돌고 있는 색인 프로세스
 
 def _spawn(minutes: float) -> _Run | None:
     """색인 프로세스를 띄웁니다. 이미 돌고 있으면 None."""
-    import multiprocessing
-
     global _current
     with _proc_lock:
         if _current is not None and not _current.done.is_set():
             return None
-        ctx = multiprocessing.get_context("spawn")  # 스레드가 도는 웹 서버에서 fork하지 않습니다.
-        queue = ctx.Queue()
-        proc = ctx.Process(target=_process_main, args=(minutes, queue), name="render_index", daemon=True)
-        proc.start()
-        _current = _Run(proc, queue)
+        _current = _Run(minutes)
         return _current
 
 
