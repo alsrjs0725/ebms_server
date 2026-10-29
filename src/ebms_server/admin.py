@@ -487,14 +487,26 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
 
 class ChartDetach(BaseModel):
     charts: list[str]
+    # 모든 차트를 떼고 빈 곡은 사용 중지합니다. 같은 곡이 두 번호로 나뉜 것을 한 곡으로 합칠 때 씁니다.
+    unuse_empty: bool = False
+    reason: str = ""
 
 
 @router.post("/api/admin/songs/{song_id}/charts/detach")
 def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depends(web_admin)]):
     """곡에서 차트 몇 개(sha256)만 뗍니다. 다른 곡 차트가 잘못 병합된 경우, 떼고 나서 그 차트의 원본 폴더를
-    임포트하면 거기에 다시 붙습니다. 곡 zip에 든 그 차트 파일도 뺍니다."""
+    임포트하면 거기에 다시 붙습니다. 곡 zip에 든 그 차트 파일도 뺍니다.
+    unuse_empty면 모든 차트를 떼고 빈 곡을 사용 중지합니다. 사용 중지 기록에 차트가 없으므로 그 곡의 원본 폴더를
+    다른 곡에 임포트하면 차트가 그 곡에 붙습니다(같은 곡 합치기)."""
+    reason = body.reason.strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    database = db.Database()
     try:
-        result = db.Database().detach_charts(song_id, body.charts, timeout=DELETE_LOCK_TIMEOUT)
+        result = database.detach_charts(song_id, body.charts, timeout=DELETE_LOCK_TIMEOUT, allow_all=body.unuse_empty)
+        if result is not None and body.unuse_empty and not get_song_detail(song_id)["charts"]:
+            database.delete_song(song_id, reason, admin.id, timeout=DELETE_LOCK_TIMEOUT)
+            result["unused"] = True
     except TimeoutError:
         raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
     except ValueError as e:

@@ -2141,13 +2141,16 @@ class Database:
         shutil.rmtree(source, ignore_errors=True)
         preview.kick()
 
-    def detach_charts(self, song_id: int, chart_ids: list[str], timeout: float | None = None) -> dict | None:
+    def detach_charts(
+        self, song_id: int, chart_ids: list[str], timeout: float | None = None, allow_all: bool = False
+    ) -> dict | None:
         """곡에서 차트 몇 개만 뗍니다. 다른 곡의 차트가 잘못 병합돼 그 곡의 키음으로 재생될 때, 그 차트를
         원래 곡으로 다시 임포트하려고 씁니다. 없는 곡이면 None.
 
         차트 행은 song_id만 비워 남기고(차트 청크에서는 뺄 수 없음), 곡 zip에 같은 내용으로 든 차트 파일은 뺍니다.
         사용 중지 기록을 남기지 않으므로 뗀 차트는 다음 임포트 때 그 폴더의 곡에 다시 붙습니다.
         곡의 차트가 아니거나 모든 차트를 떼려 하면 ValueError(곡을 통째로 내리려면 delete_song).
+        allow_all이면 모든 차트도 뗍니다(같은 곡이 두 번호로 나뉜 것을 합치려고, 뗀 뒤 빈 곡을 사용 중지).
         {"detached": [sha256...], "removed_files": [곡 zip에서 뺀 경로...]}를 반환합니다."""
         wanted = set(chart_ids)
         if not wanted:
@@ -2166,7 +2169,7 @@ class Database:
                     foreign = sorted(wanted - set(charts))
                     if foreign:
                         raise ValueError(f"not charts of song {song_id}: {', '.join(foreign)}")
-                    if wanted == set(charts):
+                    if wanted == set(charts) and not allow_all:
                         raise ValueError("곡의 모든 차트는 뗄 수 없습니다. 곡을 사용 중지하세요.")
 
                     data = self._song_data(cur, song_id)

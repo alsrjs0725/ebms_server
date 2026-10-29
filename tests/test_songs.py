@@ -10,7 +10,7 @@ from ebms_server import admin, constant, db as db_module
 
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_client_auth import client_login
-from test_import import import_dir, import_tmp, make_zip, upload, wait  # noqa: F401
+from test_import import commit, import_dir, import_tmp, make_zip, stage, upload, wait  # noqa: F401
 from test_quota import admin_login
 
 
@@ -279,3 +279,29 @@ def test_detach_charts(client, monkeypatch):
     new_id = job["songs"][0]["song_id"]
     assert [c["sha256"] for c in client.get(f"/api/admin/songs/{new_id}").json()["charts"]] == [sha_b]
     assert client.get(f"/api/admin/songs/{new_id}/file", params={"path": "01.ogg"}).content == b"other"
+
+
+def test_detach_all_and_merge(client, monkeypatch):
+    """같은 곡이 두 번호로 나뉘었으면 한쪽 차트를 모두 떼고 빈 곡을 사용 중지한 뒤, 원본을 다른 쪽에 넣어 합칩니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
+    job = stage(client, "b.zip", make_zip({"b.bms": b"#TITLE A2\n", "01.ogg": b"a", "02.ogg": b"b"}))
+    unit = client.get(f"/api/admin/import/stages/{job['stage_id']}").json()["items"][0]
+    client.put(f"/api/admin/import/stages/{job['stage_id']}/units/{unit['id']}", json={"target": "new"})
+    assert commit(client, job)["songs"][0]["song_id"] == 2
+    sha_b = hashlib.sha256(b"#TITLE A2\n").hexdigest()
+
+    # 플래그 없이 모든 차트는 뗄 수 없습니다.
+    assert client.post("/api/admin/songs/2/charts/detach", json={"charts": [sha_b]}).status_code == 400
+    r = client.post("/api/admin/songs/2/charts/detach", json={"charts": [sha_b], "unuse_empty": True, "reason": "#1과 같은 곡"})
+    assert r.status_code == 200 and r.json()["unused"] is True
+    assert client.get("/api/admin/songs/2").status_code == 404
+    assert [s["song_id"] for s in manifest_songs()] == [1]
+
+    # 원본을 #1에 넣으면 차트가 #1에 붙습니다(사용 중지한 곡이라고 건너뛰지 않음).
+    job = stage(client, "b2.zip", make_zip({"b.bms": b"#TITLE A2\n", "01.ogg": b"a", "02.ogg": b"b"}))
+    unit = client.get(f"/api/admin/import/stages/{job['stage_id']}").json()["items"][0]
+    client.put(f"/api/admin/import/stages/{job['stage_id']}/units/{unit['id']}", json={"target": 1})
+    assert commit(client, job)["songs"][0]["song_id"] == 1
+    assert {c["sha256"] for c in client.get("/api/admin/songs/1").json()["charts"]} == {
+        hashlib.sha256(b"#TITLE A\n").hexdigest(), sha_b}
