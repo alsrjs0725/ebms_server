@@ -73,13 +73,15 @@ def import_tmp(client, slow=False):
     return commit(client, wait(client, r.json()), slow)
 
 
-def upload(client, name, data, chunk=100):
+def upload(client, name, data, chunk=None):
     """조각으로 올려 대기 묶음에 넣고, 그대로 commit한 결과를 반환합니다."""
     return commit(client, stage(client, name, data, chunk))
 
 
-def stage(client, name, data, chunk=100):
+def stage(client, name, data, chunk=None):
     """조각으로 올리고 대기 묶음에 넣는 작업이 끝날 때까지 기다린 결과를 반환합니다."""
+    # 이어 올리기를 시험하도록 여러 조각으로 나누되, 큰 파일(키음 wav 등)이 수천 번 PUT 하지 않게 최대 8조각
+    chunk = chunk or max(100, -(-len(data) // 8))
     r = client.post("/api/admin/import/uploads", json={"filename": name, "size": len(data)})
     assert r.status_code == 200, r.text
     upload_id = r.json()["id"]
