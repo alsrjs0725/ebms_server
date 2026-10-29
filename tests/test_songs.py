@@ -251,3 +251,31 @@ def test_unused_song_not_reimported(client, monkeypatch):
     assert client.post("/api/admin/songs/1/restore").status_code == 200
     job = upload(client, "again2.zip", make_zip({"b.bme": b"#TITLE B\n", "new.wav": b"w"}))
     assert job["songs"][0]["song_id"] == 1 and job["songs"][0]["added_files"] == ["new.wav"]
+
+
+def test_detach_charts(client, monkeypatch):
+    """다른 곡 차트가 잘못 병합된 곡에서 그 차트만 떼고, 원본 폴더를 새 곡으로 다시 넣습니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "host.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"host"}))
+    # 다른 곡(B)의 차트가 host에 병합돼 host의 01.ogg로 재생되는 상태
+    job = upload(client, "other.zip", make_zip({"a.bms": b"#TITLE A\n", "b.bms": b"#TITLE B\n", "01.ogg": b"other"}))
+    assert job["songs"][0]["song_id"] == 1
+    sha_a, sha_b = (hashlib.sha256(c).hexdigest() for c in (b"#TITLE A\n", b"#TITLE B\n"))
+    assert {c["sha256"] for c in client.get("/api/admin/songs/1").json()["charts"]} == {sha_a, sha_b}
+
+    assert client.post("/api/admin/songs/1/charts/detach", json={"charts": ["0" * 64]}).status_code == 400
+    assert client.post("/api/admin/songs/1/charts/detach", json={"charts": [sha_a, sha_b]}).status_code == 400
+    assert client.post("/api/admin/songs/9/charts/detach", json={"charts": [sha_b]}).status_code == 404
+    r = client.post("/api/admin/songs/1/charts/detach", json={"charts": [sha_b]})
+    assert r.json() == {"detached": [sha_b], "removed_files": ["b.bms"]}
+    song = client.get("/api/admin/songs/1").json()
+    assert [c["sha256"] for c in song["charts"]] == [sha_a]
+    assert {f["path"] for f in song["files"]} == {"a.bms", "01.ogg"}
+    assert [s["charts"] for s in manifest_songs()] == [[sha_a]]
+
+    # 원본 폴더를 다시 넣으면 뗀 차트가 새 곡에 붙습니다(사용 중지한 곡처럼 건너뛰지 않음).
+    job = upload(client, "b.zip", make_zip({"b.bms": b"#TITLE B\n", "01.ogg": b"other"}))
+    assert job["songs"][0]["new_song"] is True
+    new_id = job["songs"][0]["song_id"]
+    assert [c["sha256"] for c in client.get(f"/api/admin/songs/{new_id}").json()["charts"]] == [sha_b]
+    assert client.get(f"/api/admin/songs/{new_id}/file", params={"path": "01.ogg"}).content == b"other"

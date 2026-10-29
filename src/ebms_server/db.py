@@ -2146,6 +2146,73 @@ class Database:
         self.logger.info(f"restore_song: Restored song[{song_id}]")
         preview.kick()
 
+    def detach_charts(self, song_id: int, chart_ids: list[str], timeout: float | None = None) -> dict | None:
+        """곡에서 차트 몇 개만 뗍니다. 다른 곡의 차트가 잘못 병합돼 그 곡의 키음으로 재생될 때, 그 차트를
+        원래 곡으로 다시 임포트하려고 씁니다. 없는 곡이면 None.
+
+        차트 행은 song_id만 비워 남기고(차트 청크에서는 뺄 수 없음), 곡 zip에 같은 내용으로 든 차트 파일은 뺍니다.
+        사용 중지 기록을 남기지 않으므로 뗀 차트는 다음 임포트 때 그 폴더의 곡에 다시 붙습니다.
+        곡의 차트가 아니거나 모든 차트를 떼려 하면 ValueError(곡을 통째로 내리려면 delete_song).
+        {"detached": [sha256...], "removed_files": [곡 zip에서 뺀 경로...]}를 반환합니다."""
+        wanted = set(chart_ids)
+        if not wanted:
+            raise ValueError("charts required")
+        self._lock(timeout)
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT pre_chunk FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    pre_chunk = row[0]
+                    cur.execute("SELECT id, size, filename FROM chart WHERE song_id = %s", (song_id,))
+                    charts = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+                    foreign = sorted(wanted - set(charts))
+                    if foreign:
+                        raise ValueError(f"not charts of song {song_id}: {', '.join(foreign)}")
+                    if wanted == set(charts):
+                        raise ValueError("곡의 모든 차트는 뗄 수 없습니다. 곡을 사용 중지하세요.")
+
+                    data = self._song_data(cur, song_id)
+                    if data is None:
+                        raise ValueError(f"song {song_id}: zip data not found")
+                    removed: set[str] = set()
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        infos = {info.filename: info for info in zf.infolist()}
+                        for chart_id in wanted:
+                            size, filename = charts[chart_id]
+                            info = infos.get(filename)
+                            if info is not None and info.file_size == size and hashlib.sha256(zf.read(info)).hexdigest() == chart_id:
+                                removed.add(filename)
+                        if removed:
+                            buf = io.BytesIO()
+                            with zipfile.ZipFile(buf, "w") as out:
+                                for info in zf.infolist():
+                                    if info.filename not in removed:
+                                        out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=6)
+                            data = buf.getvalue()
+                    if removed:
+                        cur.execute(
+                            "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = %s",
+                            (len(data), hashlib.sha256(data).hexdigest(), json.dumps(zip_entries(data)), song_id),
+                        )
+                        self._put_song_data(cur, song_id, data)
+                    for chart_id in sorted(wanted):
+                        cur.execute("UPDATE chart SET song_id = NULL WHERE id = %s AND song_id = %s", (chart_id, song_id))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    if pre_chunk is not None:
+                        self._rebuild_pre_chunk(cur, pre_chunk)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        self.logger.info(f"detach_charts: Song[{song_id}] detached {sorted(wanted)}, removed files {sorted(removed)}")
+        preview.kick()
+        return {"detached": sorted(wanted), "removed_files": sorted(removed)}
+
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
         with connect() as con, con.cursor() as cur:
