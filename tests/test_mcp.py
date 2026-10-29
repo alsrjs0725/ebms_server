@@ -1,12 +1,15 @@
-"""병합 충돌 판단용 MCP 서버(/api/mcp): 관리자 API 키 인증, 도구 목록, case 자료, 추천 저장 테스트."""
+"""병합 충돌 판단용 MCP 서버(/api/mcp): 관리자 API 키 인증, 도구 목록, case 자료, 소리 조각, 추천 저장 테스트."""
+import base64
 
 from fastapi.testclient import TestClient
 
 from test_api_keys import bearer, create_key
 from test_auth import client  # noqa: F401  (fixture 재사용)
 from test_client_auth import client_login
-from test_conflicts import base, conflicted
+from test_conflicts import _media, base, conflicted, needs_ffmpeg
+from test_import import make_zip, stage, upload
 from test_quota import admin_login
+from test_staging import commit_stage, units
 
 
 def rpc(api, key, method, params=None, msg_id=1):
@@ -54,7 +57,7 @@ def test_initialize_and_tools(client, monkeypatch):
     r = api.post("/api/mcp", headers=bearer(key), json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert r.status_code == 202
     names = {t["name"] for t in rpc(api, key, "tools/list")["result"]["tools"]}
-    assert names == {"whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "submit_recommendation"}
+    assert names == {"whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation"}
     assert call(api, key, "whoami")["role"] == "admin"
     assert rpc(api, key, "nope")["error"]["code"] == -32601
     assert rpc(api, key, "tools/call", {"name": "nope"})["error"]["code"] == -32602
@@ -105,3 +108,37 @@ def test_case_and_recommendation(client, monkeypatch):
     assert items["k.wav"]["ai"]["choice"] == "new" and items["k.wav"]["ai"]["model"] == "flash"
     assert items["readme.txt"]["ai"]["choice"] == "unsure"
     assert listing["ai"]["summary"] == "같은 곡" and listing["ai"]["split_recommended"] is False
+
+
+@needs_ffmpeg
+def test_sound_clip(client, monkeypatch, tmp_path):
+    # 기존·새 키음을 같은 구간으로 잘라 오디오(mp3)와 스펙트로그램(png)으로 줍니다.
+    admin_login(client, monkeypatch)
+    old = _media(tmp_path, "old.wav", ["-f", "lavfi", "-i", "sine=f=440:d=3"])
+    new = _media(tmp_path, "new.wav", ["-f", "lavfi", "-i", "sine=f=880:d=3"])
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": old, "r.txt": b"a\n"}))
+    job = stage(client, "pack.zip", make_zip({"p/s/a.bms": b"#TITLE A\n", "p/s/k.wav": new, "p/s/r.txt": b"b\n"}))
+    sid = job["stage_id"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["pack/p/s"]
+    key = create_key(client)
+    api = TestClient(client.app)
+
+    result = rpc(api, key, "tools/call", {"name": "get_sound_clip", "arguments": {
+        "stage_id": sid, "unit_id": unit["id"], "path": "k.wav", "start": 1, "seconds": 1}})["result"]
+    assert not result.get("isError"), result
+    kinds = [c["type"] for c in result["content"]]
+    assert kinds == ["text", "text", "audio", "image", "text", "audio", "image"]
+    audio = [c for c in result["content"] if c["type"] == "audio"]
+    assert all(c["mimeType"] == "audio/mpeg" and base64.b64decode(c["data"])[:3] in (b"ID3", b"\xff\xfb", b"\xff\xf3") for c in audio)
+    images = [c for c in result["content"] if c["type"] == "image"]
+    assert all(base64.b64decode(c["data"])[:8] == b"\x89PNG\r\n\x1a\n" for c in images)
+
+    # 스펙트로그램만
+    only = rpc(api, key, "tools/call", {"name": "get_sound_clip", "arguments": {
+        "stage_id": sid, "unit_id": unit["id"], "path": "k.wav", "audio": False}})["result"]
+    assert [c["type"] for c in only["content"]] == ["text", "text", "image", "text", "image"]
+    # 키음이 아닌 충돌은 거부
+    bad = rpc(api, key, "tools/call", {"name": "get_sound_clip", "arguments": {
+        "stage_id": sid, "unit_id": unit["id"], "path": "r.txt"}})["result"]
+    assert bad["isError"]
