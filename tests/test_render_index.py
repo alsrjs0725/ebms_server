@@ -37,7 +37,8 @@ def test_index_finds_duplicate_and_mixed_songs(client, monkeypatch, tmp_path):
                                       .replace(b"03.wav", b"x3.wav"), **other}))
 
     assert client.get("/admin/render").status_code == 200
-    state = render_index.run(5)
+    assert render_index.run(5) is False
+    state = render_index.status_()
     assert state["indexed_songs"] == 3 and state["indexed_charts"] == 5 and not state["running"]
     found = client.get("/api/admin/render/findings").json()
     kinds = {(f["kind"], f["song_a"], f["song_b"]) for f in found}
@@ -52,13 +53,32 @@ def test_index_finds_duplicate_and_mixed_songs(client, monkeypatch, tmp_path):
     assert client.put(f"/api/admin/render/findings/{dup['id']}", json={"status": "dismissed"}).status_code == 200
     assert client.put("/api/admin/render/findings/999", json={"status": "dismissed"}).status_code == 404
     assert client.put(f"/api/admin/render/findings/{dup['id']}", json={"status": "x"}).status_code == 400
-    assert render_index.run(5)["songs"] == 0
+    render_index.run(5)
+    assert render_index.status_()["songs"] == 0
     assert [f["kind"] for f in client.get("/api/admin/render/findings").json()] == ["mixed"]
     assert [f["id"] for f in client.get("/api/admin/render/findings", params={"status": "dismissed"}).json()] == [dup["id"]]
 
     # 사용 중지한 곡은 색인과 열린 항목에서 빠집니다.
     assert client.request("DELETE", "/api/admin/songs/1", json={"reason": "test"}).status_code == 200
-    state = render_index.run(5)
+    render_index.run(5)
+    state = render_index.status_()
     assert state["indexed_songs"] == 2
     assert client.get("/api/admin/render/findings").json() == []
     assert client.get("/api/admin/render/index").json()["indexed_charts"] == 2
+
+
+def test_cpus(monkeypatch):
+    monkeypatch.setattr(render_index.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3})
+    monkeypatch.setattr(render_index.constant, "RENDER_INDEX_CPUS", "")
+    assert render_index._cpus() == {3}
+    monkeypatch.setattr(render_index.constant, "RENDER_INDEX_CPUS", "1, 2,9")
+    assert render_index._cpus() == {1, 2}
+    monkeypatch.setattr(render_index.constant, "RENDER_INDEX_CPUS", "none")
+    assert render_index._cpus() is None
+
+
+def test_run_with_zero_minutes_leaves_work(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
+    assert render_index.run(0) is True
+    assert render_index.status_()["indexed_songs"] == 0 and render_index.status_()["left"] is True

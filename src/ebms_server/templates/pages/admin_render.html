@@ -12,7 +12,7 @@
 <h1 class="h3 mb-4">중복·섞임 점검</h1>
 <p class="text-muted small">
     모든 곡의 차트를 키음으로 렌더해 소리 지문을 모아 두고, 다른 곡 번호인데 같은 곡(중복)과 한 곡 안에 섞인 다른 곡(섞임)을 찾습니다.
-    {% if state.interval_hours > 0 and state.minutes > 0 %}{{ state.interval_hours | round(1) }}시간마다 {{ state.minutes | round(0) | int }}분씩 아직 안 본 곡과 바뀐 곡을 색인합니다.{% else %}자동으로 색인하지 않으니 <b>지금 색인</b>으로 돌립니다.{% endif %}
+    {% if state.interval_hours > 0 and state.minutes > 0 %}아직 안 본 곡과 바뀐 곡을 따로 띄운 프로세스에서 상시로 색인하고, 다 보면 {{ state.interval_hours | round(1) }}시간 뒤 다시 봅니다.{% else %}자동으로 색인하지 않으니 <b>지금 색인</b>으로 돌립니다.{% endif %}
     자동으로 고치지 않으니, 확인한 뒤 곡 관리에서 합치거나 떼고 여기서는 <b>넘기기</b>로 목록에서 뺍니다.
 </p>
 

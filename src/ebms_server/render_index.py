@@ -183,8 +183,6 @@ CREATE TABLE IF NOT EXISTS finding(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
-_lock = threading.Lock()  # 색인 작업은 한 번에 하나
-_state: dict = {"running": False}
 
 
 def _path():
@@ -252,18 +250,31 @@ def _forget_song(con: sqlite3.Connection, song_id: int) -> None:
     con.execute("DELETE FROM finding WHERE status = 'open' AND (song_a = ? OR song_b = ?)", (song_id, song_id))
 
 
-def index_song(con: sqlite3.Connection, database: db.Database, song_id: int, sha256: str) -> dict:
+def _song_row(song_id: int) -> tuple[list[dict], db.StoreFile | None]:
+    """곡 zip의 파일 목록과 연 저장소 파일. 색인 프로세스에서 db.Database()(시작 작업이 무거움)를 만들지 않으려고 직접 읽습니다."""
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT files, size, sha256, path FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+    if row is None:
+        return [], None
+    files = json.loads(row[0]) if row[0] else []
+    try:
+        return files, db.StoreFile(row[1], row[2], row[3])
+    except FileNotFoundError:
+        return files, None
+
+
+def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
     """곡 하나를 (다시) 색인하고 그 곡이 낀 중복·섞임을 찾습니다."""
-    files = database.get_song_files(song_id) or []
+    files, file = _song_row(song_id)
     paths = [f["path"] for f in files if f["path"].lower().endswith(constant.BMS_FORMAT)]
     _forget_song(con, song_id)
     groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
     dups: dict[int, dict] = {}
-    file = database.open_file("song", song_id) if paths else None
     if paths and file is None:
-        return {"song_id": song_id, "skipped": "gone"}
+        raise FileNotFoundError(f"song {song_id} file")
     stored = 0
-    if file is not None:
+    if file is not None and paths:
         with os.fdopen(os.dup(file._fd), "rb") as raw, zipfile.ZipFile(raw) as zf:
             file.close()
             names = [i.filename for i in zf.infolist() if not i.is_dir()]
@@ -321,7 +332,7 @@ def _group(groups: list, path: str, fp: render_match.Fingerprint) -> None:
         groups.append((fp, [path]))
 
 
-def _live_songs(database: db.Database) -> dict[int, str]:
+def _live_songs() -> dict[int, str]:
     with db.connect() as con, con.cursor() as cur:
         cur.execute("SELECT id, sha256 FROM song")
         return {row[0]: row[1] for row in cur.fetchall()}
@@ -334,22 +345,25 @@ def compact(con: sqlite3.Connection) -> int:
     return n
 
 
-def run(minutes: float) -> dict:
-    """색인 안 된 곡(번호 순), 그다음 내용이 바뀐 곡을 minutes 동안 색인합니다. 이미 돌고 있으면 그 상태를 돌려줍니다."""
-    if not _lock.acquire(blocking=False):
-        return status_()
+def _save_state(con: sqlite3.Connection, **values) -> None:
+    """진행 상황은 색인 파일(meta)에 둡니다. 색인은 별도 프로세스에서 돌고 웹 서버가 읽습니다."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'run'").fetchone()
+    state = json.loads(row[0]) if row else {}
+    state.update(values)
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('run', ?)", (json.dumps(state),))
+    con.commit()
+
+
+def run(minutes: float) -> bool:
+    """색인 안 된 곡(번호 순), 그다음 내용이 바뀐 곡을 minutes 동안 색인합니다. 할 일이 남았으면 True."""
+    started = time.time()
+    deadline = time.monotonic() + minutes * 60
+    con = connect()
+    left = False
     try:
+        _save_state(con, started_at=int(started), finished_at=None, songs=0, song=None, error=None)
         try:
-            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), NICE)
-        except OSError:
-            pass
-        started = time.time()
-        deadline = time.monotonic() + minutes * 60
-        _state.update(running=True, started_at=int(started), songs=0, error=None, song=None)
-        database = db.Database()
-        con = connect()
-        try:
-            live = _live_songs(database)
+            live = _live_songs()
             known = dict(con.execute("SELECT id, sha256 FROM song").fetchall())
             gone = set(known) - set(live)
             for song_id in gone:
@@ -357,12 +371,14 @@ def run(minutes: float) -> dict:
             con.commit()
             changed = sorted(s for s in live if s in known and known[s] != live[s])
             todo = sorted(s for s in live if s not in known) + changed
+            done = 0
             for song_id in todo:
                 if time.monotonic() > deadline:
+                    left = True
                     break
-                _state["song"] = song_id
+                _save_state(con, song=song_id, songs=done)
                 try:
-                    index_song(con, database, song_id, live[song_id])
+                    index_song(con, song_id, live[song_id])
                 except Exception:
                     con.rollback()
                     logger.exception(f"render index failed[song {song_id}]")
@@ -371,46 +387,100 @@ def run(minutes: float) -> dict:
                     con.execute("INSERT INTO song(id, sha256, charts, indexed_at) VALUES (?, ?, -1, ?)",
                                 (song_id, live[song_id], int(time.time())))
                     con.commit()
-                _state["songs"] += 1
+                done += 1
             if gone or changed:
                 compact(con)
-        finally:
-            con.close()
-        logger.info(f"render index: {_state['songs']} songs in {int(time.time() - started)}s")
-    except Exception as e:
-        logger.exception("render index run failed")
-        _state["error"] = str(e) or type(e).__name__
+            _save_state(con, songs=done, song=None, finished_at=int(time.time()), left=left)
+            logger.info(f"render index: {done} songs in {int(time.time() - started)}s, left={left}")
+        except Exception as e:
+            logger.exception("render index run failed")
+            _save_state(con, song=None, finished_at=int(time.time()), error=str(e) or type(e).__name__)
     finally:
-        _state.update(running=False, song=None, finished_at=int(time.time()))
-        _lock.release()
-    return status_()
+        con.close()
+    return left
+
+
+def _cpus() -> set[int] | None:
+    """색인 프로세스를 붙일 코어. RENDER_INDEX_CPUS("3", "2,3", "none")가 비면 마지막 코어 하나."""
+    value = constant.RENDER_INDEX_CPUS.strip().lower()
+    if value == "none":
+        return None
+    try:
+        available = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        return None
+    if not value:
+        return {max(available)} if len(available) > 1 else None
+    wanted = {int(x) for x in value.split(",") if x.strip()}
+    return (wanted & available) or None
+
+
+def _process_main(minutes: float, queue) -> None:
+    """색인 프로세스: 웹 서버와 GIL을 나누지 않도록 따로 띄우고, 정한 코어에 붙여 낮은 우선순위로 돕니다(ffmpeg도 물려받음)."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cpus = _cpus()
+    if cpus:
+        try:
+            os.sched_setaffinity(0, cpus)
+        except OSError:
+            pass
+    try:
+        os.nice(NICE)
+    except OSError:
+        pass
+    queue.put(run(minutes))
+
+
+_proc_lock = threading.Lock()
+_proc = None  # 돌고 있는 색인 프로세스
+
+
+def _spawn(minutes: float):
+    """색인 프로세스를 띄웁니다. (프로세스, 결과 큐). 이미 돌고 있으면 None."""
+    import multiprocessing
+
+    global _proc
+    with _proc_lock:
+        if _proc is not None and _proc.is_alive():
+            return None
+        ctx = multiprocessing.get_context("spawn")  # 스레드가 도는 웹 서버에서 fork하지 않습니다.
+        queue = ctx.Queue()
+        _proc = ctx.Process(target=_process_main, args=(minutes, queue), name="render_index", daemon=True)
+        _proc.start()
+        return _proc, queue
+
+
+def running() -> bool:
+    return _proc is not None and _proc.is_alive()
 
 
 def status_() -> dict:
-    out = {k: _state.get(k) for k in ("running", "started_at", "finished_at", "songs", "song", "error")}
+    out = {"running": running()}
     if _path().exists():
         con = connect()
         try:
+            row = con.execute("SELECT value FROM meta WHERE key = 'run'").fetchone()
+            out.update(json.loads(row[0]) if row else {})
             out["indexed_songs"] = con.execute("SELECT COUNT(*) FROM song").fetchone()[0]
             out["indexed_charts"] = con.execute("SELECT COUNT(*) FROM chart").fetchone()[0]
             out["open_findings"] = con.execute("SELECT COUNT(*) FROM finding WHERE status = 'open'").fetchone()[0]
         finally:
             con.close()
+    if not out["running"]:
+        out["song"] = None
     out["interval_hours"] = constant.RENDER_INDEX_HOURS
     out["minutes"] = constant.RENDER_INDEX_MINUTES
     return out
 
 
 def start_now(minutes: float) -> dict:
-    if _state.get("running"):
-        return status_()
-    threading.Thread(target=run, args=(minutes,), name="render_index", daemon=True).start()
-    time.sleep(0.05)
+    _spawn(minutes)
     return status_()
 
 
 def start() -> threading.Event | None:
-    """RENDER_INDEX_HOURS마다 RENDER_INDEX_MINUTES씩 색인하는 스레드. 0이면 띄우지 않습니다.
+    """상시 색인: 할 일이 남아 있으면 RENDER_INDEX_MINUTES분씩 쉬지 않고 이어 돌고, 다 보면 RENDER_INDEX_HOURS 뒤에
+    새 곡·바뀐 곡을 다시 봅니다. 둘 중 하나가 0이면 띄우지 않습니다(관리자 "지금 색인"만).
     서버가 막 켜졌을 때는 백필·복구가 돌므로 RENDER_INDEX_START_DELAY 뒤에 처음 돕니다."""
     if constant.RENDER_INDEX_HOURS <= 0 or constant.RENDER_INDEX_MINUTES <= 0:
         return None
@@ -419,9 +489,24 @@ def start() -> threading.Event | None:
     def loop():
         if stop.wait(constant.RENDER_INDEX_START_DELAY):
             return
-        while True:
-            run(constant.RENDER_INDEX_MINUTES)
-            if stop.wait(constant.RENDER_INDEX_HOURS * 3600):
+        while not stop.is_set():
+            spawned = _spawn(constant.RENDER_INDEX_MINUTES)
+            left = True
+            if spawned is None:  # 관리자가 띄운 것이 돌고 있음
+                if stop.wait(60):
+                    return
+                continue
+            proc, queue = spawned
+            while proc.is_alive() and not stop.wait(5):
+                pass
+            if stop.is_set():
+                proc.terminate()
+                return
+            try:
+                left = queue.get(timeout=5)
+            except Exception:
+                left = False  # 비정상 종료: 주기만큼 쉬고 다시
+            if not left and stop.wait(constant.RENDER_INDEX_HOURS * 3600):
                 return
 
     threading.Thread(target=loop, name="render_index_loop", daemon=True).start()
