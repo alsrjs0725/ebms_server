@@ -36,10 +36,13 @@ PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "ebms-conflicts", "version": "1"}
 AI_CHOICES = ("old", "new", "unsure")
 # get_conflict_case 한 번에 주는 충돌 수
-CASE_LIMIT = 50
-CASE_MAX_LIMIT = 200
+CASE_LIMIT = 20
+CASE_MAX_LIMIT = 50
+# 한 번 응답에 비교를 계산하는 시간 상한(초). 넘으면 그때까지 계산한 것만 주고 next_offset으로 이어 받게 합니다
+# (앞단 프록시가 90초에 끊으므로). 계산한 비교는 캐시돼 다음에는 빠릅니다.
+CASE_SECONDS = 30.0
 # 차트 diff를 case에 넣을 때 앞부분 줄 수(전체는 get_file_diff)
-CASE_DIFF_LINES = 60
+CASE_DIFF_LINES = 30
 DIFF_MAX_LINES = 2000
 # 그 파일을 쓰는 차트가 이보다 많으면 개수만 줍니다.
 USED_BY_LIST = 5
@@ -57,7 +60,9 @@ EBMS 곡 임포트에서 기존 곡에 병합하려다 같은 경로에 내용�
 파일마다 old(기존 곡 파일 유지)·new(새 파일로 바꿈)·unsure(사람이 봐야 함) 중 하나를 추천하고 submit_recommendation으로 남깁니다.
 추천은 저장만 되고 바로 적용되지 않습니다. 관리자가 화면에서 확인한 뒤 적용합니다.
 
-순서: list_conflict_units → get_conflict_case(offset을 늘려 가며 모든 충돌) → 필요하면 get_file_diff·get_sound_clip → submit_recommendation.
+순서: list_conflict_units → get_conflict_case → (필요하면 get_file_diff·get_sound_clip) → 그 페이지의 submit_recommendation →
+next_offset이 있으면 그 offset으로 다음 페이지. 페이지를 받을 때마다 바로 추천을 저장하세요(모아 두었다가 한 번에 내지 말 것).
+곡 정보(existing_songs, new_charts)는 offset 0 응답에만 있습니다. 셸이나 파일 도구는 필요 없습니다.
 수치로 판단하기 어려운 키음(상관계수가 애매함, 싱크·품질 차이, 리믹스 의심)은 get_sound_clip으로 기존·새 소리를 직접 들어 봅니다.
 소리를 들을 수 없으면 같이 오는 스펙트로그램(세로축 주파수, 위쪽이 비어 있으면 손실 압축으로 고음이 잘린 것)을 봅니다.
 
@@ -65,6 +70,7 @@ EBMS 곡 임포트에서 기존 곡에 병합하려다 같은 경로에 내용�
 1. 다른 곡 의심이 먼저입니다. existing_songs와 new_charts의 제목·아티스트가 다르거나, 키음 상관계수(correlation과
    aligned_correlation)가 둘 다 낮으면(0.5 미만) 이름만 같은 다른 소재입니다. 이때 그 파일은 old로 두고 split_recommended=true,
    issues에 "다른 곡"이라고 적습니다. 새 파일로 바꾸면 기존 곡 차트가 다른 소리를 냅니다.
+   길이가 같아도 상관계수가 낮으면 리믹스·다른 믹스입니다. old로 두더라도 issues에 꼭 적어 관리자가 알게 합니다.
 2. 같은 소재(상관계수 높음)면 quality.better 쪽을 고릅니다. same이면 old.
 3. 싱크만 다르면(offset_ms가 크고 aligned_correlation이 높음): 그 키음을 쓰는 차트(used_by_old/used_by_new)가 어느 쪽 싱크에
    맞춰졌는지가 기준입니다. 한쪽 차트만 쓰면 그쪽, 양쪽이 다 쓰면 unsure.
@@ -100,7 +106,8 @@ TOOLS = [
         "name": "get_conflict_case",
         "description": (
             "곡 하나의 판단 자료: 겨룬 기존 곡과 차트, 새 차트(same_as_registered/conflict/new_chart), "
-            "충돌 파일마다 비교 수치·품질·그 파일을 쓰는 차트. offset·limit으로 나눠 받습니다."
+            "충돌 파일마다 비교 수치·품질·그 파일을 쓰는 차트. offset·limit으로 나눠 받습니다. "
+            "곡 정보는 offset 0에만 있고, 비교 계산이 오래 걸리면 limit보다 적게 주므로 next_offset으로 이어 받습니다."
         ),
         "inputSchema": {
             "type": "object",
@@ -367,7 +374,15 @@ def _image_facts(old: bytes, old_name: str, new: bytes, new_name: str) -> dict:
     }
 
 
+def _compact(value):
+    """값이 없는 항목(None, 빈 목록·사전)을 뺍니다."""
+    if isinstance(value, dict):
+        return {k: _compact(v) for k, v in value.items() if v is not None and v != [] and v != {}}
+    return value
+
+
 def get_conflict_case(stage_id: str, unit_id: str, offset: int = 0, limit: int = CASE_LIMIT) -> dict:
+    started = time.monotonic()
     limit = max(1, min(int(limit), CASE_MAX_LIMIT))
     offset = max(0, int(offset))
     listing = conflicts.list_conflicts(stage_id, unit_id)
@@ -391,6 +406,8 @@ def get_conflict_case(stage_id: str, unit_id: str, offset: int = 0, limit: int =
 
     out_items = []
     for item in page:
+        if out_items and time.monotonic() - started > CASE_SECONDS:
+            break
         song_id = item["song_id"]
         rec = {
             "path": item["path"],
@@ -412,13 +429,25 @@ def get_conflict_case(stage_id: str, unit_id: str, offset: int = 0, limit: int =
             conflict_stems = {posixpath.splitext(p.lower())[0]: p for p in sound_paths}
             rec["conflict_sounds_old"] = sorted(conflict_stems[s] for s in stems(old_charts[song_id], item["old_path"] or item["path"]) if s in conflict_stems)
             rec["conflict_sounds_new"] = sorted(conflict_stems[s] for s in stems(new_charts, item["path"]) if s in conflict_stems)
-        rec["compare"] = _facts(stage, unit, item)
-        out_items.append(rec)
+        facts = _facts(stage, unit, item)
+        facts.pop("min_correlation", None)
+        rec["compare"] = facts
+        out_items.append(_compact(rec))
 
-    return {
+    done = offset + len(out_items)
+    result = {
         "stage_id": stage_id,
         "unit_id": unit_id,
         "folder": unit["folder"],
+        "total": len(all_items),
+        "offset": offset,
+        "next_offset": done if done < len(all_items) else None,
+        "items": out_items,
+    }
+    if offset:
+        return result
+    # 곡 정보는 첫 페이지에만 넣습니다(페이지마다 같은 내용이라).
+    result.update({
         "existing_songs": {
             str(song_id): {
                 "folder": listing["songs"].get(str(song_id)),
@@ -434,11 +463,9 @@ def get_conflict_case(stage_id: str, unit_id: str, offset: int = 0, limit: int =
             for p, v in new_charts.items()
         ],
         "ai": {k: v for k, v in (unit.get("ai") or {}).items() if k != "items"} or None,
-        "total": len(all_items),
-        "offset": offset,
-        "next_offset": offset + len(page) if offset + len(page) < len(all_items) else None,
-        "items": out_items,
-    }
+        "min_correlation": media_match.SOUND_MIN_CORRELATION,
+    })
+    return result
 
 
 def get_file_diff(stage_id: str, unit_id: str, path: str, max_lines: int = DIFF_MAX_LINES) -> dict:

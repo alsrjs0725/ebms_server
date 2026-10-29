@@ -163,7 +163,7 @@ AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) �
 | --- | --- | --- |
 | `whoami` | 사용자 | 이 연결의 사용자 `{id, nickname, role(user/admin)}` |
 | `list_conflict_units` | 관리자 | 검토 대기 묶음에서 병합 충돌이 남은 곡. `pending_only`(기본 true)면 AI 추천이 덜 된 곡만 |
-| `get_conflict_case` | 관리자 | 곡 하나의 판단 자료: 겨룬 기존 곡과 차트, 새 차트의 상태(`same_as_registered`/`conflict`/`new_chart`), 충돌 파일마다 비교 수치(키음 상관계수·싱크 오차, 그림 차이, 영상 프레임 차이, 품질, 차트 diff 앞부분·`#WAV` 번호 바뀜)와 그 파일을 쓰는 차트(`used_by_old/new`, 차트면 `conflict_sounds_old/new`). `offset`·`limit`(기본 50, 최대 200)으로 나눠 받습니다 |
+| `get_conflict_case` | 관리자 | 곡 하나의 판단 자료: 겨룬 기존 곡과 차트, 새 차트의 상태(`same_as_registered`/`conflict`/`new_chart`), 충돌 파일마다 비교 수치(키음 상관계수·싱크 오차, 그림 차이, 영상 프레임 차이, 품질, 차트 diff 앞부분·`#WAV` 번호 바뀜)와 그 파일을 쓰는 차트(`used_by_old/new`, 차트면 `conflict_sounds_old/new`). `offset`·`limit`(기본 20, 최대 50)으로 나눠 받습니다. 곡 정보(`existing_songs`·`new_charts`)는 `offset` 0 응답에만 있고, 값이 없는 항목은 뺍니다. 비교 계산이 30초를 넘으면 그때까지 계산한 것만 주므로(앞단 프록시 시간 제한) `next_offset`으로 이어 받습니다. 계산한 비교는 캐시돼 다시 부르면 빠릅니다 |
 | `get_file_diff` | 관리자 | 텍스트 충돌 파일의 전체 diff(최대 2000줄) |
 | `get_sound_clip` | 관리자 | 키음 충돌의 기존·새 소리를 같은 구간(`start`초부터 `seconds`초, 기본 10초·최대 30초)으로 잘라 MCP content로 줍니다: 오디오(`audio/mpeg`, 192kbps)와 스펙트로그램(`image/png`). `audio`·`spectrogram`을 false로 하면 뺍니다. 오디오를 못 받는 모델은 스펙트로그램을 봅니다 |
 | `submit_recommendation` | 관리자 | 충돌 파일마다 `old`/`new`/`unsure` 추천(`confidence`, `reason`)과 곡 전체 판단(`summary`, `split_recommended`, `issues`, `model`)을 저장합니다 |
