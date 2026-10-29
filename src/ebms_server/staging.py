@@ -36,7 +36,7 @@ import time
 import uuid
 import zipfile
 
-from . import cache, constant, db, decode_cache, importer, rar, render_match, sevenzip, store
+from . import cache, constant, db, decode_cache, importer, preview, rar, render_match, sevenzip, store
 from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
@@ -1218,6 +1218,9 @@ def _render_check(unit: dict, song_dir: pathlib.Path, charts: list[str], song_id
         return [], []
     if not replaced:
         return [], []
+    if preview._ffmpeg() is None:
+        logger.warning("render check: ffmpeg not found. Charts are merged without the render check.")
+        return [], sorted(replaced)
     sha = {c["path"]: c["sha256"] for c in unit["charts"]}
     names = list(files)
     mine_read = lambda p: files[p].read_bytes()
