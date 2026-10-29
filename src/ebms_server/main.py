@@ -39,6 +39,7 @@ def configure_logging() -> None:
     )
     configure_audit_log(formatter)
     configure_access_log()
+    configure_uvicorn_log()
 
 
 def configure_audit_log(formatter: logging.Formatter) -> None:
@@ -66,6 +67,16 @@ def configure_access_log() -> None:
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     access_logger.addHandler(handler)
     access_logger.propagate = False
+
+
+def configure_uvicorn_log() -> None:
+    """uvicorn 자체 로그(요청 처리 중 난 예외의 트레이스백, 시작·종료)를 uvicorn의 stderr 핸들러 대신 루트로 보내
+    ebms.log에도 남깁니다. 그대로 두면 500의 원인이 docker 로그에만 남고 관리자 로그 화면에는 보이지 않습니다."""
+    uvicorn_logger = logging.getLogger("uvicorn")
+    for handler in uvicorn_logger.handlers[:]:
+        uvicorn_logger.removeHandler(handler)
+        handler.close()
+    uvicorn_logger.propagate = True
 
 
 def background_startup() -> None:

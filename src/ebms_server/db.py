@@ -1584,8 +1584,6 @@ class Database:
                     con.rollback()
                     raise
             progress.update(i)
-        if todo:
-            self.logger.info(f"backfill_pre_chunks: Built {len(todo)} pre chunks.")
         return len(todo)
 
     def get_song_data(self, song_id: int) -> bytes | None:
@@ -1686,7 +1684,6 @@ class Database:
         )
         song_id = cur.lastrowid
         self._put_song_data(cur, song_id, data)
-        self.logger.info(f"insert_song: Inserted new song[{song_id}, {len(data)} bytes]")
         return song_id, len(data)
 
     def _next_song_id(self, cur) -> int | None:
@@ -2074,7 +2071,6 @@ class Database:
                     raise
         finally:
             self._write_lock.release()
-        self.logger.info(f"delete_song: Moved song[{song_id}] to {target}")
         return True
 
     def restore_song(self, song_id: int, timeout: float | None = None) -> None:
@@ -2143,7 +2139,6 @@ class Database:
         finally:
             self._write_lock.release()
         shutil.rmtree(source, ignore_errors=True)
-        self.logger.info(f"restore_song: Restored song[{song_id}]")
         preview.kick()
 
     def detach_charts(self, song_id: int, chart_ids: list[str], timeout: float | None = None) -> dict | None:
@@ -2209,7 +2204,6 @@ class Database:
                     raise
         finally:
             self._write_lock.release()
-        self.logger.info(f"detach_charts: Song[{song_id}] detached {sorted(wanted)}, removed files {sorted(removed)}")
         preview.kick()
         return {"detached": sorted(wanted), "removed_files": sorted(removed)}
 
@@ -2353,7 +2347,7 @@ class SongBatch:
             self.logger.warning(f"insert_song failed: Path isn't directory[{root}]")
             return None
         if not chart_files(root):
-            self.logger.warning(f"insert_song failed: No valid file in folder. Suporting ext: {constant.BMS_FORMAT}")
+            self.logger.warning(f"insert_song failed: No chart file ({', '.join(constant.BMS_FORMAT)}) in folder[{root}]")
             return None
 
         self._begin()
@@ -2430,7 +2424,9 @@ class SongBatch:
         elif remove:
             # 곡에 넣지 못한 파일이 있으므로 원본 폴더는 지우지 않습니다.
             self.logger.warning(f"insert_song: Kept folder with conflicting files[{root}]")
-        self.logger.info(f"insert_song: Song[{song_id}] with {len(new_charts)} new charts.")
+        self.logger.info(
+            f"insert_song: {'New song' if new_song else 'Song'}[{song_id}] with {len(new_charts)} new charts[{root}]"
+        )
         info = {
             "song_id": song_id,
             "new_song": new_song,
@@ -2475,7 +2471,8 @@ class SongBatch:
                 self.db._rebuild_pre_chunk(cur, chunk_no)
             self._con.commit()
         except Exception:
-            self.logger.exception("song batch commit failed")
+            # 트레이스백은 예외를 받은 쪽(임포트 작업)이 남깁니다.
+            self.logger.error(f"song batch: Commit failed, rolled back {self._songs} songs.")
             self._abort()
             raise
         self.logger.info(

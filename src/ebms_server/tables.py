@@ -296,7 +296,6 @@ def add_table(url: str, get: Callable[[str], bytes] | None = None) -> dict:
             table_id = cur.lastrowid
             con.commit()
         _store(table_id, table)
-    logger.info(f"difficulty table {table_id}: added {table['name']} ({url})")
     pre_rebalance.kick()
     return get_table(table_id)
 
@@ -381,9 +380,11 @@ def admin_list(admin: Annotated[User, Depends(web_admin)]):
 @router.post("/api/admin/tables")
 async def admin_create(body: TableBody, admin: Annotated[User, Depends(web_admin)]):
     try:
-        return await run_in_threadpool(add_table, body.url)
+        table = await run_in_threadpool(add_table, body.url)
     except TableError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    logger.info(f"difficulty table {table['id']}: added {table['name']} ({table['url']}) by {admin.id}")
+    return table
 
 
 @router.post("/api/admin/tables/{table_id}/refresh")
@@ -394,4 +395,5 @@ async def admin_refresh(table_id: int, admin: Annotated[User, Depends(web_admin)
 @router.delete("/api/admin/tables/{table_id}")
 def admin_delete(table_id: int, admin: Annotated[User, Depends(web_admin)]):
     delete_table(table_id)
+    logger.info(f"difficulty table {table_id}: deleted by {admin.id}")
     return {"ok": True}

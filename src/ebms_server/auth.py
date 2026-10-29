@@ -380,8 +380,15 @@ def auth_callback(
 def _finish_login(request: Request, oauth: OAuth, pending: dict, code: str, session) -> Response:
     try:
         profile = fetch_profile(oauth, code, pending["v"])
-    except (httpx.HTTPError, KeyError, ValueError):
-        logger.exception("OAuth token exchange failed: %s", oauth.name)
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        if isinstance(e, httpx.HTTPStatusError):
+            # 거절 이유(invalid_grant, redirect_uri_mismatch 등)는 응답 본문에 있습니다.
+            logger.warning(
+                f"OAuth token exchange failed: {oauth.name}: HTTP {e.response.status_code} "
+                f"{e.request.url.path} {e.response.text[:300]!r}"
+            )
+        else:
+            logger.exception(f"OAuth token exchange failed: {oauth.name}")
         return _message(request, "로그인 실패", f"{oauth.label}에서 사용자 정보를 받지 못했습니다. 다시 시도해 주세요.", 502)
 
     link_user_id = pending.get("l")

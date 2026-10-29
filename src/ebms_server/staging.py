@@ -267,8 +267,8 @@ def recover() -> None:
             continue
         try:
             stage = _load(path.name)
-        except (StageError, ValueError):
-            logger.warning(f"staging: removed broken stage[{path}]")
+        except (StageError, ValueError) as e:
+            logger.warning(f"staging: removed broken stage[{path}]: {e}")
             shutil.rmtree(path, ignore_errors=True)
             continue
         status = stage["status"]
@@ -534,10 +534,9 @@ class _Writer:
         try:
             _pack(song_dir, work / PACK_FILE)
         except Exception as e:
-            logger.exception(f"staging failed[{song_dir}]")
             _restore_origin(work)
             shutil.rmtree(work, ignore_errors=True)
-            self.job.songs.append({"folder": folder, "error": str(e) or type(e).__name__})
+            self.error(folder, str(e) or type(e).__name__, exc_info=True)
             return
         origin = work / ORIGIN_FILE
         if origin.is_file():
@@ -553,9 +552,8 @@ class _Writer:
         try:
             unit = _make_unit(unit_id, work / PACK_FILE, name, folder)
         except Exception as e:
-            logger.exception(f"staging failed[{folder}]")
             shutil.rmtree(work, ignore_errors=True)
-            self.job.songs.append({"folder": folder, "error": str(e) or type(e).__name__})
+            self.error(folder, str(e) or type(e).__name__, exc_info=True)
             return
         if not unit["charts"]:
             shutil.rmtree(work, ignore_errors=True)
@@ -571,8 +569,10 @@ class _Writer:
         if time.monotonic() - self._saved >= SAVE_INTERVAL:
             self.save()
 
-    def error(self, folder: str, message: str) -> None:
-        logger.warning(f"staging: failed[{_text(folder)}]: {_text(message)}")
+    def error(self, folder: str, message: str, exc_info: bool = False) -> None:
+        """곡(또는 원본) 하나가 실패했다고 결과와 로그에 남깁니다. 예외로 실패했으면 exc_info로 트레이스백까지 남깁니다."""
+        log = logger.error if exc_info else logger.warning
+        log(f"staging: failed[{_text(folder)}]: {_text(message)}", exc_info=exc_info)
         self.job.songs.append({"folder": _text(folder), "error": _text(message)})
 
     @contextlib.contextmanager
@@ -643,9 +643,8 @@ def _stage_zip(writer: _Writer, path: pathlib.Path, filename: str) -> int:
                         ) as fout:
                             shutil.copyfileobj(fin, fout, constant.READ_SIZE)
             except Exception as e:
-                logger.exception(f"staging failed[{filename}:{folder}]")
                 shutil.rmtree(work, ignore_errors=True)
-                writer.error(folder, str(e) or type(e).__name__)
+                writer.error(folder, str(e) or type(e).__name__, exc_info=True)
                 continue
             writer.add_pack(unit_id, name, folder)
     return len(groups)
@@ -693,9 +692,8 @@ def _move_songs(writer: _Writer, song_dirs: list[pathlib.Path], root: pathlib.Pa
             else:
                 shutil.move(song_dir, work / song_dir.name)
         except OSError as e:
-            logger.exception(f"staging failed[{song_dir}]")
             shutil.rmtree(work, ignore_errors=True)
-            writer.error(folder, str(e) or type(e).__name__)
+            writer.error(folder, str(e) or type(e).__name__, exc_info=True)
             continue
         writer.add(unit_id, work / song_dir.name, folder)
 
@@ -751,11 +749,9 @@ def _stage_tmp(writer: _Writer) -> None:
             with writer.source(f"var/tmp/{path.name}"):
                 _stage_zip(writer, path, path.name)
         except importer.ZipNameEncodingError as e:
-            logger.warning(f"stage_tmp: {e} [{path}]")
             writer.error(path.name, str(e))
             continue
         except (zipfile.BadZipFile, OSError) as e:
-            logger.warning(f"stage_tmp: cannot read zip[{path}]: {e}")
             writer.error(path.name, f"zip을 읽지 못했습니다(아직 복사 중일 수 있습니다): {e}")
             continue
         if not any("error" in song for song in job.songs[start:]):
@@ -767,7 +763,6 @@ def _stage_tmp(writer: _Writer) -> None:
             with writer.source(f"var/tmp/{rar.first_volume(names)}"):
                 _stage_rar(writer, root / rar.first_volume(names))
         except (rar.RarError, OSError) as e:
-            logger.warning(f"stage_tmp: cannot extract rar[{names[0]}]: {e}")
             writer.error(names[0], f"{e} (아직 복사 중이거나 볼륨이 빠졌을 수 있습니다)")
             continue
         if not any("error" in song for song in job.songs[start:]):
@@ -783,7 +778,6 @@ def _stage_tmp(writer: _Writer) -> None:
             with writer.source(f"var/tmp/{path.name}"):
                 _stage_7z(writer, path)
         except (sevenzip.SevenZipError, OSError) as e:
-            logger.warning(f"stage_tmp: cannot extract 7z[{path}]: {e}")
             writer.error(path.name, f"{e} (아직 복사 중일 수 있습니다)")
             continue
         if not any("error" in song for song in job.songs[start:]):

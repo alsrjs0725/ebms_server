@@ -41,7 +41,9 @@ def test_admin_user_access_is_recorded(client, monkeypatch, caplog):
 def test_configure_logging_files(tmp_path, monkeypatch):
     monkeypatch.setattr(constant, "LOG_DIR", tmp_path)
     access = logging.getLogger("uvicorn.access")
+    uvicorn_logger = logging.getLogger("uvicorn")
     saved = access.handlers[:], access.propagate, logging.root.handlers[:], logging.root.level
+    saved_uvicorn = uvicorn_logger.handlers[:], uvicorn_logger.propagate
     try:
         main.configure_logging()
         # uvicorn 접근 로그는 access.log에만(stdout·ebms.log로 가지 않음), 날마다 돌려 ACCESS_LOG_DAYS개
@@ -56,11 +58,17 @@ def test_configure_logging_files(tmp_path, monkeypatch):
         # 7일 × (53 + 지금 파일) ≥ 1년
         assert audit.ROTATE_DAYS * (audit.BACKUP_COUNT + 1) >= 366
         logging.getLogger(audit.__name__).info("admin=a ip=1.2.3.4 action=user.view target=u")
+
+        # 요청 처리 중 난 예외(uvicorn이 남기는 트레이스백)는 ebms.log에도
+        assert uvicorn_logger.handlers == [] and uvicorn_logger.propagate is True
+        logging.getLogger("uvicorn.error").error("Exception in ASGI application")
     finally:
         for h in access.handlers + logging.getLogger(audit.__name__).handlers + logging.root.handlers:
             h.close()
         access.handlers[:] = saved[0]
         access.propagate = saved[1]
+        uvicorn_logger.handlers[:] = saved_uvicorn[0]
+        uvicorn_logger.propagate = saved_uvicorn[1]
         logging.root.handlers[:] = saved[2]
         logging.root.setLevel(saved[3])
         logging.getLogger(audit.__name__).handlers.clear()
@@ -68,4 +76,5 @@ def test_configure_logging_files(tmp_path, monkeypatch):
     assert '203.0.113.5:1234 - "GET /api/play/song/1 HTTP/1.1" 200' in (tmp_path / "access.log").read_text()
     assert "203.0.113.5" not in (tmp_path / "ebms.log").read_text()
     assert "action=user.view" in (tmp_path / "audit.log").read_text()
+    assert "ERROR uvicorn.error: Exception in ASGI application" in (tmp_path / "ebms.log").read_text()
     assert "action=user.view" in (tmp_path / "ebms.log").read_text()

@@ -9,6 +9,7 @@
 """
 import datetime
 import html
+import logging
 import re
 import time
 from typing import Annotated, Literal
@@ -23,6 +24,8 @@ from .accounts import User
 from .admin import _forbidden, web_admin
 from .quota import KST
 from .templating import templates
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -279,6 +282,7 @@ def admin_save(kind: Literal[tuple(KINDS)], body: PolicyBody, admin: Annotated[U
         )
         version_id = cur.lastrowid
         con.commit()
+    logger.info(f"policy {kind} version {version_id} saved by {admin.id}: effective {effective_on}")
     return get_version(version_id)
 
 
@@ -289,4 +293,5 @@ def admin_delete(version_id: int, admin: Annotated[User, Depends(web_admin)]):
     with db.connect() as con, con.cursor() as cur:
         cur.execute("DELETE FROM policy WHERE id = %s", (version_id,))
         con.commit()
+    logger.info(f"policy version {version_id} deleted by {admin.id}")
     return {"ok": True}

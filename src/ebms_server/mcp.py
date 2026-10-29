@@ -536,8 +536,8 @@ def _call(request: Request, user, params: dict) -> dict:
         message = e.detail if isinstance(e, StageError) else str(e)
         return {"content": [{"type": "text", "text": str(message)}], "isError": True}
     if name == "submit_recommendation":
+        # 접속기록은 ebms.log에도 같은 줄이 남습니다.
         audit.record(request, user.id, "mcp.recommend", f"{args.get('stage_id')}/{args.get('unit_id')}", saved=value["saved"])
-        logger.info(f"mcp recommendation by {user.id}: {args.get('stage_id')}/{args.get('unit_id')} {value['saved']} items")
     return {
         "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, default=list)}],
         "structuredContent": json.loads(json.dumps(value, default=list)),

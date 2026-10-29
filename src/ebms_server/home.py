@@ -5,6 +5,7 @@
 채우지 않은 칸(`[[...]]`)이 있는 줄은 메인화면에서 뺍니다.
 본문은 처리방침과 같은 마크다운 일부(`policies.render`)만 지원합니다.
 """
+import logging
 import time
 from typing import Annotated
 
@@ -18,6 +19,8 @@ from .accounts import User
 from .admin import _forbidden, web_admin
 from .policies import PLACEHOLDER, render
 from .templating import templates
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -95,6 +98,7 @@ def admin_save(body: HomeBody, admin: Annotated[User, Depends(web_admin)]):
             (NAME, body.body, int(time.time()), admin.id),
         )
         con.commit()
+    logger.info(f"home text saved by {admin.id}: {len(body.body)} chars")
     return {"body": body.body, "saved": True}
 
 
@@ -104,4 +108,5 @@ def admin_reset(admin: Annotated[User, Depends(web_admin)]):
     with db.connect() as con, con.cursor() as cur:
         cur.execute("DELETE FROM site_text WHERE name = %s", (NAME,))
         con.commit()
+    logger.info(f"home text reset to default by {admin.id}")
     return {"body": DEFAULT, "saved": False}

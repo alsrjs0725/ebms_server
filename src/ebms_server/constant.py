@@ -146,6 +146,3 @@ DEFAULT_SETTINGS = {
     "pre_monthly_bytes": 10 * 1024 ** 3,
     "pre_throttled_kbps": 500,
 }
-
-if __name__ == "__main__":
-    print(DB_HOST, DB_PORT, DB_NAME)
