@@ -1039,6 +1039,8 @@ function unitRows(stage, unit, locked) {
         const parts = [];
         if (unit.result.error) parts.push(`지난 commit 실패: ${unit.result.error}`);
         if (unit.result.conflicts.length) parts.push(`내용이 달라 넣지 않은 파일(기존 유지): ${unit.result.conflicts.join(", ")}`);
+        const held = unit.result.render_held || [];
+        if (held.length) parts.push(`병합하면 다른 소리로 울려 넣지 않은 채보(충돌 키음을 새 파일로 고르거나 채보를 새 곡으로): ${held.map((h) => `${h.chart} (일치율 ${h.score})`).join(", ")}`);
         warn.textContent = parts.join(" · ");
         folder.append(warn);
     }

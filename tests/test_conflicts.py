@@ -255,3 +255,69 @@ def test_render_chart_with_sound_conflict(client, monkeypatch, tmp_path):
     assert np.abs(samples[int(2.05 * rate):int(2.25 * rate)]).max() > 0.1  # kick (2초)
     assert np.abs(samples[int(4.05 * rate):int(4.4 * rate)]).max() < 0.01  # lead는 바탕에 없음
     assert client.get(base(sid, unit) + "/charts", params={"path": "zz.wav"}).status_code == 404
+
+
+def tone_wav(freq, seconds=0.3) -> bytes:
+    import wave
+    rate = 22050
+    t = np.arange(int(rate * seconds)) / rate
+    x = (np.sin(2 * np.pi * freq * t) * np.exp(-t / 0.1) * 20000).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(x.tobytes())
+    return buf.getvalue()
+
+
+def rhythm_chart(title: bytes, seed: int) -> bytes:
+    rng = np.random.default_rng(seed)
+    rows = b"".join(
+        b"#%03d01:" % m + b"".join(rng.choice([b"01", b"02", b"03", b"04", b"00"]) for _ in range(16)) + b"\n"
+        for m in range(1, 31)
+    )
+    return b"#TITLE " + title + b"\n#ARTIST RMT\n#BPM 150\n" + b"".join(b"#WAV%02d %02d.wav\n" % (i, i) for i in range(1, 5)) + rows
+
+
+@needs_ffmpeg
+def test_chart_held_when_merge_changes_its_sound(client, monkeypatch):
+    """같은 이름(01·02.wav)의 다른 소리를 가진 다른 곡 채보가 비슷한 곡으로 병합되면, 그 채보는 기존 곡 소리로
+    울리게 되므로 넣지 않고 남깁니다. 충돌 키음을 새 파일로 고르면 들어갑니다."""
+    admin_login(client, monkeypatch)
+    base_files = {"a.bms": rhythm_chart(b"Song [NORMAL]", 1), **{f"{i:02d}.wav": tone_wav(f) for i, f in ((1, 200), (2, 700), (3, 1500), (4, 3000))}}
+    upload(client, "base.zip", make_zip({f"b/{k}": v for k, v in base_files.items()}))
+    other = {"x.bms": rhythm_chart(b"Song [ANOTHER]", 2), "01.wav": tone_wav(4000, 0.6), "02.wav": tone_wav(90, 0.6)}
+    job = stage(client, "pack.zip", make_zip({f"p/s/{k}": v for k, v in other.items()}))
+    sid = job["stage_id"]
+    unit = units(client, sid)["pack/p/s"]
+    assert unit["suggestion"]["merge"] == 1
+    result = commit_stage(client, sid)
+    held = result["songs"][0]["render_held"]
+    assert [h["chart"] for h in held] == ["x.bms"] and held[0]["score"] < 0.7
+    assert "x.bms" not in song_zip(1)
+    unit = units(client, sid)["pack/p/s"]
+    assert unit["result"]["render_held"] == held and unit["result"]["conflicts"] == ["01.wav", "02.wav"]
+
+    # 충돌 키음을 새 파일로 고르면 올린 그대로 울리므로 들어갑니다.
+    assert client.put(base(sid, unit), json={"choices": {"01.wav": "new", "02.wav": "new"}}).status_code == 200
+    r = client.post(base(sid, unit) + "/apply")
+    assert r.status_code == 200, r.text
+    wait(client, r.json())
+    files = song_zip(1)
+    assert files["x.bms"] == other["x.bms"] and files["01.wav"] == other["01.wav"]
+
+
+@needs_ffmpeg
+def test_same_sound_merge_is_not_held(client, monkeypatch):
+    """같은 곡 차분(같은 소리를 다시 인코딩한 키음)은 병합해도 소리가 같아 그대로 들어갑니다."""
+    admin_login(client, monkeypatch)
+    base_files = {"a.bms": rhythm_chart(b"Song [NORMAL]", 1), **{f"{i:02d}.wav": tone_wav(f) for i, f in ((1, 200), (2, 700), (3, 1500), (4, 3000))}}
+    upload(client, "base.zip", make_zip({f"b/{k}": v for k, v in base_files.items()}))
+    # 01.wav는 소리가 같고 크기만 조금 다름(재인코딩 흉내)
+    louder = tone_wav(200)
+    louder = louder[:44] + (np.frombuffer(louder[44:], "<i2") * 0.9).astype("<i2").tobytes()
+    job = stage(client, "pack.zip", make_zip({"p/s/y.bms": rhythm_chart(b"Song [HARD]", 1)[:-1] + b"\n#00201:01\n", "p/s/01.wav": louder}))
+    result = commit_stage(client, job["stage_id"])
+    assert "render_held" not in result["songs"][0]
+    assert "y.bms" in song_zip(1)
