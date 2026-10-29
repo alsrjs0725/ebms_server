@@ -86,22 +86,27 @@ def test_run_with_zero_minutes_leaves_work(client, monkeypatch):
     assert render_index.status_()["indexed_songs"] == 0 and render_index.status_()["left"] is True
 
 
-def test_parse_output_joins_traceback_and_raw_stderr():
+def test_parse_output_streams_records_and_joins_raw_stderr():
     lines = [
         "Traceback (most recent call last):\n",  # 로그 설정 전에 죽은 경우(stderr)
         '  File "<string>", line 1\n',
         "FileNotFoundError: x\n",
         "INFO|ebms_server.render_index|start\n",
-        "ERROR|ebms_server.render_index|run failed\n",
-        "Traceback (most recent call last):\n",
-        "OSError: y\n",
+        f"ERROR|ebms_server.render_index|run failed{render_index.NEWLINE}Traceback (most recent call last):{render_index.NEWLINE}OSError: y\n",
         "INFO|result|1\n",
     ]
     out = list(render_index.parse_output(lines))
-    assert out[0][0] == logging.ERROR and out[0][1] == "ebms_server.render_index.process" and "FileNotFoundError: x" in out[0][2]
+    assert out[0][0] == logging.ERROR and out[0][1] == "ebms_server.render_index.process" and out[0][2].endswith("FileNotFoundError: x")
     assert out[1] == (logging.INFO, "ebms_server.render_index", "start")
-    assert out[2][0] == logging.ERROR and out[2][2].endswith("OSError: y")
+    assert out[2] == (logging.ERROR, "ebms_server.render_index", "run failed\nTraceback (most recent call last):\nOSError: y")
     assert out[3] == (logging.INFO, "result", "1")
+
+    # 로그 줄은 다음 줄을 기다리지 않고 바로 나옵니다(색인 중에도 로그 페이지에 보이게).
+    def feed():
+        yield "INFO|ebms_server.render_index|first\n"
+        raise AssertionError("waited for the next line")
+
+    assert next(render_index.parse_output(feed())) == (logging.INFO, "ebms_server.render_index", "first")
 
 
 def test_worker_process_logs_reach_server(monkeypatch, tmp_path, caplog):
@@ -117,4 +122,4 @@ def test_worker_process_logs_reach_server(monkeypatch, tmp_path, caplog):
     assert proc.left is False and proc.proc.returncode == 0
     messages = [r.getMessage() for r in caplog.records if r.name.startswith("ebms_server.render_index")]
     assert any("render index process" in m for m in messages)
-    assert any("render index run failed" in m and "Traceback" in m for m in messages)
+    assert any("render index run failed" in m and "\nTraceback" in m for m in messages)

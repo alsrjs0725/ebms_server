@@ -447,28 +447,27 @@ class _Run:
 
 
 RESULT = "result"
+NEWLINE = "\x1f"  # 색인 프로세스 로그 한 줄 안의 줄바꿈
 _LEVELS = {name: getattr(logging, name) for name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")}
 
 
 def parse_output(lines):
-    """색인 프로세스 출력 → (수준, 로거 이름, 메시지). 로그 줄은 "수준|로거|메시지"이고, 그 뒤에 붙는 줄(traceback 등)과
-    로그 설정 전에 stderr로 나온 줄은 앞 기록에 붙이거나 따로 ERROR로 남깁니다."""
-    current = None
+    """색인 프로세스 출력 → (수준, 로거 이름, 메시지). 로그 줄("수준|로거|메시지")은 받는 대로 바로 내고,
+    로그 설정 전에 stderr로 나온 줄(traceback 등)은 다음 로그 줄이나 끝까지 모아 ERROR 하나로 냅니다."""
+    raw_lines: list[str] = []
     for raw in lines:
         line = raw.rstrip("\n")
         level, sep, rest = line.partition("|")
         if sep and level in _LEVELS and "|" in rest:
-            if current:
-                yield current
+            if raw_lines:
+                yield logging.ERROR, __name__ + ".process", "\n".join(raw_lines)
+                raw_lines = []
             name, _, message = rest.partition("|")
-            current = (_LEVELS[level], name, message)
-        elif current:
-            current = (max(current[0], logging.ERROR if line.startswith("Traceback") else current[0]), current[1],
-                       current[2] + "\n" + line)
-        elif line.strip():
-            current = (logging.ERROR, __name__ + ".process", line)
-    if current:
-        yield current
+            yield _LEVELS[level], name, message.replace(NEWLINE, "\n")
+        elif line.strip() or raw_lines:
+            raw_lines.append(line)
+    if raw_lines:
+        yield logging.ERROR, __name__ + ".process", "\n".join(raw_lines)
 
 
 _proc_lock = threading.Lock()
