@@ -45,7 +45,7 @@ def test_list_choose_and_apply(client, monkeypatch):
     items = {i["path"]: i for i in r.json()["items"]}
     assert items["k.wav"] == {
         "path": "k.wav", "song_id": 1, "kind": "sound", "new_size": 3,
-        "old_path": "k.wav", "old_kind": "sound", "old_size": 3, "choice": None,
+        "old_path": "k.wav", "old_kind": "sound", "old_size": 3, "choice": None, "ai": None,
     }
     assert items["readme.txt"]["kind"] == "other"
 
