@@ -73,6 +73,8 @@ class Job:
         self.resumed = False
         # 지금 풀거나 옮기는 원본(압축 파일·곡 폴더). 실패 로그에 남깁니다.
         self.source: str | None = None
+        # 결과가 곡 목록이 아닌 작업(렌더 비교 등)의 결과
+        self.result: dict | None = None
 
     @property
     def slow(self) -> bool:
@@ -119,6 +121,7 @@ class Job:
             "resting": self.resting_until is not None,
             "stage_id": self.stage_id,
             "resumed": self.resumed,
+            "result": self.result,
         }
 
 
