@@ -3,6 +3,8 @@ import base64
 
 from fastapi.testclient import TestClient
 
+from ebms_server import mcp
+
 from test_api_keys import bearer, create_key
 from test_auth import client  # noqa: F401  (fixture 재사용)
 from test_client_auth import client_login
@@ -78,9 +80,12 @@ def test_case_and_recommendation(client, monkeypatch):
     assert case["new_charts"] == [{"path": "a.bms", "title": "A", "artist": "", "status": "same_as_registered"}]
     item = case["items"][0]
     assert item["path"] == "k.wav" and item["kind"] == "sound"
-    assert item["used_by_old"] == [] and item["used_by_new"] == []
+    # 값이 없는 항목(쓰는 차트 없음, 고른 것·추천 없음)은 빠집니다.
+    assert "used_by_old" not in item and "choice" not in item and "ai" not in item
     assert "compare" in item
     rest = call(api, key, "get_conflict_case", stage_id=sid, unit_id=unit["id"], offset=1)
+    # 곡 정보는 첫 페이지에만
+    assert "existing_songs" not in rest and "new_charts" not in rest
     assert rest["next_offset"] is None and "+TWO" in rest["items"][0]["compare"]["diff_head"]
     diff = call(api, key, "get_file_diff", stage_id=sid, unit_id=unit["id"], path="readme.txt")
     assert "-two" in diff["diff"] and diff["truncated"] is False
@@ -142,3 +147,15 @@ def test_sound_clip(client, monkeypatch, tmp_path):
     bad = rpc(api, key, "tools/call", {"name": "get_sound_clip", "arguments": {
         "stage_id": sid, "unit_id": unit["id"], "path": "r.txt"}})["result"]
     assert bad["isError"]
+
+
+def test_case_time_budget(client, monkeypatch):
+    # 비교 계산이 시간 상한을 넘으면 limit보다 적게 주고 next_offset으로 이어 받게 합니다(최소 1개).
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "readme.txt": b"one\nTWO\n"})
+    key = create_key(client)
+    api = TestClient(client.app)
+    monkeypatch.setattr(mcp, "CASE_SECONDS", 0.0)
+    case = call(api, key, "get_conflict_case", stage_id=sid, unit_id=unit["id"], limit=50)
+    assert len(case["items"]) == 1 and case["next_offset"] == 1 and case["total"] == 2
+    rest = call(api, key, "get_conflict_case", stage_id=sid, unit_id=unit["id"], offset=case["next_offset"])
+    assert len(rest["items"]) == 1 and rest["next_offset"] is None
