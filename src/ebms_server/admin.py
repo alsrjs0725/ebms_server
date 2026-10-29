@@ -483,6 +483,26 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
     return get_song_detail(song_id)
 
 
+class ChartDetach(BaseModel):
+    charts: list[str]
+
+
+@router.post("/api/admin/songs/{song_id}/charts/detach")
+def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depends(web_admin)]):
+    """곡에서 차트 몇 개(sha256)만 뗍니다. 다른 곡 차트가 잘못 병합된 경우, 떼고 나서 그 차트의 원본 폴더를
+    임포트하면 거기에 다시 붙습니다. 곡 zip에 든 그 차트 파일도 뺍니다."""
+    try:
+        result = db.Database().detach_charts(song_id, body.charts, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    logger.info(f"song {song_id} charts detached by {admin.id}: {result}")
+    return result
+
+
 @router.get("/api/admin/songs/{song_id}/zip")
 def download_song_zip(song_id: int, request: Request, admin: Annotated[User, Depends(web_admin)]):
     """곡 zip 전체. 티켓·사용량은 쓰지 않습니다."""
