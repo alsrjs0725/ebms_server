@@ -123,7 +123,7 @@ EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
 | `stage` | STAGE | 테스트 후 홈서버에 `ebms-stage`로 배포 |
 | `release` | RELEASE | 테스트 후 홈서버에 `ebms-release`로 배포 |
 
-작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `release` 순서로 올립니다. `stage`·`release`에 병합되면 `.github/workflows/deploy.yml`이 이미지를 빌드해 GHCR(`ghcr.io/alsrjs0725/ebms_server`)에 올리고(`stage` / `latest`·`release`·`<버전>` 태그, 커밋마다 `sha-<커밋>`), 홈서버의 self-hosted runner가 그 커밋의 이미지를 받아 `docker compose -p ebms-<단계> --env-file <단계>.env up -d`로 띄웁니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
+작업은 `develop`으로 PR을 보내고, `develop` → `stage` → `release` 순서로 올립니다. `stage`·`release`에 병합되면 `.github/workflows/deploy.yml`이 테스트와 이미지 빌드를 나란히 돌려 이미지를 GHCR(`ghcr.io/alsrjs0725/ebms_server`)에 `sha-<커밋>` 태그로 올리고, 테스트가 통과하면 `stage` / `latest`·`release`·`<버전>` 태그를 붙인 뒤(테스트가 실패한 커밋의 `sha-` 이미지는 올라가 있지만 배포되지 않습니다), 홈서버의 self-hosted runner가 그 커밋의 이미지를 받아 `docker compose -p ebms-<단계> --env-file <단계>.env up -d`로 띄웁니다. 두 단계는 compose 프로젝트 이름이 달라 컨테이너와 볼륨(MySQL 데이터 포함)이 따로 유지됩니다.
 
 ### 홈서버 초기 세팅 (한 번만)
 
