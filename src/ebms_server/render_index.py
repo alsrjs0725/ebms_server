@@ -415,43 +415,93 @@ def _cpus() -> set[int] | None:
     return (wanted & available) or None
 
 
+class _QueueLog(logging.Handler):
+    """색인 프로세스의 로그를 웹 서버로 보냅니다(웹 서버가 ebms.log에 남겨 관리자 로그에서 보이게)."""
+
+    def __init__(self, queue):
+        super().__init__()
+        self.queue = queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.exc_info:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+                record.exc_info = None
+            record.msg, record.args = record.getMessage(), None
+            self.queue.put(("log", record))
+        except Exception:
+            pass
+
+
 def _process_main(minutes: float, queue) -> None:
     """색인 프로세스: 웹 서버와 GIL을 나누지 않도록 따로 띄우고, 정한 코어에 붙여 낮은 우선순위로 돕니다(ffmpeg도 물려받음)."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    cpus = _cpus()
-    if cpus:
-        try:
-            os.sched_setaffinity(0, cpus)
-        except OSError:
-            pass
+    logging.basicConfig(level=logging.INFO, handlers=[_QueueLog(queue)], force=True)
+    left = False
     try:
+        cpus = _cpus()
+        if cpus:
+            os.sched_setaffinity(0, cpus)
         os.nice(NICE)
-    except OSError:
-        pass
-    queue.put(run(minutes))
+        logger.info(f"render index process {os.getpid()}: cpus {sorted(cpus) if cpus else 'any'}, {minutes} min")
+        left = run(minutes)
+    except Exception:
+        logger.exception("render index process failed")
+    queue.put(("result", left))
+
+
+class _Run:
+    """띄운 색인 프로세스 하나. done이 서면 끝났고 left는 할 일이 남았는지."""
+
+    def __init__(self, proc, queue):
+        self.proc = proc
+        self.queue = queue
+        self.left = False
+        self.done = threading.Event()
+        threading.Thread(target=self._pump, name="render_index_pump", daemon=True).start()
+
+    def _pump(self) -> None:
+        import queue as queue_module
+
+        while True:
+            try:
+                kind, value = self.queue.get(timeout=5)
+            except queue_module.Empty:
+                if not self.proc.is_alive():
+                    break
+                continue
+            if kind == "log":
+                logging.getLogger(value.name).handle(value)
+            elif kind == "result":
+                self.left = value
+                break
+        self.proc.join(30)
+        if self.proc.exitcode not in (0, None):
+            logger.error(f"render index process exited with {self.proc.exitcode}")
+        self.done.set()
 
 
 _proc_lock = threading.Lock()
-_proc = None  # 돌고 있는 색인 프로세스
+_current: _Run | None = None  # 돌고 있는 색인 프로세스
 
 
-def _spawn(minutes: float):
-    """색인 프로세스를 띄웁니다. (프로세스, 결과 큐). 이미 돌고 있으면 None."""
+def _spawn(minutes: float) -> _Run | None:
+    """색인 프로세스를 띄웁니다. 이미 돌고 있으면 None."""
     import multiprocessing
 
-    global _proc
+    global _current
     with _proc_lock:
-        if _proc is not None and _proc.is_alive():
+        if _current is not None and not _current.done.is_set():
             return None
         ctx = multiprocessing.get_context("spawn")  # 스레드가 도는 웹 서버에서 fork하지 않습니다.
         queue = ctx.Queue()
-        _proc = ctx.Process(target=_process_main, args=(minutes, queue), name="render_index", daemon=True)
-        _proc.start()
-        return _proc, queue
+        proc = ctx.Process(target=_process_main, args=(minutes, queue), name="render_index", daemon=True)
+        proc.start()
+        _current = _Run(proc, queue)
+        return _current
 
 
 def running() -> bool:
-    return _proc is not None and _proc.is_alive()
+    return _current is not None and not _current.done.is_set()
 
 
 def status_() -> dict:
@@ -491,21 +541,15 @@ def start() -> threading.Event | None:
             return
         while not stop.is_set():
             spawned = _spawn(constant.RENDER_INDEX_MINUTES)
-            left = True
             if spawned is None:  # 관리자가 띄운 것이 돌고 있음
                 if stop.wait(60):
                     return
                 continue
-            proc, queue = spawned
-            while proc.is_alive() and not stop.wait(5):
-                pass
-            if stop.is_set():
-                proc.terminate()
-                return
-            try:
-                left = queue.get(timeout=5)
-            except Exception:
-                left = False  # 비정상 종료: 주기만큼 쉬고 다시
+            while not spawned.done.wait(5):
+                if stop.is_set():
+                    spawned.proc.terminate()
+                    return
+            left = spawned.left
             if not left and stop.wait(constant.RENDER_INDEX_HOURS * 3600):
                 return
 
