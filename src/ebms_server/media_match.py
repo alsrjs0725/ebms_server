@@ -19,9 +19,15 @@ ffmpeg로 풀고, 풀지 못하거나(ffmpeg 없음, 깨진 파일) 다르다고
 - 이미지: 해상도, 무손실 형식(jpg가 아닌 것) 순.
 - 영상: 해상도, fps, 초당 비트레이트 순.
 모두 비슷하면 용량이 작은 쪽입니다. 형식을 읽지 못하면 기존 파일을 둡니다.
+
+판정과 품질은 파일 내용(sha256) 기준으로 기억해(decode_cache.memo) 충돌 해결 적용·다시 commit 때 다시 풀지 않습니다.
+품질은 파일마다 ffprobe·ffmpeg를 따로 돌려야 해서 QUALITY_WORKERS개씩 나란히 돌립니다.
+commit은 쓰기 잠금을 잡고 기다리므로 ffmpeg·ffprobe 우선순위를 낮추지 않습니다(preview._run nice=False).
 """
+import concurrent.futures
 import json
 import logging
+import os
 import pathlib
 import shutil
 import subprocess
@@ -29,7 +35,7 @@ import tempfile
 
 import numpy as np
 
-from . import constant, preview
+from . import constant, decode_cache, preview
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,8 @@ LOSSY_IMAGE = ("mjpeg", "jpeg")
 
 # ffmpeg 한 번에 푸는 파일 수
 DECODE_BATCH = 64
+# 품질을 읽는 ffprobe·ffmpeg를 나란히 돌리는 수
+QUALITY_WORKERS = min(8, os.cpu_count() or 1)
 
 
 def kind(path: str) -> str | None:
@@ -108,19 +116,35 @@ def same_files(pairs: list[tuple[str, bytes, pathlib.Path]]) -> set[str]:
         logger.warning("media_match: ffmpeg not found. Different media files are kept as conflicts.")
         return set()
     same = set()
+    keys = {path: ("same", kind(path), decode_cache.sha256_bytes(old), decode_cache.sha256_file(new)) for path, old, new in pairs}
+    todo = []
+    for pair in pairs:
+        judged = decode_cache.memo_get(keys[pair[0]])
+        if judged is None:
+            todo.append(pair)
+        elif judged:
+            same.add(pair[0])
+    if not todo:
+        return same
     with tempfile.TemporaryDirectory(prefix="ebms-match-") as tmp:
         work = pathlib.Path(tmp)
         groups: dict[str, list[tuple[str, pathlib.Path, pathlib.Path]]] = {}
-        for i, (path, old, new) in enumerate(pairs):
+        for i, (path, old, new) in enumerate(todo):
             old_path = work / f"{i}{pathlib.PurePosixPath(path).suffix.lower()}"
             old_path.write_bytes(old)
             groups.setdefault(kind(path), []).append((path, old_path, new))
         for k, items in groups.items():
             compare = {"sound": _same_sounds, "image": _same_images, "video": _same_videos}[k]
             try:
-                same |= compare(ffmpeg, items, work)
+                verdicts = compare(ffmpeg, items, work)
             except Exception:
                 logger.exception(f"media_match: {k} comparison failed")
+                continue
+            # 풀지 못한 쌍은 기억하지 않습니다(시간 초과 등으로 다음에는 풀릴 수 있음).
+            for path, value in verdicts.items():
+                decode_cache.memo_put(keys[path], value)
+                if value:
+                    same.add(path)
     return same
 
 
@@ -137,13 +161,16 @@ def _decode(ffmpeg: str, paths: list[pathlib.Path], work: pathlib.Path, args: li
         for n, i in enumerate(batch):
             cmd += ["-map", f"{n}:{stream}:0", *args, str(raws[i])]
         try:
-            preview._run(cmd)
+            preview._run(cmd, nice=False)
             todo = []
         except (RuntimeError, subprocess.TimeoutExpired):
             todo = batch
         for i in todo:
             try:
-                preview._run([ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(paths[i]), "-map", f"0:{stream}:0", *args, str(raws[i])])
+                preview._run(
+                    [ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(paths[i]), "-map", f"0:{stream}:0", *args, str(raws[i])],
+                    nice=False,
+                )
             except (RuntimeError, subprocess.TimeoutExpired):
                 raws[i].unlink(missing_ok=True)
         for i in batch:
@@ -162,11 +189,12 @@ def _pairs_decoded(ffmpeg, items, work, args, stream):
             yield path, a, b
 
 
-def _same_sounds(ffmpeg, items, work) -> set[str]:
+def _same_sounds(ffmpeg, items, work) -> dict[str, bool]:
+    """{경로: 같은 소재인지}(둘 다 풀린 쌍만). _same_images·_same_videos도 같습니다."""
     args = ["-ac", "1", "-ar", str(SOUND_RATE), "-t", f"{SOUND_SECONDS:.3f}", "-f", "f32le"]
     return {
-        path for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "a")
-        if same_sound(np.frombuffer(a, dtype="<f4"), np.frombuffer(b, dtype="<f4"))
+        path: same_sound(np.frombuffer(a, dtype="<f4"), np.frombuffer(b, dtype="<f4"))
+        for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "a")
     }
 
 
@@ -203,13 +231,13 @@ def _best_lag(a: np.ndarray, b: np.ndarray, max_lag: int) -> int:
     return int(lags[int(np.argmax(values))])
 
 
-def _same_images(ffmpeg, items, work) -> set[str]:
+def _same_images(ffmpeg, items, work) -> dict[str, bool]:
     # 면적 평균으로 줄여, 크기만 바꾼 그림(512→256 등)의 가장자리 차이가 남지 않게 합니다.
     args = ["-frames:v", "1", "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}:flags=area", "-pix_fmt", "rgba", "-f", "rawvideo"]
     size = IMAGE_SIZE * IMAGE_SIZE * 4
     return {
-        path for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v")
-        if len(a) == len(b) == size and same_image(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8))
+        path: len(a) == len(b) == size and same_image(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8))
+        for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v")
     }
 
 
@@ -220,18 +248,17 @@ def same_image(a: np.ndarray, b: np.ndarray) -> bool:
     return float(diff.mean()) <= IMAGE_MAX_MEAN_DIFF and float(changed.mean()) <= IMAGE_MAX_CHANGED
 
 
-def _same_videos(ffmpeg, items, work) -> set[str]:
+def _same_videos(ffmpeg, items, work) -> dict[str, bool]:
     args = [
         "-t", f"{VIDEO_SECONDS:.3f}", "-an",
         "-vf", f"fps={VIDEO_FPS},scale={VIDEO_SIZE}:{VIDEO_SIZE}:flags=area", "-pix_fmt", "gray", "-f", "rawvideo",
     ]
     frame = VIDEO_SIZE * VIDEO_SIZE
-    same = set()
+    same = {}
     for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v"):
         fa = np.frombuffer(a, np.uint8)[: len(a) // frame * frame].reshape(-1, frame)
         fb = np.frombuffer(b, np.uint8)[: len(b) // frame * frame].reshape(-1, frame)
-        if same_video(fa, fb):
-            same.add(path)
+        same[path] = same_video(fa, fb)
     return same
 
 
@@ -258,7 +285,7 @@ def _probe(path: pathlib.Path) -> dict | None:
     try:
         out = preview._run([
             ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path),
-        ])
+        ], nice=False)
         return json.loads(out)
     except (RuntimeError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -322,21 +349,35 @@ def _differ(a: float, b: float, margin: float = QUALITY_MARGIN) -> int:
 
 
 def _sound_quality(ffmpeg: str, path: pathlib.Path, work: pathlib.Path) -> dict | None:
-    info = _probe(path)
-    stream = info and _stream(info, "audio")
-    if not stream:
-        return None
-    raw = _decode(ffmpeg, [path], work, ["-ac", "1", "-ar", str(BAND_RATE), "-t", f"{BAND_SECONDS:.3f}", "-f", "f32le"], "a")[0]
-    if raw is None:
-        return None
-    codec = stream.get("codec_name") or ""
-    bits = int(stream.get("bits_per_raw_sample") or stream.get("bits_per_sample") or 0)
-    return {
-        "band": bandwidth(np.frombuffer(raw, dtype="<f4").astype(np.float64)),
-        "lossless": codec.startswith(LOSSLESS_AUDIO),
-        "format": (int(stream.get("sample_rate") or 0), int(stream.get("channels") or 0), bits),
-        "bitrate": _bitrate(path, _duration(info, stream)),
-    }
+    return _sound_qualities(ffmpeg, [path], work)[0]
+
+
+def _sound_qualities(ffmpeg: str, paths: list[pathlib.Path], work: pathlib.Path) -> list[dict | None]:
+    """키음들의 품질. 대역폭을 재는 디코드는 ffmpeg 한 번에 여러 파일을 풉니다(_decode)."""
+    probes = []
+    for path in paths:
+        info = _probe(path)
+        stream = info and _stream(info, "audio")
+        probes.append((info, stream) if stream else None)
+    readable = [i for i, probe in enumerate(probes) if probe]
+    raws = _decode(
+        ffmpeg, [paths[i] for i in readable], work,
+        ["-ac", "1", "-ar", str(BAND_RATE), "-t", f"{BAND_SECONDS:.3f}", "-f", "f32le"], "a",
+    )
+    out: list[dict | None] = [None] * len(paths)
+    for i, raw in zip(readable, raws):
+        if raw is None:
+            continue
+        info, stream = probes[i]
+        codec = stream.get("codec_name") or ""
+        bits = int(stream.get("bits_per_raw_sample") or stream.get("bits_per_sample") or 0)
+        out[i] = {
+            "band": bandwidth(np.frombuffer(raw, dtype="<f4").astype(np.float64)),
+            "lossless": codec.startswith(LOSSLESS_AUDIO),
+            "format": (int(stream.get("sample_rate") or 0), int(stream.get("channels") or 0), bits),
+            "bitrate": _bitrate(paths[i], _duration(info, stream)),
+        }
+    return out
 
 
 def _sound_better(old: dict, new: dict) -> int:
@@ -386,6 +427,38 @@ def _video_better(old: dict, new: dict) -> int:
     return _differ(old["fps"], new["fps"]) or _differ(old["bitrate"], new["bitrate"])
 
 
+def _qualities(ffmpeg: str, files: dict[tuple[str, str], pathlib.Path]) -> dict[tuple[str, str], dict | None]:
+    """{(종류, sha256): 파일}의 품질. 내용이 같은 파일은 기억해 둔 값을 쓰고(읽지 못한 것은 기억하지 않음),
+    나머지는 QUALITY_WORKERS개씩 나란히 읽습니다. 키음은 여러 개를 묶어 ffmpeg 한 번에 풉니다."""
+    out = {key: decode_cache.memo_get(("quality", *key)) for key in files}
+    todo = [key for key, value in out.items() if value is None]
+    sounds = [key for key in todo if key[0] == "sound"]
+    size = max(1, min(DECODE_BATCH, -(-len(sounds) // QUALITY_WORKERS)))
+    tasks = [sounds[i:i + size] for i in range(0, len(sounds), size)] + [[key] for key in todo if key[0] != "sound"]
+
+    def read(keys):
+        try:
+            if keys[0][0] == "sound":
+                with tempfile.TemporaryDirectory(prefix="ebms-quality-") as tmp:
+                    values = _sound_qualities(ffmpeg, [files[key] for key in keys], pathlib.Path(tmp))
+            elif keys[0][0] == "image":
+                values = [_image_quality(files[keys[0]])]
+            else:
+                values = [_video_quality(files[keys[0]])]
+        except Exception:
+            logger.exception(f"media_match: quality read failed[{[str(files[key]) for key in keys]}]")
+            values = [None] * len(keys)
+        return list(zip(keys, values))
+
+    with concurrent.futures.ThreadPoolExecutor(QUALITY_WORKERS) as pool:
+        for done in pool.map(read, tasks):
+            for key, value in done:
+                out[key] = value
+                if value is not None:
+                    decode_cache.memo_put(("quality", *key), value)
+    return out
+
+
 def better_new(pairs: list[tuple[str, bytes, pathlib.Path]]) -> set[str]:
     """같은 소재로 본 (경로, 기존 파일 내용, 새 파일)들 중 새 파일을 남길 것의 경로.
     품질이 좋은 쪽을 남기고, 비슷하면 용량이 작은 쪽입니다. 품질을 읽지 못하면 기존 파일을 둡니다."""
@@ -396,31 +469,27 @@ def better_new(pairs: list[tuple[str, bytes, pathlib.Path]]) -> set[str]:
     if ffmpeg is None or _ffprobe() is None:
         logger.warning("media_match: ffmpeg/ffprobe not found. Keeping existing files for the same media.")
         return set()
+    better = {"sound": _sound_better, "image": _image_better, "video": _video_better}
     out = set()
     with tempfile.TemporaryDirectory(prefix="ebms-quality-") as tmp:
         work = pathlib.Path(tmp)
+        jobs = []  # (경로, 종류, 기존 파일, 기존 sha256, 새 파일, 새 sha256, 기존 크기)
         for i, (path, old, new) in enumerate(pairs):
-            k = kind(path)
             old_path = work / f"old{i}{pathlib.PurePosixPath(path).suffix.lower()}"
             old_path.write_bytes(old)
-            try:
-                if k == "sound":
-                    a, b = _sound_quality(ffmpeg, old_path, work), _sound_quality(ffmpeg, new, work)
-                    better = _sound_better
-                elif k == "image":
-                    a, b = _image_quality(old_path), _image_quality(new)
-                    better = _image_better
-                else:
-                    a, b = _video_quality(old_path), _video_quality(new)
-                    better = _video_better
-                if a is None or b is None:
-                    continue
-                verdict = better(a, b)
-                if verdict > 0 or (verdict == 0 and new.stat().st_size < len(old)):
-                    out.add(path)
-                logger.info(f"media_match: quality {path} old={a} new={b} -> {'new' if path in out else 'old'}")
-            except Exception:
-                logger.exception(f"media_match: quality comparison failed[{path}]")
-            finally:
-                old_path.unlink(missing_ok=True)
+            jobs.append((path, kind(path), old_path, decode_cache.sha256_bytes(old), new, decode_cache.sha256_file(new), len(old)))
+        files = {}
+        for _, k, old_path, old_sha, new, new_sha, _ in jobs:
+            files.setdefault((k, old_sha), old_path)
+            files.setdefault((k, new_sha), new)
+
+        quality = _qualities(ffmpeg, files)
+        for path, k, _, old_sha, new, new_sha, old_size in jobs:
+            a, b = quality[(k, old_sha)], quality[(k, new_sha)]
+            if a is None or b is None:
+                continue
+            verdict = better[k](a, b)
+            if verdict > 0 or (verdict == 0 and new.stat().st_size < old_size):
+                out.add(path)
+            logger.info(f"media_match: quality {path} old={a} new={b} -> {'new' if path in out else 'old'}")
     return out

@@ -235,3 +235,47 @@ def test_bandwidth_math():
     assert media_match.bandwidth(full) > 20000
     assert 7000 < media_match.bandwidth(cut) < 9000
     assert media_match.bandwidth(np.zeros(rate)) == 0
+
+
+@needs_ffmpeg
+def test_cached_verdicts_skip_ffmpeg(tmp_path, monkeypatch):
+    """충돌 적용·다시 commit 때 같은 내용의 쌍은 판정·품질을 다시 풀지 않습니다(decode_cache)."""
+    from ebms_server import decode_cache, preview
+
+    decode_cache.clear()
+    wav = noise(tmp_path, "a.wav")
+    mp3 = noise(tmp_path, "b.mp3", "-c:a", "libmp3lame", "-b:a", "64k")
+    new_file = tmp_path / "new" / "k.wav"
+    new_file.parent.mkdir(parents=True)
+    new_file.write_bytes(wav)
+    pairs = [("k.wav", mp3, new_file)]
+    first = media_match.same_files(pairs), media_match.better_new(pairs)
+    assert first == ({"k.wav"}, {"k.wav"})
+
+    def fail(*args, **kwargs):
+        raise AssertionError("ffmpeg ran again")
+
+    monkeypatch.setattr(preview, "_run", fail)
+    assert (media_match.same_files(pairs), media_match.better_new(pairs)) == first
+    decode_cache.clear()
+
+
+@needs_ffmpeg
+def test_better_quality_many(tmp_path):
+    """여러 쌍을 나란히·묶어 읽어도 쌍마다 결과가 섞이지 않습니다."""
+    from ebms_server import decode_cache
+
+    decode_cache.clear()
+    wav = noise(tmp_path, "a.wav")
+    low = noise(tmp_path, "low.mp3", "-c:a", "libmp3lame", "-b:a", "64k")
+    pairs, expected = [], set()
+    for i in range(20):
+        old, new = (low, wav) if i % 2 else (wav, low)
+        new_file = tmp_path / "new" / f"k{i}.wav"
+        new_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file.write_bytes(new)
+        pairs.append((f"k{i}.wav", old, new_file))
+        if i % 2:
+            expected.add(f"k{i}.wav")
+    assert media_match.better_new(pairs) == expected
+    decode_cache.clear()

@@ -403,9 +403,11 @@ def _ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def _run(cmd: list[str], data: bytes | None = None) -> bytes:
+def _run(cmd: list[str], data: bytes | None = None, nice: bool = True) -> bytes:
+    """ffmpeg·ffprobe를 돌려 표준 출력을 돌려줍니다. nice면 우선순위를 낮춥니다.
+    commit처럼 쓰기 잠금을 잡고 기다리는 쪽은 nice=False로 부릅니다(preexec_fn을 쓰면 큰 프로세스에서 fork가 느려짐)."""
     kwargs = {}
-    if os.name == "posix":
+    if nice and os.name == "posix":
         # 미리듣기는 뒤에서 천천히 만들어도 되므로 다운로드·임포트에 CPU를 양보합니다.
         kwargs["preexec_fn"] = lambda: os.nice(10)
     result = subprocess.run(
@@ -417,7 +419,8 @@ def _run(cmd: list[str], data: bytes | None = None) -> bytes:
 
 
 def _decode_sounds(
-    ffmpeg: str, paths: list[pathlib.Path], seconds: float | None, rate: int = SAMPLE_RATE, channels: int = 1
+    ffmpeg: str, paths: list[pathlib.Path], seconds: float | None, rate: int = SAMPLE_RATE, channels: int = 1,
+    nice: bool = True,
 ) -> list[np.ndarray | None]:
     """키음 파일들을 float32 샘플로 풉니다(seconds초까지, None이면 끝까지). 채널이 둘 이상이면 (샘플, 채널) 모양입니다.
     풀지 못한 파일은 None."""
@@ -436,14 +439,14 @@ def _decode_sounds(
         for n, i in enumerate(batch):
             cmd += args(i, n, raws[i])
         try:
-            _run(cmd)
+            _run(cmd, nice=nice)
             todo = []
         except (RuntimeError, subprocess.TimeoutExpired):
             # 하나라도 못 풀면 전체가 실패하므로 하나씩 다시 풉니다.
             todo = batch
         for i in todo:
             try:
-                _run([ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(paths[i]), *args(i, 0, raws[i])])
+                _run([ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(paths[i]), *args(i, 0, raws[i])], nice=nice)
             except (RuntimeError, subprocess.TimeoutExpired):
                 raws[i].unlink(missing_ok=True)
         for i in batch:
