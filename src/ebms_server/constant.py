@@ -82,10 +82,11 @@ TABLE_FETCH_TIMEOUT = 30
 TABLE_MAX_BYTES = 32 * 1024 * 1024
 # 등록한 난이도표를 모두 다시 읽는 주기(시간). 0이면 자동으로 다시 읽지 않습니다(관리자 페이지에서 직접).
 TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
-# 모든 곡 차트의 렌더 색인(render_index.py): RENDER_INDEX_HOURS마다 RENDER_INDEX_MINUTES분씩 아직 안 본 곡을 색인하며
-# 다른 곡 번호의 같은 곡·곡 안에 섞인 다른 곡을 찾아 관리자 목록(/admin/render)에 쌓습니다. 둘 중 하나가 0이면 끕니다.
+# 모든 곡 차트의 렌더 색인(render_index.py): 아직 안 본 곡을 색인하며 다른 곡 번호의 같은 곡·곡 안에 섞인 다른 곡을 찾아
+# 관리자 목록(/admin/render)에 쌓습니다. 관리자가 "지금 색인"(API)으로 RENDER_INDEX_MINUTES분씩 돌리고, RENDER_INDEX_HOURS를
+# 0보다 크게 두면 그 주기로 자동으로도 돕니다(기본 0: 자동 없음, 부하를 확인한 뒤 켭니다).
 RENDER_INDEX_DIR = pathlib.Path(os.environ.get("EBMS_RENDER_INDEX_DIR", BASE_DIR / "var" / "render_index"))
-RENDER_INDEX_HOURS = float(os.environ.get("EBMS_RENDER_INDEX_HOURS", "24"))
+RENDER_INDEX_HOURS = float(os.environ.get("EBMS_RENDER_INDEX_HOURS", "0"))
 RENDER_INDEX_MINUTES = float(os.environ.get("EBMS_RENDER_INDEX_MINUTES", "120"))
 RENDER_INDEX_START_DELAY = float(os.environ.get("EBMS_RENDER_INDEX_START_DELAY", "1800"))
 # 공유용 난이도표 정적 페이지 폴더. `/table/{표 이름}.html`(과 그 페이지가 가리키는 header·data JSON)로 그대로 내보냅니다.
