@@ -34,3 +34,9 @@ docker compose up -d
 | [docs/privacy.md](docs/privacy.md) | 개인정보 보유기간과 자동 파기 |
 | [docs/admin.md](docs/admin.md) | 관리자 페이지와 관리자 API |
 | [docs/api.md](docs/api.md) | HTTP API 레퍼런스: 엔드포인트, 공통 헤더, 응답 형식 |
+
+## 라이선스
+
+[MIT 라이선스](LICENSE)입니다. 웹 화면에 쓰는 Bootstrap과 Start Bootstrap 템플릿(MIT)의 고지는 `src/ebms_server/static/vendor/bootstrap/LICENSE`, `vendor/startbootstrap-scrolling-nav/`와 각 파일 머리 주석에 있습니다. Docker 이미지의 ffmpeg·7zip·unrar는 Debian 패키지를 별도 프로세스로 호출만 하며, 각 패키지의 라이선스를 따릅니다(unrar는 non-free).
+
+beatoraja·BeMusicSeeker 등은 동작과 기준값만 참고합니다. GPL 코드를 옮겨 오면 그 파일이 GPL 파생물이 되므로 코드를 번역해 넣지 않습니다.
