@@ -86,6 +86,15 @@ EBMS_VAR_DIR=/mnt/hdd/ebms/release/var
   # release.env에 EBMS_MYSQL_DIR 추가 후 다시 up
   ```
 
+### 로그 시간대
+
+로그(ebms.log·audit.log·access.log, docker 로그, 관리자 로그 화면)의 시각은 컨테이너 시간대를 따르고 기본은 UTC입니다. 한국 시간으로 남기려면 단계별 env 파일에 `TZ`를 넣고 다시 `up` 합니다. `KST-9`는 POSIX 형식이라 이미지에 tzdata가 없어도 동작합니다. 바꾸기 전에 남은 로그는 UTC 그대로이고, access.log는 KST 자정에 돌아갑니다.
+
+```bash
+# /opt/ebms/release.env
+TZ=KST-9
+```
+
 ### SSD를 작업 공간으로 쓰기
 
 곡은 모두 저장소(`var/store`)에 들어가므로 데이터는 큰 디스크(HDD)에 두고, 작은 SSD는 임포트 중간 작업과 MySQL 쓰기 로그에만 씁니다. SMR HDD에서는 압축 풀기·commit이 디스크를 다투어 곡 하나에 몇 분씩 걸릴 수 있습니다.
