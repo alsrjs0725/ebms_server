@@ -82,6 +82,8 @@ services:
       EBMS_RENDER_INDEX_CPUS: ${EBMS_RENDER_INDEX_CPUS:-}
       # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
       EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
+      # 로그 시각의 시간대. 비우면 UTC. 예: KST-9(이미지에 tzdata가 없어도 동작)(docs/deployment.md)
+      TZ: ${TZ:-}
     ports:
       # 평문 HTTP이므로 기본은 호스트의 루프백에만 엽니다. 외부에는 TLS 리버스 프록시(https)로만 공개하세요.
       # 프록시가 docker 컨테이너(nginx-proxy-manager 등)면 루프백에 닿지 못하므로
