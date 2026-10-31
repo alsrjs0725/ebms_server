@@ -16,10 +16,12 @@ import logging
 import os
 import pathlib
 import shutil
+import struct
 import threading
 import time
 import uuid
 import zipfile
+import zlib
 from collections import OrderedDict
 
 from . import cache, charset, constant
@@ -202,11 +204,30 @@ class ZipNameEncodingError(ValueError):
     """UTF-8 플래그가 없는 zip 항목 이름을 ZIP_NAME_ENCODINGS 중 어느 것으로도 다 풀 수 없습니다."""
 
 
+def _has_unicode_path(info: zipfile.ZipInfo, raw: bytes) -> bool:
+    """Info-ZIP Unicode Path 추가 필드(0x7075)에 UTF-8 이름이 있는지. zipfile(3.12+)은 이 필드가 맞으면
+    UTF-8 플래그가 없어도 filename을 그 이름으로 바꿔 둡니다(반디집·7-Zip·WinRAR가 이렇게 만듭니다)."""
+    extra = info.extra
+    while len(extra) >= 4:
+        tp, ln = struct.unpack("<HH", extra[:4])
+        data = extra[4:ln + 4]
+        if tp == 0x7075 and len(data) >= 5:
+            version, crc = struct.unpack("<BL", data[:5])
+            if version == 1 and crc == zlib.crc32(raw) and data[5:]:
+                return True
+        extra = extra[ln + 4:]
+    return False
+
+
 def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
-    """UTF-8 플래그가 없는 항목 이름의 원래 바이트. zipfile은 플래그가 없으면 cp437로 읽으므로 되돌립니다."""
+    """UTF-8 플래그가 없는 항목 이름의 원래 바이트. zipfile은 플래그가 없으면 cp437로 읽으므로 되돌립니다.
+    UTF-8 이름이 이미 있으면(플래그 또는 Unicode Path 필드) None."""
     if info.flag_bits & 0x800:
         return None
-    return info.filename.encode("cp437")
+    raw = info.orig_filename.encode("cp437")
+    if _has_unicode_path(info, raw):
+        return None
+    return raw
 
 
 def _zip_name_encoding(zf: zipfile.ZipFile) -> str | None:
