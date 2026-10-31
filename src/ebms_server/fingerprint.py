@@ -118,12 +118,12 @@ def variants(blob: bytes) -> list[np.ndarray]:
     return out
 
 
-def render_score(a: list[np.ndarray], b: list[np.ndarray]) -> float | None:
-    """분기 중 가장 잘 맞는 쌍의 렌더 일치율."""
+def render_score(a: list[np.ndarray], b: list[np.ndarray], prefix: bool = False) -> float | None:
+    """분기 중 가장 잘 맞는 쌍의 렌더 일치율. prefix면 a는 앞부분만 렌더한 질의라 b도 a 길이까지만 봅니다."""
     best = None
     for x in a:
         for y in b:
-            value = render_match.similarity(x, y)
+            value = render_match.similarity(x, y[: len(x)] if prefix else y)
             if value is not None and (best is None or value > best):
                 best = value
     return best
@@ -225,17 +225,41 @@ def search(
     exclude_song: int,
     query: list[tuple[int, int]] | None = None,
     skip: Callable[[int], bool] = lambda song_id: False,
+    prefix: bool = False,
 ) -> Iterator[tuple[int, str, float | None]]:
     """질의 특징(분기별)과 같은 시간차로 해시가 많이 겹치는 다른 곡 차트를 후보로 뽑아 렌더 일치율을 잽니다.
     (곡 번호, 차트 경로, 렌더 일치율)을 해시가 많이 겹친 순으로 하나씩 냅니다. skip(곡 번호)은 후보마다 그때 보므로,
-    앞 후보 결과로 뒤 후보를 건너뛸 수 있습니다."""
+    앞 후보 결과로 뒤 후보를 건너뛸 수 있습니다. prefix는 질의가 앞부분만 렌더한 것일 때(render_score)."""
     if query is None:
         query = sorted({hv for f in features if len(f) for hv in hashes(f)})
     for cand, _ in candidates(con, query, exclude_song):
         other_song, other_path, other_blob = con.execute("SELECT song_id, path, features FROM chart WHERE id = ?", (cand,)).fetchone()
         if skip(other_song):
             continue
-        yield other_song, other_path, render_score(features, variants(other_blob))
+        yield other_song, other_path, render_score(features, variants(other_blob), prefix)
+
+
+def song_features(con: sqlite3.Connection, song_id: int) -> dict[str, list[np.ndarray]]:
+    """저장된 곡의 차트별 특징(분기별). 곡이 없으면 빈 dict."""
+    return {path: variants(blob) for path, blob in con.execute("SELECT path, features FROM chart WHERE song_id = ?", (song_id,))}
+
+
+def song_paths(con: sqlite3.Connection, song_id: int) -> list[str]:
+    """저장된 곡의 차트 경로들."""
+    return [row[0] for row in con.execute("SELECT path FROM chart WHERE song_id = ?", (song_id,))]
+
+
+def best_score(query: list[list[np.ndarray]], stored: dict[str, list[np.ndarray]], prefix: bool = False) -> float | None:
+    """질의 차트들(차트마다 분기별 특징)과 저장된 곡 차트들 사이에서 가장 높은 렌더 일치율. SAME 이상이면 더 보지 않습니다."""
+    best = None
+    for q in query:
+        for feats in stored.values():
+            value = render_score(q, feats, prefix)
+            if value is not None and (best is None or value > best):
+                best = value
+                if best >= render_match.SAME:
+                    return best
+    return best
 
 
 def forget_song(con: sqlite3.Connection, song_id: int) -> None:

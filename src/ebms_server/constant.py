@@ -91,6 +91,10 @@ RENDER_INDEX_MINUTES = float(os.environ.get("EBMS_RENDER_INDEX_MINUTES", "60"))
 RENDER_INDEX_START_DELAY = float(os.environ.get("EBMS_RENDER_INDEX_START_DELAY", "600"))
 # 색인 프로세스를 붙일 코어 번호("3", "2,3"). 비우면 마지막 코어 하나, "none"이면 붙이지 않습니다.
 RENDER_INDEX_CPUS = os.environ.get("EBMS_RENDER_INDEX_CPUS", "")
+# 업로드 묶음을 풀고 판정하기 전에 곡마다 모든 차트를 앞 STAGE_RENDER_SECONDS초만 렌더해 지문 저장소에서 같은 곡을
+# 찾습니다(stage_render.py). STAGE_RENDER_WORKERS개 프로세스로 나눠 렌더하고, 0이면 렌더 검색을 하지 않습니다.
+STAGE_RENDER_WORKERS = int(os.environ.get("EBMS_STAGE_RENDER_WORKERS", "4"))
+STAGE_RENDER_SECONDS = float(os.environ.get("EBMS_STAGE_RENDER_SECONDS", "60"))
 # 공유용 난이도표 정적 페이지 폴더. `/table/{표 이름}.html`(과 그 페이지가 가리키는 header·data JSON)로 그대로 내보냅니다.
 TABLE_PAGE_DIR = BASE_DIR / "src" / "ebms_server" / "table"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.

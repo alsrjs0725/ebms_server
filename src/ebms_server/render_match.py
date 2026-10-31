@@ -187,17 +187,19 @@ def branch_charts(chart: bytes, limit: int = MAX_VARIANTS) -> tuple[list[bytes],
 # ---- 렌더 ----
 
 
-def _sounds(chart: bytes) -> tuple[list[preview.Sound], bool]:
-    """차트의 소리 중 렌더할 것(MAX_SECONDS 안, MAX_SOUNDS개까지)과 잘렸는지."""
+def _sounds(chart: bytes, seconds: float = MAX_SECONDS) -> tuple[list[preview.Sound], bool]:
+    """차트의 소리 중 렌더할 것(seconds 안, MAX_SOUNDS개까지)과 잘렸는지(앞부분만 렌더할 때는 잘렸다고 하지 않음)."""
     sounds = preview.parse_chart(chart).sounds
-    kept = [s for s in sounds if math.isfinite(s.time) and 0 <= s.time < MAX_SECONDS and math.isfinite(s.offset)]
+    kept = [s for s in sounds if math.isfinite(s.time) and 0 <= s.time < seconds and math.isfinite(s.offset)]
+    if seconds < MAX_SECONDS:
+        return kept[:MAX_SOUNDS], len(kept) > MAX_SOUNDS
     truncated = len(kept) < len(sounds) or len(kept) > MAX_SOUNDS
     return kept[:MAX_SOUNDS], truncated
 
 
-def mix(sounds: list[preview.Sound], samples: dict[str, np.ndarray]) -> np.ndarray:
-    """소리를 처음부터 끝까지(MAX_SECONDS까지) 섞습니다."""
-    limit = int(MAX_SECONDS * RATE)
+def mix(sounds: list[preview.Sound], samples: dict[str, np.ndarray], seconds: float = MAX_SECONDS) -> np.ndarray:
+    """소리를 처음부터 끝까지(seconds까지) 섞습니다."""
+    limit = int(seconds * RATE)
     segments = []
     end = 0
     for s in sounds:
@@ -246,11 +248,12 @@ def features(buf: np.ndarray) -> np.ndarray:
 
 def fingerprints(
     names: list[str], read: Callable[[str], bytes], charts: list[str], deadline: float | None = None,
-    nice: bool = True,
+    nice: bool = True, seconds: float = MAX_SECONDS, work_dir: pathlib.Path | None = None,
 ) -> dict[str, Fingerprint]:
     """곡 안 차트들의 렌더 특징. names는 곡 안 모든 파일 경로, read(경로)는 그 내용, charts는 렌더할 차트 경로입니다.
     키음은 내용(sha256) 기준으로 한 번만 풉니다(decode_cache). deadline(time.monotonic 기준)을 넘기면 남은 분기는
-    건너뛰고 truncated로 둡니다. nice는 ffmpeg 우선순위를 낮출지(commit 중에는 False). ffmpeg가 없으면 RuntimeError."""
+    건너뛰고 truncated로 둡니다. nice는 ffmpeg 우선순위를 낮출지(commit 중에는 False). seconds는 앞에서부터 렌더할
+    길이(업로드 검색용은 앞부분만), work_dir은 키음을 잠깐 풀어 둘 폴더(기본 cache.work_dir()). ffmpeg가 없으면 RuntimeError."""
     ffmpeg = preview._ffmpeg()
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found")
@@ -260,7 +263,7 @@ def fingerprints(
     for path in charts:
         try:
             texts, cut[path] = branch_charts(read(path))
-            parsed[path] = [_sounds(text) for text in texts]
+            parsed[path] = [_sounds(text, seconds) for text in texts]
         except Exception as e:  # 깨진 차트는 렌더하지 않습니다.
             logger.info(f"render_match: parse failed[{path}]: {e}")
     targets: dict[str, dict[str, str | None]] = {}
@@ -274,7 +277,7 @@ def fingerprints(
     members = sorted({t for found in targets.values() for t in found.values() if t})
     decoded: dict[str, np.ndarray] = {}
     if members:
-        with tempfile.TemporaryDirectory(dir=cache.work_dir()) as tmp:
+        with tempfile.TemporaryDirectory(dir=work_dir or cache.work_dir()) as tmp:
             disk, hashes = [], []
             for i, member in enumerate(members):
                 target = pathlib.Path(tmp) / f"{i}{posixpath.splitext(member)[1].lower()}"
@@ -282,7 +285,7 @@ def fingerprints(
                 target.write_bytes(data)
                 disk.append(target)
                 hashes.append(decode_cache.sha256_bytes(data))
-            found_all = decode_cache.decode_sounds(ffmpeg, disk, MAX_SECONDS, rate=RATE, nice=nice, hashes=hashes)
+            found_all = decode_cache.decode_sounds(ffmpeg, disk, seconds, rate=RATE, nice=nice, hashes=hashes)
             for member, data in zip(members, found_all):
                 if data is not None:
                     decoded[member] = data
@@ -297,7 +300,7 @@ def fingerprints(
                 truncated = True
                 break
             truncated |= clipped
-            feats.append(features(mix(sounds, samples)))
+            feats.append(features(mix(sounds, samples, seconds)))
             # 확장자만 다른 키음(.wav/.ogg)은 같은 자리로 봅니다.
             heard = sorted(
                 (round(s.time, 4), posixpath.splitext(found[s.name].lower())[0])
