@@ -359,6 +359,38 @@ def test_zip_name_encoding_unknown():
         importer._song_groups(zf)
 
 
+class UnicodePathZipInfo(zipfile.ZipInfo):
+    """반디집·7-Zip처럼 UTF-8 플래그 없이 cp932 바이트 이름을 쓰고, UTF-8 이름은 Unicode Path 필드(0x7075)에 둡니다."""
+
+    def _encodeFilenameFlags(self):
+        return self.filename.encode("cp932", "replace"), self.flag_bits & ~0x800
+
+
+def _unicode_path_info(name: str) -> zipfile.ZipInfo:
+    import struct
+    import zlib
+    info = UnicodePathZipInfo(name)
+    raw = name.encode("cp932", "replace")
+    data = struct.pack("<BL", 1, zlib.crc32(raw)) + name.encode("utf-8")
+    info.extra = struct.pack("<HH", 0x7075, len(data)) + data
+    return info
+
+
+def test_zip_unicode_path_field():
+    # cp932에 없는 문자(／)는 원래 이름이 '?'로 깨져 있고, zipfile이 Unicode Path 필드의 UTF-8 이름으로 바꿔 둡니다.
+    # 이 이름을 cp437로 되돌리려다 실패하지 않고 그대로 씁니다(ASCII·cp932 이름 항목과 섞여 있어도).
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(_unicode_path_info("U／E/曲.bms"), b"#TITLE A\n")
+        zf.writestr(_unicode_path_info("U／E/音.wav"), b"")
+        zf.writestr(Cp932ZipInfo("U／E/readme.txt".replace("／", "_")), b"")
+    zf = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+    assert all(not i.flag_bits & 0x800 for i in zf.infolist())
+    assert importer._zip_name_encoding(zf) == "utf-8"
+    assert sorted(parts for g in importer._song_groups(zf).values() for _, parts in g) == [["曲.bms"], ["音.wav"]]
+    assert list(importer._song_groups(zf)) == [("U／E",)]
+
+
 def test_upload_resumes_after_restart(client, monkeypatch):
     """받던 업로드는 서버를 다시 시작해도 받은 곳부터 이어 받습니다."""
     admin_login(client, monkeypatch)
