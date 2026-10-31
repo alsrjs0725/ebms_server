@@ -16,6 +16,8 @@
   키음이 곡 안에 다 있으면(따로 선 곡) 항목이 하나 이상 같고 그 키음을 혼자 SIMILAR_SOUNDS 이상 가진 기존 곡을
   중복 의심 후보로 보여주기만 하고(complete), auto는 새 곡입니다(같은 곡을 채보만 고쳐 다시 올린 경우).
   키음이 없는 차트뿐인 곡은 항목만으로 판정합니다(SIMILAR_MIN_FIELDS개 이상 같은 곡이 후보, 가장 많이 겹치는 곡이 하나면 auto).
+  그와 함께 묶음을 다 푼 뒤 곡마다 모든 차트를 앞부분만 렌더해(stage_render, 묶음의 `_render/`) 지문 저장소에서 같은 곡을 찾아
+  후보 맨 앞에 더하고, 후보 곡과의 렌더 일치율을 suggestion.render에 둡니다. commit한 차트는 바로 저장소에 넣습니다.
 - 기존 곡에 더하는 차트는 commit 직전에 올린 그대로의 소리와 병합 뒤 날 소리를 렌더해 비교하고(render_match), 다르면(같은 이름의
   다른 곡 키음으로 울리게 되면) 그 차트를 넣지 않고 묶음에 남깁니다(result.render_held). 충돌 키음을 새 파일로 고르거나 차트를 새 곡으로 두면 들어갑니다.
 - 새 곡으로 넣는 차트가 곡 안에 없는 키음을 쓰면(차분) 비슷한 곡 후보에서 그 키음만 복사해 넣습니다(병합했을 때와 같은 소리로 플레이).
@@ -36,7 +38,7 @@ import time
 import uuid
 import zipfile
 
-from . import cache, constant, db, decode_cache, importer, preview, rar, render_match, sevenzip, store
+from . import cache, constant, db, decode_cache, importer, preview, rar, render_match, sevenzip, stage_render, store
 from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,8 @@ PACK_FILE = "song.zip"
 SAVE_INTERVAL = 2.0
 # 올린 zip·rar·7z를 다 풀 때까지 두는 묶음 안 폴더
 SOURCE_DIR = "_source"
+# 곡마다 앞부분 렌더 특징(stage_render)
+RENDER_DIR = "_render"
 # var/tmp에서 곡 폴더를 옮기는 동안 곡 자리에 두는 원래 위치. 옮기다 꺼지면 recover가 보고 var/tmp로 되돌립니다.
 ORIGIN_FILE = ".origin.json"
 # 서버가 다시 시작될 때 이어서 하는 최대 횟수(작업 때문에 서버가 꺼져 계속 다시 시작하는 것을 막음)
@@ -123,6 +127,43 @@ def _unit_dir(stage: dict, unit: dict) -> pathlib.Path:
 
 def _pack_path(stage: dict, unit: dict) -> pathlib.Path:
     return _dir(stage["id"]) / unit["id"] / PACK_FILE
+
+
+def _render_dir(stage: dict) -> pathlib.Path:
+    """곡마다 앞부분 렌더 특징을 둔 폴더(stage_render)."""
+    return _dir(stage["id"]) / RENDER_DIR
+
+
+def _render_units(stage: dict) -> None:
+    """판정 전에 아직 렌더하지 않은 곡을 렌더해 둡니다(stage_render). 차트가 기존 차트와 겹치는 곡은 하지 않습니다.
+    오래 걸리므로 묶음 잠금 밖(묶음을 다 푼 뒤)에서만 부릅니다."""
+    out = _render_dir(stage)
+    todo = []
+    with db.connect() as con, con.cursor() as cur:
+        for unit in stage["units"]:
+            if (out / f"{unit['id']}.json").is_file():
+                continue
+            exact = False
+            for chart in unit["charts"]:
+                cur.execute("SELECT 1 FROM chart WHERE id = %s AND size = %s", (chart["sha256"], chart["size"]))
+                if cur.fetchone() is not None:
+                    exact = True
+                    break
+            if exact:
+                continue
+            pack = _pack_path(stage, unit)
+            source = pack if pack.is_file() else _unit_dir(stage, unit)
+            todo.append((unit["id"], str(source), {c["path"]: c["sha256"] for c in unit["charts"]}))
+    stage_render.render(todo, out)
+
+
+def _store_prints(stage: dict, unit: dict, song_id: int, charts: list[str]) -> None:
+    """commit한 차트의 앞부분 렌더 특징을 지문 저장소에 넣습니다(다음 업로드부터 찾게). 실패해도 commit은 그대로."""
+    try:
+        query, _ = stage_render.load(_render_dir(stage), unit)
+        stage_render.store_committed(song_id, {c: query[c] for c in charts if c in query})
+    except Exception:
+        logger.exception(f"staging: could not store render prints[{song_id}]")
 
 
 def _pack(song_dir: pathlib.Path, pack: pathlib.Path) -> None:
@@ -277,7 +318,7 @@ def recover() -> None:
             shutil.rmtree(path, ignore_errors=True)
             continue
         status = stage["status"]
-        known = {unit["id"] for unit in stage["units"]}
+        known = {unit["id"] for unit in stage["units"]} | {RENDER_DIR}
         if status == "staging":
             known.add(SOURCE_DIR)
         for child in path.iterdir():
@@ -471,6 +512,15 @@ def _fill_meta(stage: dict, unit: dict) -> None:
 def _analyze(stage: dict) -> None:
     """곡마다 겹치는 기존 곡을 찾아 판정(suggestion)과 차트별 상태(songs, deleted)를 채웁니다. DB는 읽기만 합니다."""
     Database()  # 테이블 준비
+    prints = stage_render.open_store()
+    try:
+        _analyze_units(stage, prints)
+    finally:
+        if prints is not None:
+            prints.close()
+
+
+def _analyze_units(stage: dict, prints) -> None:
     with db.connect() as con, con.cursor() as cur:
         for unit in stage["units"]:
             _fill_meta(stage, unit)
@@ -494,16 +544,26 @@ def _analyze(stage: dict) -> None:
                     songs.append(chart["song_id"])
             songs.sort()
             merge, matches, sounds, complete = None, {}, {}, False
+            render, partial = {}, False
             if deleted is not None:
                 kind = "unused"
             elif not songs:
                 songs, matches, sounds, merge, complete = _similar(cur, unit, *_unit_sounds(stage, unit))
+                query, partial = stage_render.load(_render_dir(stage), unit) if prints is not None else ({}, False)
+                if query:
+                    found, scores = stage_render.judge(prints, query, songs)
+                    # 렌더로 같은 곡인 곡을 앞에, 그다음 이름·키음으로 고른 곡
+                    songs = [s for s in sorted(found, key=lambda s: (-found[s], s)) if s not in songs] + songs
+                    render = {str(s): round(v, 3) for s, v in {**scores, **found}.items() if s in songs}
                 kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {"kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds, "complete": complete}
+            unit["suggestion"] = {
+                "kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds,
+                "complete": complete, "render": render, "render_partial": partial,
+            }
 
 
 def analyze(stage_id: str) -> dict:
@@ -610,6 +670,10 @@ class _Writer:
             shutil.rmtree(_dir(stage["id"]), ignore_errors=True)
             self.job.stage_id = None
             return
+        try:
+            _render_units(stage)
+        except Exception:
+            logger.exception(f"staging render failed[{stage['id']}]")
         try:
             _analyze(stage)
             stage["analyzed_at"] = int(time.time())
@@ -1372,6 +1436,8 @@ def commit(stage_id: str, job: importer.Job) -> None:
                             info["borrowed_sounds"] = borrowed
                         if held:
                             info["render_held"] = held
+                        if info.get("song_id") and not info.get("error"):
+                            _store_prints(stage, unit, info["song_id"], [c for c in charts if c not in {h["chart"] for h in held}])
                     except Exception as e:
                         logger.exception(f"commit failed[{label}]")
                         info = {"folder": label, "error": str(e) or type(e).__name__}

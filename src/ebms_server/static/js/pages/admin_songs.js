@@ -975,7 +975,8 @@ function suggestionCell(stage, unit) {
         const div = document.createElement("div");
         div.className = "small";
         const top = String(s.songs[0]);
-        const why = s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
+        const why = !s.matches[top] ? "맨 앞 곡은 렌더로만 찾은 곡"
+            : s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
             : s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
             : (s.matches[top] || []).length < 2 ? "맨 앞 곡과 같은 항목이 하나뿐" : "맨 앞 곡이 여럿";
         div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 비슷함)` : `자동: 새 곡 (${why})`;
@@ -984,11 +985,14 @@ function suggestionCell(stage, unit) {
     return td;
 }
 
-// 비슷한 곡인 이유: 같은 항목과, 곡에 없는 키음이 있으면 그 곡에 있는 비율
+// 비슷한 곡인 이유: 같은 항목과, 곡에 없는 키음이 있으면 그 곡에 있는 비율, 렌더 일치율
 function similarReason(s, id) {
     const parts = (s.matches[String(id)] || []).map((f) => FIELD[f]);
     const rate = s.sounds?.[String(id)];
     if (rate !== undefined) parts.push(`키음 ${Math.round(rate * 100)}%`);
+    // 앞부분 렌더 일치율(70% 이상이면 같은 곡). 올린 곡에 키음이 일부만 있으면 낮게 나올 수 있습니다.
+    const render = s.render?.[String(id)];
+    if (render !== undefined) parts.push(`렌더 ${Math.round(render * 100)}%${s.render_partial ? "(키음 일부)" : ""}`);
     return parts.join("·");
 }
 

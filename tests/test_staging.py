@@ -70,7 +70,7 @@ def test_upload_is_staged_until_commit(client, monkeypatch):
     assert len(stages) == 1 and stages[0]["status"] == "ready" and stages[0]["units"] == 2
     assert stages[0]["counts"]["new"] == 1 and stages[0]["counts"]["add"] == 1
     got = units(client, job["stage_id"])
-    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None, "merge": None, "matches": {}, "sounds": {}, "complete": False}
+    assert got["pack/p/new"]["suggestion"] == {"kind": "new", "songs": [], "deleted": None, "merge": None, "matches": {}, "sounds": {}, "complete": False, "render": {}, "render_partial": False}
     assert got["pack/p/add"]["suggestion"]["kind"] == "add" and got["pack/p/add"]["suggestion"]["songs"] == [1]
     assert {c["path"]: c["song_id"] for c in got["pack/p/add"]["charts"]} == {"a.bms": 1, "extra.bms": None}
     assert detail(client, job["stage_id"])["songs"] == {"1": "base"}
@@ -335,7 +335,7 @@ def test_similar_songs_by_fields(client, monkeypatch):
     got = units(client, sid)
     assert got["pack/small"]["suggestion"] == {
         "kind": "similar", "songs": [1, 2, 3], "deleted": None, "merge": 1,
-        "matches": {"1": ["title", "artist", "bpm", "genre"], "2": ["title", "bpm"], "3": ["bpm", "genre"]}, "sounds": {}, "complete": False,
+        "matches": {"1": ["title", "artist", "bpm", "genre"], "2": ["title", "bpm"], "3": ["bpm", "genre"]}, "sounds": {}, "complete": False, "render": {}, "render_partial": False,
     }
     tie = got["pack/tie"]["suggestion"]
     assert tie["kind"] == "similar" and tie["songs"] == [1, 2] and tie["merge"] is None
@@ -387,7 +387,7 @@ def test_similar_songs_by_sounds(client, monkeypatch):
     got = units(client, job["stage_id"])
     assert got["pack/full"]["suggestion"] == {
         "kind": "similar", "songs": [1], "deleted": None, "merge": 1,
-        "matches": {"1": ["title", "artist", "bpm"]}, "sounds": {"1": 1.0}, "complete": False,
+        "matches": {"1": ["title", "artist", "bpm"]}, "sounds": {"1": 1.0}, "complete": False, "render": {}, "render_partial": False,
     }
     renamed = got["pack/renamed"]["suggestion"]
     assert (renamed["songs"], renamed["matches"], renamed["sounds"], renamed["merge"]) == ([1], {"1": ["artist"]}, {"1": 1.0}, None)
@@ -395,7 +395,7 @@ def test_similar_songs_by_sounds(client, monkeypatch):
     assert (most["kind"], most["songs"], most["sounds"], most["merge"]) == ("similar", [1], {"1": 0.8}, None)
     assert got["pack/again"]["suggestion"] == {
         "kind": "similar", "songs": [1], "deleted": None, "merge": None,
-        "matches": {"1": ["title", "artist", "bpm"]}, "sounds": {"1": 1.0}, "complete": True,
+        "matches": {"1": ["title", "artist", "bpm"]}, "sounds": {"1": 1.0}, "complete": True, "render": {}, "render_partial": False,
     }
     for folder in ("pack/short", "pack/complete", "pack/tiny"):
         assert got[folder]["suggestion"]["kind"] == "new", folder
