@@ -17,7 +17,8 @@
   중복 의심 후보로 보여주기만 하고(complete), auto는 새 곡입니다(같은 곡을 채보만 고쳐 다시 올린 경우).
   키음이 없는 차트뿐인 곡은 항목만으로 판정합니다(SIMILAR_MIN_FIELDS개 이상 같은 곡이 후보, 가장 많이 겹치는 곡이 하나면 auto).
   그와 함께 묶음을 다 푼 뒤 곡마다 모든 차트를 앞부분만 렌더해(stage_render, 묶음의 `_render/`) 지문 저장소에서 같은 곡을 찾아
-  후보 맨 앞에 더하고, 후보 곡과의 렌더 일치율을 suggestion.render에 둡니다. commit한 차트는 바로 저장소에 넣습니다.
+  후보 맨 앞에 더하고, 후보 곡과의 렌더 일치율을 suggestion.render에 둡니다(곡에 없는 키음은 후보 곡 것으로 채워 렌더).
+  auto가 추가할 곡이 그렇게 렌더해도 '다름'이면 auto는 새 곡입니다(render_blocked). commit한 차트는 바로 저장소에 넣습니다.
 - 기존 곡에 더하는 차트는 commit 직전에 올린 그대로의 소리와 병합 뒤 날 소리를 렌더해 비교하고(render_match), 다르면(같은 이름의
   다른 곡 키음으로 울리게 되면) 그 차트를 넣지 않고 묶음에 남깁니다(result.render_held). 충돌 키음을 새 파일로 고르거나 차트를 새 곡으로 두면 들어갑니다.
 - 새 곡으로 넣는 차트가 곡 안에 없는 키음을 쓰면(차분) 비슷한 곡 후보에서 그 키음만 복사해 넣습니다(병합했을 때와 같은 소리로 플레이).
@@ -136,6 +137,7 @@ def _render_dir(stage: dict) -> pathlib.Path:
 
 def _render_units(stage: dict) -> None:
     """판정 전에 아직 렌더하지 않은 곡을 렌더해 둡니다(stage_render). 차트가 기존 차트와 겹치는 곡은 하지 않습니다.
+    차트가 부르는 키음 파일이 곡에 다 없으면 이름·키음으로 고른 후보 곡(앞 FILL_CANDIDATES개) 키음으로 채워서도 렌더합니다.
     오래 걸리므로 묶음 잠금 밖(묶음을 다 푼 뒤)에서만 부릅니다."""
     out = _render_dir(stage)
     todo = []
@@ -151,16 +153,28 @@ def _render_units(stage: dict) -> None:
                     break
             if exact:
                 continue
+            fills = {}
+            sounds, own = _unit_sounds(stage, unit)
+            if any(not sound & own for sound in sounds):
+                _fill_meta(stage, unit)
+                songs = _similar(cur, unit, sounds, own)[0][: stage_render.FILL_CANDIDATES]
+                for song_id in songs:
+                    cur.execute("SELECT path FROM song WHERE id = %s", (song_id,))
+                    row = cur.fetchone()
+                    if row is not None and row[0]:
+                        fills[song_id] = str(store.full_path(row[0]))
             pack = _pack_path(stage, unit)
             source = pack if pack.is_file() else _unit_dir(stage, unit)
-            todo.append((unit["id"], str(source), {c["path"]: c["sha256"] for c in unit["charts"]}))
+            todo.append((unit["id"], str(source), {c["path"]: c["sha256"] for c in unit["charts"]}, fills))
     stage_render.render(todo, out)
 
 
 def _store_prints(stage: dict, unit: dict, song_id: int, charts: list[str]) -> None:
     """commit한 차트의 앞부분 렌더 특징을 지문 저장소에 넣습니다(다음 업로드부터 찾게). 실패해도 commit은 그대로."""
     try:
-        query, _ = stage_render.load(_render_dir(stage), unit)
+        rendered = stage_render.load(_render_dir(stage), unit)
+        # 기존 곡에 넣었으면 그 곡 키음으로 채운 렌더가 실제로 날 소리에 가깝습니다.
+        query, _ = rendered.query(song_id)
         stage_render.store_committed(song_id, {c: query[c] for c in charts if c in query})
     except Exception:
         logger.exception(f"staging: could not store render prints[{song_id}]")
@@ -544,17 +558,22 @@ def _analyze_units(stage: dict, prints) -> None:
                     songs.append(chart["song_id"])
             songs.sort()
             merge, matches, sounds, complete = None, {}, {}, False
-            render, partial = {}, False
+            render, partial, blocked = {}, False, None
             if deleted is not None:
                 kind = "unused"
             elif not songs:
                 songs, matches, sounds, merge, complete = _similar(cur, unit, *_unit_sounds(stage, unit))
-                query, partial = stage_render.load(_render_dir(stage), unit) if prints is not None else ({}, False)
-                if query:
-                    found, scores = stage_render.judge(prints, query, songs)
+                rendered = stage_render.load(_render_dir(stage), unit) if prints is not None else None
+                if rendered is not None and (rendered.own or rendered.filled):
+                    partial = rendered.partial
+                    found, scores = stage_render.judge(prints, rendered, songs)
                     # 렌더로 같은 곡인 곡을 앞에, 그다음 이름·키음으로 고른 곡
                     songs = [s for s in sorted(found, key=lambda s: (-found[s], s)) if s not in songs] + songs
-                    render = {str(s): round(v, 3) for s, v in {**scores, **found}.items() if s in songs}
+                    values = {**found, **{s: v for s, (v, _) in scores.items()}}
+                    render = {str(s): round(v, 3) for s, v in values.items() if s in songs}
+                    if merge is not None and merge in scores and scores[merge][1] and scores[merge][0] <= render_match.DIFFERENT:
+                        # 그 곡 키음으로 채워 렌더해도 소리가 다른 곡(키음 이름만 같은 다른 곡)에는 자동으로 넣지 않습니다.
+                        blocked, merge = merge, None
                 kind = "similar" if songs else "new"
             elif len(songs) == 1:
                 kind = "add"
@@ -562,7 +581,7 @@ def _analyze_units(stage: dict, prints) -> None:
                 kind = "ambiguous"
             unit["suggestion"] = {
                 "kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds,
-                "complete": complete, "render": render, "render_partial": partial,
+                "complete": complete, "render": render, "render_partial": partial, "render_blocked": blocked,
             }
 
 

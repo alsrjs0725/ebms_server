@@ -975,7 +975,8 @@ function suggestionCell(stage, unit) {
         const div = document.createElement("div");
         div.className = "small";
         const top = String(s.songs[0]);
-        const why = !s.matches[top] ? "맨 앞 곡은 렌더로만 찾은 곡"
+        const why = s.render_blocked ? `${songName(stage, s.render_blocked)}의 키음으로 채워 렌더해도 소리가 다름`
+            : !s.matches[top] ? "맨 앞 곡은 렌더로만 찾은 곡"
             : s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
             : s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
             : (s.matches[top] || []).length < 2 ? "맨 앞 곡과 같은 항목이 하나뿐" : "맨 앞 곡이 여럿";
@@ -990,9 +991,9 @@ function similarReason(s, id) {
     const parts = (s.matches[String(id)] || []).map((f) => FIELD[f]);
     const rate = s.sounds?.[String(id)];
     if (rate !== undefined) parts.push(`키음 ${Math.round(rate * 100)}%`);
-    // 앞부분 렌더 일치율(70% 이상이면 같은 곡). 올린 곡에 키음이 일부만 있으면 낮게 나올 수 있습니다.
+    // 앞부분 렌더 일치율(70% 이상이면 같은 곡). 올린 곡에 없는 키음은 그 곡 것으로 채워 렌더한 값입니다(앞 3곡).
     const render = s.render?.[String(id)];
-    if (render !== undefined) parts.push(`렌더 ${Math.round(render * 100)}%${s.render_partial ? "(키음 일부)" : ""}`);
+    if (render !== undefined) parts.push(`렌더 ${Math.round(render * 100)}%`);
     return parts.join("·");
 }
 

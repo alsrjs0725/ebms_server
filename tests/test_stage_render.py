@@ -1,5 +1,5 @@
 """업로드 판정의 렌더 검색(stage_render): commit한 곡의 앞부분 렌더를 저장소에 넣고, 다음 업로드에서 같은 곡을 찾고
-키음 이름만 같은 다른 소리의 곡은 렌더 일치율이 낮게 나옵니다."""
+키음 이름만 같은 다른 소리의 곡에는 자동으로 넣지 않습니다(빠진 키음은 후보 곡 것으로 채워 렌더)."""
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_import import make_zip, stage, upload
 from test_quota import admin_login
@@ -28,17 +28,18 @@ def test_render_search_finds_same_song_and_blocks_other_sounds(client, monkeypat
     assert s["kind"] == "similar" and s["songs"] == [1] and s["matches"] == {} and s["merge"] is None
     assert s["render"]["1"] >= render_match.SAME
 
-    assert s["render_partial"] is False
+    assert s["render_partial"] is False and s["render_blocked"] is None
 
-    # 같은 곡의 차분(03.wav는 곡에 없어 올린 것만으로는 덜 맞음): 키음 일부만이라고 표시, 자동 추가 그대로
+    # 같은 곡의 차분(03.wav는 올린 곡에 없음): 곡 1의 03.wav로 채워 렌더하면 같은 곡, 자동 추가 그대로
     same = _unit(client, stage(client, "b.zip", make_zip({"b.bms": chart(1, "A [ANOTHER]"), "01.wav": sounds["01.wav"], "02.wav": sounds["02.wav"]})))
     s = same["suggestion"]
-    assert s["kind"] == "similar" and s["merge"] == 1 and s["render_partial"] is True
-    assert s["render"]["1"] > render_match.DIFFERENT
+    assert s["kind"] == "similar" and s["merge"] == 1 and s["render_partial"] is True and s["render_blocked"] is None
+    assert s["render"]["1"] >= render_match.SAME
 
-    # 키음 이름은 같지만 소리가 다른 곡: 렌더 일치율이 낮음(병합은 commit 직전 검증이 채보를 남김)
-    other = {"01.wav": tone(tmp_path, "d.wav", 3000, 1.5), "02.wav": tone(tmp_path, "e.wav", 120, 0.05), "03.wav": tone(tmp_path, "f.wav", 500)}
+    # 키음 이름은 같지만 소리가 다른 차분(01·02.wav가 다른 소리, 03.wav 없음): 이름·키음 이름으로는 자동 추가지만
+    # 곡 1 키음으로 채워 렌더해도 '다름'이라 자동 추가하지 않음
+    other = {"01.wav": tone(tmp_path, "d.wav", 3000, 1.5), "02.wav": tone(tmp_path, "e.wav", 120, 0.05)}
     diff = _unit(client, stage(client, "c.zip", make_zip({"c.bms": chart(1, "A [HYPER]"), **other})))
     s = diff["suggestion"]
-    assert s["kind"] == "similar" and s["songs"] == [1] and s["render_partial"] is False
+    assert s["kind"] == "similar" and s["songs"] == [1] and s["merge"] is None and s["render_blocked"] == 1
     assert s["render"]["1"] <= render_match.DIFFERENT
