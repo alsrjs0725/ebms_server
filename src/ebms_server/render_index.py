@@ -1,13 +1,9 @@
-"""모든 곡의 차트 렌더 특징을 모아 두고, 날마다 일정 시간씩 곡을 색인하며 다른 곡 번호의 같은 곡(중복)과
+"""모든 곡의 차트를 날마다 일정 시간씩 렌더해 지문 저장소(fingerprint)에 넣으며, 다른 곡 번호의 같은 곡(중복)과
 한 곡 안에 섞인 다른 곡을 찾아 관리자 목록에 쌓습니다. 자동으로 고치지는 않습니다.
 
-차트가 수만 개라 모든 쌍을 렌더 일치율(render_match)로 비교할 수 없으므로, Shazam처럼 onset 특징의 봉우리
-세 개(기준 + 뒤따르는 둘)의 대역·간격을 해시로 만들어 색인에 넣고, 해시가 같은 시간차로 많이 겹치는 차트만
-후보로 뽑아 저장한 특징으로 렌더 일치율을 잽니다. 곡이 다른 차트끼리는 렌더 일치율만 봅니다(키음 이름은
-곡마다 01.ogg처럼 겹치므로 순서 일치율은 쓰지 않음).
-
-색인은 MySQL이 아니라 var 아래 SQLite 파일 하나(RENDER_INDEX_DIR/index.sqlite)에 둡니다. 다시 만들 수 있는
-파생 데이터라 binlog·백업에 넣지 않습니다. 곡 zip이 바뀌면(sha256) 그 곡을 다시 색인하고, 없어진 곡은 지웁니다.
+후보 찾기·렌더 일치율은 fingerprint.search가 합니다. 곡이 다른 차트끼리는 렌더 일치율만 봅니다(키음 이름은
+곡마다 01.ogg처럼 겹치므로 순서 일치율은 쓰지 않음). 곡 zip이 바뀌면(sha256) 그 곡을 다시 색인하고, 없어진 곡은 지웁니다.
+발견(finding) 표는 저장소와 같은 SQLite 파일에 둡니다.
 """
 import json
 import logging
@@ -16,158 +12,27 @@ import sqlite3
 import threading
 import time
 import zipfile
-import zlib
 
 from typing import Annotated
 
-import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import auth, constant, db, render_match
+from . import auth, constant, db, fingerprint, render_match
 from .accounts import User
 from .admin import _forbidden, web_admin
 from .templating import templates
 
 logger = logging.getLogger(__name__)
 
-# 특징 저장: FEATURE_STEP 단위 uint8(0~12.75)로 줄여 zlib으로 압축합니다(렌더 일치율에는 차이가 거의 없음).
-FEATURE_STEP = 0.05
-# 차트마다 저장·색인하는 분기 수
-MAX_STORED_VARIANTS = 4
-# 봉우리: 주변(±PEAK_FRAMES 프레임, ±PEAK_BANDS 대역)에서 가장 크고 PEAK_MIN 이상인 점을 1초 창마다 PEAKS_PER_SECOND개까지
-PEAK_FRAMES = 3
-PEAK_BANDS = 2
-PEAK_MIN = 0.5
-PEAKS_PER_SECOND = 3
-# 해시: 기준 봉우리와 그 뒤 MAX_DT 프레임 안의 봉우리 FAN개 중 두 개(대역 3개 + 간격 2개)
-FAN = 3
-MAX_DT = 63
-# 후보: 같은 시간차(±1프레임)로 겹친 해시가 MIN_MATCH개 이상이고 질의 해시의 MIN_MATCH_RATIO 이상
-MIN_MATCH = 10
-MIN_MATCH_RATIO = 0.03
-# 차트 하나가 렌더 일치율로 확인하는 후보 수
-MAX_CANDIDATES = 8
-# 너무 흔한 해시(무음에 가까운 반복 등)는 후보 찾기에서 뺍니다.
-MAX_POSTING = 5000
 NICE = 10
 
 
-# ---- 특징 저장 ----
+# ---- 발견 ----
 
-
-def pack(features: np.ndarray) -> bytes:
-    q = np.clip(np.rint(features / FEATURE_STEP), 0, 255).astype(np.uint8)
-    return zlib.compress(np.int32(q.shape[0]).tobytes() + q.tobytes(), 6)
-
-
-def unpack(data: bytes) -> np.ndarray:
-    raw = zlib.decompress(data)
-    frames = int(np.frombuffer(raw[:4], dtype=np.int32)[0])
-    return np.frombuffer(raw[4:], dtype=np.uint8).reshape(frames, render_match.BANDS).astype(np.float32) * FEATURE_STEP
-
-
-# ---- 해시 ----
-
-
-def peaks(features: np.ndarray) -> list[tuple[int, int]]:
-    """(프레임, 대역) 봉우리들, 시간순."""
-    if len(features) == 0:
-        return []
-    f = features
-    padded = np.pad(f, ((PEAK_FRAMES, PEAK_FRAMES), (PEAK_BANDS, PEAK_BANDS)), constant_values=-1)
-    local = np.full_like(f, -1)
-    for dt in range(2 * PEAK_FRAMES + 1):
-        for db_ in range(2 * PEAK_BANDS + 1):
-            np.maximum(local, padded[dt : dt + len(f), db_ : db_ + f.shape[1]], out=local)
-    ts, bs = np.nonzero((f >= local) & (f >= PEAK_MIN))
-    if len(ts) == 0:
-        return []
-    values = f[ts, bs]
-    # 고정된 1초 칸이 아니라 앞뒤 0.5초 안에서 더 큰 봉우리가 PEAKS_PER_SECOND개보다 적은 봉우리만 남깁니다
-    # (렌더가 늦게 시작해도 같은 봉우리가 남도록).
-    half = int(render_match.RATE / render_match.HOP) // 2
-    order = np.argsort(ts, kind="stable")
-    ts, bs, values = ts[order], bs[order], values[order]
-    out = []
-    lo = hi = 0
-    for i in range(len(ts)):
-        while ts[lo] < ts[i] - half:
-            lo += 1
-        while hi < len(ts) and ts[hi] <= ts[i] + half:
-            hi += 1
-        if int((values[lo:hi] > values[i]).sum()) < PEAKS_PER_SECOND:
-            out.append((int(ts[i]), int(bs[i])))
-    out.sort()
-    return out
-
-
-def hashes(features: np.ndarray) -> list[tuple[int, int]]:
-    """(해시, 기준 프레임)들. 해시 = 대역 셋(5비트씩)과 간격 둘(6비트씩)."""
-    p = peaks(features)
-    out = []
-    for i, (t1, b1) in enumerate(p):
-        following = [(t, b) for t, b in p[i + 1 : i + 1 + FAN * 3] if 0 < t - t1 <= MAX_DT][:FAN]
-        for j in range(len(following)):
-            t2, b2 = following[j]
-            for t3, b3 in following[j + 1 :]:
-                if t3 - t1 > MAX_DT:
-                    continue
-                h = (b1 << 22) | (b2 << 17) | (b3 << 12) | ((t2 - t1) << 6) | (t3 - t1)
-                out.append((h, t1))
-    return out
-
-
-def _variants_blob(features: list[np.ndarray]) -> bytes:
-    parts = [pack(f) for f in features[:MAX_STORED_VARIANTS]]
-    return b"".join(len(p).to_bytes(4, "little") + p for p in parts)
-
-
-def _variants(blob: bytes) -> list[np.ndarray]:
-    out, pos = [], 0
-    while pos < len(blob):
-        size = int.from_bytes(blob[pos : pos + 4], "little")
-        out.append(unpack(blob[pos + 4 : pos + 4 + size]))
-        pos += 4 + size
-    return out
-
-
-def _render_score(a: list[np.ndarray], b: list[np.ndarray]) -> float | None:
-    """분기 중 가장 잘 맞는 쌍의 렌더 일치율."""
-    best = None
-    for x in a:
-        for y in b:
-            value = render_match.similarity(x, y)
-            if value is not None and (best is None or value > best):
-                best = value
-    return best
-
-
-# ---- 색인 저장소 ----
-
+# 지문 저장소(fingerprint)와 같은 파일에 둡니다.
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS song(
-    id INTEGER PRIMARY KEY,
-    sha256 TEXT NOT NULL,
-    charts INTEGER NOT NULL,
-    indexed_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS chart(
-    id INTEGER PRIMARY KEY,
-    song_id INTEGER NOT NULL,
-    path TEXT NOT NULL,
-    features BLOB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS chart_song ON chart(song_id);
--- 지운 차트의 해시는 바로 지우지 않고(해시로만 찾을 수 있게 둔 표라 차트로 지우려면 전체를 훑어야 함) 찾을 때 거르고,
--- 쌓이면 compact()가 한 번에 지웁니다.
-CREATE TABLE IF NOT EXISTS hash(
-    h INTEGER NOT NULL,
-    chart INTEGER NOT NULL,
-    t INTEGER NOT NULL,
-    PRIMARY KEY (h, chart, t)
-) WITHOUT ROWID;
 -- kind: dup(곡 a·b가 같은 곡) / mixed(곡 a 안에 다른 곡 차트가 섞임, b = 0). status: open / dismissed
 CREATE TABLE IF NOT EXISTS finding(
     id INTEGER PRIMARY KEY,
@@ -180,58 +45,15 @@ CREATE TABLE IF NOT EXISTS finding(
     status TEXT NOT NULL DEFAULT 'open',
     UNIQUE (kind, song_a, song_b)
 );
-CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
-
 def _path():
-    return constant.RENDER_INDEX_DIR / "index.sqlite"
+    return fingerprint.db_path()
 
 
 def connect() -> sqlite3.Connection:
-    constant.RENDER_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(_path(), timeout=60, check_same_thread=False)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
-    con.executescript(_SCHEMA)
-    return con
-
-
-def _candidates(con: sqlite3.Connection, query: list[tuple[int, int]], song_id: int) -> list[tuple[int, int]]:
-    """질의 해시들과 같은 시간차로 많이 겹치는 다른 곡 차트들: [(차트 id, 겹친 수)], 많은 순."""
-    if not query:
-        return []
-    by_hash: dict[int, list[int]] = {}
-    for h, t in query:
-        by_hash.setdefault(h, []).append(t)
-    offsets: dict[int, dict[int, int]] = {}
-    keys = list(by_hash)
-    for start in range(0, len(keys), 500):
-        part = keys[start : start + 500]
-        rows = con.execute(
-            f"SELECT h.h, h.chart, h.t FROM hash h JOIN chart c ON c.id = h.chart WHERE h.h IN ({','.join('?' * len(part))}) "
-            "AND c.song_id != ?",
-            (*part, song_id),
-        ).fetchall()
-        counts: dict[int, int] = {}
-        for h, _, _ in rows:
-            counts[h] = counts.get(h, 0) + 1
-        for h, chart, t in rows:
-            if counts[h] > MAX_POSTING:
-                continue
-            bins = offsets.setdefault(chart, {})
-            for tq in by_hash[h]:
-                d = t - tq
-                bins[d] = bins.get(d, 0) + 1
-    need = max(MIN_MATCH, int(len(query) * MIN_MATCH_RATIO))
-    out = []
-    for chart, bins in offsets.items():
-        best = max(bins.get(d, 0) + bins.get(d - 1, 0) + bins.get(d + 1, 0) for d in bins)
-        if best >= need:
-            out.append((chart, best))
-    out.sort(key=lambda x: -x[1])
-    return out[:MAX_CANDIDATES]
+    return fingerprint.connect(_SCHEMA)
 
 
 def _put_finding(con: sqlite3.Connection, kind: str, a: int, b: int, score: float | None, detail: dict) -> None:
@@ -245,8 +67,7 @@ def _put_finding(con: sqlite3.Connection, kind: str, a: int, b: int, score: floa
 
 def _forget_song(con: sqlite3.Connection, song_id: int) -> None:
     """곡의 색인과 열린 발견을 지웁니다(해시는 compact가 지움). 넘긴(dismissed) 발견은 남겨 다시 띄우지 않습니다."""
-    con.execute("DELETE FROM chart WHERE song_id = ?", (song_id,))
-    con.execute("DELETE FROM song WHERE id = ?", (song_id,))
+    fingerprint.forget_song(con, song_id)
     con.execute("DELETE FROM finding WHERE status = 'open' AND (song_a = ? OR song_b = ?)", (song_id, song_id))
 
 
@@ -283,25 +104,14 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
                 fps = render_match.fingerprints(names, zf.read, part, nice=True)
                 for path in part:
                     fp = fps.get(path)
-                    feats = [f for f in (fp.features if fp else []) if len(f)][:MAX_STORED_VARIANTS]
-                    if not feats:
+                    put = fingerprint.store(con, song_id, path, fp.features if fp else [])
+                    if put is None:
                         continue
-                    blob = _variants_blob(feats)
-                    feats = _variants(blob)  # 저장한 그대로(양자화된 값)로 비교합니다.
-                    chart_id = con.execute(
-                        "INSERT INTO chart(song_id, path, features) VALUES (?, ?, ?)", (song_id, path, blob)
-                    ).lastrowid
-                    query = sorted({hv for f in feats for hv in hashes(f)})
-                    for cand, matched in _candidates(con, query, song_id):
-                        other_song, other_path, other_blob = con.execute(
-                            "SELECT song_id, path, features FROM chart WHERE id = ?", (cand,)
-                        ).fetchone()
-                        if other_song in dups and dups[other_song]["score"] >= render_match.SAME:
-                            continue
-                        score = _render_score(feats, _variants(other_blob))
-                        if score is not None and score >= render_match.SAME:
+                    _, feats, query = put
+                    found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
+                    for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
+                        if score is not None and score >= render_match.SAME and not found(other_song):
                             dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
-                    con.executemany("INSERT OR IGNORE INTO hash(h, chart, t) VALUES (?, ?, ?)", [(h, chart_id, t) for h, t in query])
                     stored += 1
                     _group(groups, path, fp)
     for other, d in dups.items():
@@ -310,7 +120,7 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
                      {"score": d["score"], "chart": d["other_chart"], "other_chart": d["chart"]})
     if len(groups) > 1:
         _put_finding(con, "mixed", song_id, 0, None, {"groups": [g[1] for g in groups]})
-    con.execute("INSERT INTO song(id, sha256, charts, indexed_at) VALUES (?, ?, ?, ?)", (song_id, sha256, stored, int(time.time())))
+    fingerprint.mark_song(con, song_id, sha256, stored)
     con.commit()
     return {"song_id": song_id, "charts": stored, "dups": sorted(dups), "groups": len(groups)}
 
@@ -338,13 +148,6 @@ def _live_songs() -> dict[int, str]:
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def compact(con: sqlite3.Connection) -> int:
-    """지운 차트의 해시를 지웁니다."""
-    n = con.execute("DELETE FROM hash WHERE chart NOT IN (SELECT id FROM chart)").rowcount
-    con.commit()
-    return n
-
-
 def _save_state(con: sqlite3.Connection, **values) -> None:
     """진행 상황은 색인 파일(meta)에 둡니다. 색인은 별도 프로세스에서 돌고 웹 서버가 읽습니다."""
     row = con.execute("SELECT value FROM meta WHERE key = 'run'").fetchone()
@@ -364,7 +167,7 @@ def run(minutes: float) -> bool:
         _save_state(con, started_at=int(started), finished_at=None, songs=0, song=None, error=None)
         try:
             live = _live_songs()
-            known = dict(con.execute("SELECT id, sha256 FROM song").fetchall())
+            known = fingerprint.songs(con)
             gone = set(known) - set(live)
             for song_id in gone:
                 _forget_song(con, song_id)
@@ -384,12 +187,11 @@ def run(minutes: float) -> bool:
                     logger.exception(f"render index failed[song {song_id}]")
                     # 같은 내용으로는 다시 하지 않습니다(곡이 바뀌면 다시 색인).
                     _forget_song(con, song_id)
-                    con.execute("INSERT INTO song(id, sha256, charts, indexed_at) VALUES (?, ?, -1, ?)",
-                                (song_id, live[song_id], int(time.time())))
+                    fingerprint.mark_song(con, song_id, live[song_id], -1)
                     con.commit()
                 done += 1
             if gone or changed:
-                compact(con)
+                fingerprint.compact(con)
             _save_state(con, songs=done, song=None, finished_at=int(time.time()), left=left)
             logger.info(f"render index: {done} songs in {int(time.time() - started)}s, left={left}")
         except Exception as e:
