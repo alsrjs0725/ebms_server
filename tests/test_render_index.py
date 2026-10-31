@@ -3,7 +3,7 @@ import logging
 
 import numpy as np
 
-from ebms_server import render_index, render_match
+from ebms_server import fingerprint, render_index, render_match
 from test_auth import client, oauth  # noqa: F401  (fixture 재사용)
 from test_import import make_zip, stage, upload
 from test_quota import admin_login
@@ -14,11 +14,11 @@ from test_render_match import tone
 def test_pack_roundtrip_and_hashes_shift():
     rng = np.random.default_rng(0)
     f = np.maximum(rng.normal(0, 1, (2000, render_match.BANDS)), 0).astype(np.float32)
-    g = render_index.unpack(render_index.pack(f))
-    assert g.shape == f.shape and np.abs(g - np.clip(f, 0, 12.75)).max() <= render_index.FEATURE_STEP / 2 + 1e-6
+    g = fingerprint.unpack(fingerprint.pack(f))
+    assert g.shape == f.shape and np.abs(g - np.clip(f, 0, 12.75)).max() <= fingerprint.FEATURE_STEP / 2 + 1e-6
     # 앞에 무음을 붙여 늦게 시작해도 같은 해시가 같은 시간차로 나옵니다.
-    a = {(h, t + 100) for h, t in render_index.hashes(f)}
-    b = set(render_index.hashes(np.vstack([np.zeros((100, render_match.BANDS), np.float32), f])))
+    a = {(h, t + 100) for h, t in fingerprint.hashes(f)}
+    b = set(fingerprint.hashes(np.vstack([np.zeros((100, render_match.BANDS), np.float32), f])))
     assert len(a) > 100 and len(a & b) > 0.95 * len(a)
 
 
