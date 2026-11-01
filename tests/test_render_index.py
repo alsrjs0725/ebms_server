@@ -123,3 +123,18 @@ def test_worker_process_logs_reach_server(monkeypatch, tmp_path, caplog):
     messages = [r.getMessage() for r in caplog.records if r.name.startswith("ebms_server.render_index")]
     assert any("render index process" in m for m in messages)
     assert any("render index run failed" in m and "\nTraceback" in m for m in messages)
+
+
+def test_render_page_paginates_and_trims_groups(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    con = render_index.connect()
+    paths = [f"c{i}.bms" for i in range(8)]
+    for i in range(render_index.PAGE_SIZE + 3):
+        render_index._put_finding(con, "mixed", 1000 + i, 0, None, {"groups": [paths, ["z.bms"]]})
+    con.commit()
+    con.close()
+    first = client.get("/admin/render").text
+    assert "1 / 2 쪽" in first and "c4.bms" in first and "c5.bms" not in first
+    second = client.get("/admin/render", params={"page": 2}).text
+    assert second.count("data-id=") == 3
+    assert len(client.get("/api/admin/render/findings", params={"limit": 2, "offset": render_index.PAGE_SIZE + 2}).json()) == 1
