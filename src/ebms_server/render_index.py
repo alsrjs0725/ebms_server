@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS finding(
     status TEXT NOT NULL DEFAULT 'open',
     UNIQUE (kind, song_a, song_b)
 );
+CREATE INDEX IF NOT EXISTS finding_status ON finding(status, created_at);
 """
 
 
@@ -343,7 +344,12 @@ def start() -> threading.Event | None:
     return stop
 
 
-def findings(state: str = "open", kind: str = "", limit: int = 200) -> list[dict]:
+PAGE_SIZE = 50
+# 화면에는 묶음마다 앞 몇 개 경로만 보입니다(나머지는 개수만). 섞임 곡은 묶음·경로가 많아 페이지가 커집니다.
+SHOWN_PATHS = 5
+
+
+def findings(state: str = "open", kind: str = "", limit: int = 200, offset: int = 0) -> list[dict]:
     if not _path().exists():
         return []
     con = connect()
@@ -353,7 +359,7 @@ def findings(state: str = "open", kind: str = "", limit: int = 200) -> list[dict
         if kind:
             sql += " AND kind = ?"
             args.append(kind)
-        rows = con.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT ?", (*args, limit)).fetchall()
+        rows = con.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
     finally:
         con.close()
     out = [
@@ -366,6 +372,16 @@ def findings(state: str = "open", kind: str = "", limit: int = 200) -> list[dict
         f["folder_a"] = folders.get(f["song_a"])
         f["folder_b"] = folders.get(f["song_b"]) if f["song_b"] else None
     return out
+
+
+def count_findings(state: str = "open") -> int:
+    if not _path().exists():
+        return 0
+    con = connect()
+    try:
+        return con.execute("SELECT COUNT(*) FROM finding WHERE status = ?", (state,)).fetchone()[0]
+    finally:
+        con.close()
 
 
 def _folders(song_ids: set[int]) -> dict[int, str]:
@@ -399,6 +415,7 @@ def render_page(
     request: Request,
     session: Annotated[tuple[User, int] | None, Depends(auth.optional_session)],
     status: str = "open",
+    page: int = 1,
 ):
     if session is None:
         return auth._login_redirect(request)
@@ -406,10 +423,19 @@ def render_page(
         return _forbidden(request)
     if status not in ("open", "dismissed"):
         status = "open"
+    state = status_()
+    total = (state.get("open_findings") or 0) if status == "open" else count_findings(status)
+    pages = max(1, -(-total // PAGE_SIZE))
+    page = max(1, min(page, pages))
+    rows = findings(status, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
+    for f in rows:  # 화면에 안 보일 경로는 보내지 않음
+        if f["kind"] == "mixed":
+            f["groups"] = [{"size": len(g), "shown": g[:SHOWN_PATHS]} for g in f["detail"].get("groups", [])]
     return templates.TemplateResponse(
         request=request,
         name="pages/admin_render.html",
-        context={"user": session[0], "state": status_(), "findings": findings(status), "status": status},
+        context={"user": session[0], "state": state, "findings": rows, "status": status, "page": page, "pages": pages,
+                 "total": total},
     )
 
 
@@ -430,8 +456,9 @@ def api_run(body: RunBody, admin: Annotated[User, Depends(web_admin)]):
 
 
 @router.get("/api/admin/render/findings")
-def api_findings(admin: Annotated[User, Depends(web_admin)], status: str = "open", kind: str = "", limit: int = 200):
-    return findings(status, kind, max(1, min(limit, 1000)))
+def api_findings(admin: Annotated[User, Depends(web_admin)], status: str = "open", kind: str = "", limit: int = 200,
+                 offset: int = 0):
+    return findings(status, kind, max(1, min(limit, 1000)), max(0, offset))
 
 
 class FindingBody(BaseModel):

@@ -49,7 +49,7 @@
                 {% if f.kind == 'dup' %}
                 렌더 일치율 {{ '%.2f' | format(f.score) }}: {{ f.detail.chart }} ↔ {{ f.detail.other_chart }}
                 {% else %}
-                {% for g in f.detail.groups %}<div>묶음 {{ loop.index }} ({{ g | length }}): {{ g[:5] | join(', ') }}{% if g | length > 5 %} …{% endif %}</div>{% endfor %}
+                {% for g in f.groups %}<div>묶음 {{ loop.index }} ({{ g.size }}): {{ g.shown | join(', ') }}{% if g.size > g.shown | length %} …{% endif %}</div>{% endfor %}
                 {% endif %}
             </td>
             <td class="small"><span data-time="{{ f.created_at }}"></span></td>
@@ -65,6 +65,15 @@
     </tbody>
 </table>
 </div>
+{% if pages > 1 %}
+<nav aria-label="점검 목록 쪽">
+    <ul class="pagination pagination-sm">
+        <li class="page-item {% if page <= 1 %}disabled{% endif %}"><a class="page-link" href="/admin/render?status={{ status }}&page={{ page - 1 }}">이전</a></li>
+        <li class="page-item disabled"><span class="page-link">{{ page }} / {{ pages }} 쪽 ({{ total }}개)</span></li>
+        <li class="page-item {% if page >= pages %}disabled{% endif %}"><a class="page-link" href="/admin/render?status={{ status }}&page={{ page + 1 }}">다음</a></li>
+    </ul>
+</nav>
+{% endif %}
 {% else %}
 <p class="text-muted">항목이 없습니다.</p>
 {% endif %}
