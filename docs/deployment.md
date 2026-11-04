@@ -124,6 +124,27 @@ EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
 
   SSD도 부팅 시 자동 마운트되게 해 두세요. 마운트 전에 MySQL이 뜨면 redo log가 없어 시작하지 못합니다.
 
+### 렌더 색인을 SSD로
+
+중복·섞임 점검과 업로드 판정의 렌더 검색이 쓰는 색인(`index.sqlite`, 곡 9천 개에 약 8GB)은 차트마다 해시 표를 무작위로 많이 읽습니다. SMR HDD에 두면, 특히 같은 디스크를 다른 프로그램(토렌트 등)이 함께 쓸 때 색인이 크게 느려집니다. SSD 폴더를 따로 붙입니다.
+
+```bash
+# /opt/ebms/release.env
+EBMS_RENDER_INDEX_HOST_DIR=/mnt/ssd/ebms/release/render_index
+EBMS_RENDER_INDEX_DIR=/app/render_index
+```
+
+이미 쌓인 색인은 켜기 전에 옮깁니다. 색인이 돌고 있어도 SQLite 백업으로 그 시점 그대로 복사할 수 있고, 백업 뒤에 색인한 곡은 새 위치에서 다시 색인합니다(옮기지 않고 켜면 처음부터 다시 색인).
+
+```bash
+sudo mkdir -p /mnt/ssd/ebms/release/render_index
+# 임포트 캐시(EBMS_CACHE_DIR, SSD)에 백업한 뒤 새 폴더로 옮깁니다(같은 디스크라 바로 끝남).
+docker exec ebms-release-ebms-1 python -c "import sqlite3; s = sqlite3.connect('file:/app/var/render_index/index.sqlite?mode=ro', uri=True); d = sqlite3.connect('/app/cache/index.sqlite.copy'); s.backup(d); d.close()"
+sudo mv /mnt/ssd/ebms/release/cache/index.sqlite.copy /mnt/ssd/ebms/release/render_index/index.sqlite
+sudo chown -R --reference=/mnt/ssd/ebms/release/cache /mnt/ssd/ebms/release/render_index
+# release.env에 위 두 줄 추가 후 다시 배포(또는 up -d). 확인되면 HDD의 var/render_index는 지워도 됩니다.
+```
+
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |

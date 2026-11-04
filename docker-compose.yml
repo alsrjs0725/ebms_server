@@ -80,6 +80,9 @@ services:
       EBMS_RENDER_INDEX_HOURS: ${EBMS_RENDER_INDEX_HOURS:-1}
       EBMS_RENDER_INDEX_MINUTES: ${EBMS_RENDER_INDEX_MINUTES:-60}
       EBMS_RENDER_INDEX_CPUS: ${EBMS_RENDER_INDEX_CPUS:-}
+      # 색인 파일(index.sqlite) 폴더. 무작위 읽기가 많아 SSD를 권장합니다. EBMS_RENDER_INDEX_HOST_DIR(호스트 경로)를
+      # 정하면 /app/render_index로 붙으므로 함께 /app/render_index로 바꿉니다(docs/deployment.md#렌더-색인을-ssd로).
+      EBMS_RENDER_INDEX_DIR: ${EBMS_RENDER_INDEX_DIR:-/app/var/render_index}
       # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
       EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
       # 로그 시각의 시간대. 비우면 UTC. 예: KST-9(이미지에 tzdata가 없어도 동작)(docs/deployment.md)
@@ -94,8 +97,11 @@ services:
       - ${EBMS_VAR_DIR:-ebms-var}:/app/var
       # 임포트 중간 작업 공간(업로드·풀어 둔 대기 묶음). EBMS_CACHE_DIR로 빠른 디스크 경로 지정
       - ${EBMS_CACHE_DIR:-ebms-cache}:/app/cache
+      # 렌더 색인(중복·섞임 점검) 폴더. EBMS_RENDER_INDEX_HOST_DIR로 빠른 디스크 경로 지정(EBMS_RENDER_INDEX_DIR도 함께)
+      - ${EBMS_RENDER_INDEX_HOST_DIR:-ebms-render-index}:/app/render_index
 
 volumes:
   mysql-data:
   ebms-var:
   ebms-cache:
+  ebms-render-index:
