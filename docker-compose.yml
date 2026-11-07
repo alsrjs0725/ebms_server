@@ -27,6 +27,8 @@ services:
       - --log-bin=/var/lib/mysql-log/binlog
       # binlog에 바뀐 열만 적어 크기를 줄입니다(기본 FULL은 UPDATE·DELETE마다 행 전체를 적음).
       - --binlog-row-image=MINIMAL
+      # binlog는 7일만 남깁니다(기본 30일). 지난 파일은 binlog를 새로 열 때(재시작·1GiB마다) 지워집니다.
+      - --binlog-expire-logs-seconds=604800
       - --innodb-log-group-home-dir=/var/lib/mysql-log
       - --innodb-doublewrite-dir=/var/lib/mysql-log
     volumes:
