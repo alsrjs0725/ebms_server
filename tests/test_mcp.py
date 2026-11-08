@@ -59,7 +59,11 @@ def test_initialize_and_tools(client, monkeypatch):
     r = api.post("/api/mcp", headers=bearer(key), json={"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert r.status_code == 202
     names = {t["name"] for t in rpc(api, key, "tools/list")["result"]["tools"]}
-    assert names == {"whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation"}
+    assert names == {
+        "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
+        "list_song_findings", "get_song", "compare_songs", "get_compare_result", "split_song", "merge_songs",
+        "remove_charts", "delete_song", "set_finding_status",
+    }
     assert call(api, key, "whoami")["role"] == "admin"
     assert rpc(api, key, "nope")["error"]["code"] == -32601
     assert rpc(api, key, "tools/call", {"name": "nope"})["error"]["code"] == -32602
@@ -159,3 +163,72 @@ def test_case_time_budget(client, monkeypatch):
     assert len(case["items"]) == 1 and case["next_offset"] == 1 and case["total"] == 2
     rest = call(api, key, "get_conflict_case", stage_id=sid, unit_id=unit["id"], offset=case["next_offset"])
     assert len(rest["items"]) == 1 and rest["next_offset"] is None
+
+
+def test_song_cleanup_tools(client, monkeypatch):
+    """등록된 곡 정리: 곡 정보 → 나누기 → 합치기(되돌리기), 발견 닫기."""
+    from ebms_server import render_index
+
+    admin_login(client, monkeypatch)
+    key = create_key(client)
+    api = TestClient(client.app)
+    upload(client, "mixed.zip", make_zip({
+        "a.bms": b"#TITLE A\n#ARTIST x\n#WAV01 a.wav\n", "b.bms": b"#TITLE B\n#ARTIST y\n#WAV01 b.wav\n",
+        "a.wav": b"a", "b.wav": b"b",
+    }))
+    song = call(api, key, "get_song", song_id=1)
+    assert [(c["path"], c["title"], c["artist"], c["sounds"]) for c in song["charts"]] == [("a.bms", "A", "x", 1), ("b.bms", "B", "y", 1)]
+    assert song["other_files"] == ["a.wav", "b.wav"]
+    assert rpc(api, key, "tools/call", {"name": "get_song", "arguments": {"song_id": 9}})["result"]["isError"]
+
+    assert call(api, key, "list_song_findings")["findings"] == []
+    con = render_index.connect()
+    render_index._put_finding(con, "mixed", 1, 0, None, {"groups": [["a.bms"], ["b.bms"]]})
+    con.commit()
+    con.close()
+    found = call(api, key, "list_song_findings", kind="mixed")["findings"]
+    assert [(f["kind"], f["song_a"]) for f in found] == [("mixed", 1)]
+
+    split = call(api, key, "split_song", song_id=1, charts=["b.bms"], folder="[y] B")
+    assert split["song_id"] == 2 and split["moved_files"] == ["b.wav"]
+    # 나눈 곡의 발견은 닫혀 다음 색인 때 다시 검사합니다.
+    assert call(api, key, "list_song_findings")["findings"] == []
+    assert call(api, key, "get_song", song_id=2)["folder"] == "[y] B"
+    bad = rpc(api, key, "tools/call", {"name": "split_song", "arguments": {"song_id": 1, "charts": ["a.bms"]}})["result"]
+    assert bad["isError"] and "400" in bad["content"][0]["text"]
+
+    merged = call(api, key, "merge_songs", song_id=1, source=2)
+    assert merged["merged_from"] == 2 and merged["subfolder"] is None
+    assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["a.bms", "b.bms"]
+
+    con = render_index.connect()
+    render_index._put_finding(con, "dup", 1, 3, 1.0, {})
+    con.commit()
+    fid = con.execute("SELECT id FROM finding").fetchone()[0]
+    con.close()
+    assert call(api, key, "set_finding_status", finding_id=fid, status="dismissed") == {"id": fid, "status": "dismissed"}
+    assert call(api, key, "list_song_findings")["findings"] == []
+
+
+def test_remove_and_delete_tools(client, monkeypatch, caplog):
+    """살릴 수 없는 차트는 빼고, 곡 전체는 제외 → 삭제."""
+    admin_login(client, monkeypatch)
+    key = create_key(client)
+    api = TestClient(client.app)
+    upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
+    dry = call(api, key, "split_song", song_id=1, charts=["o.bms"], dry_run=True)
+    assert dry["shared_only"] is True and call(api, key, "get_song", song_id=1)["charts"][1]["path"] == "q.bms"
+    with caplog.at_level("INFO", logger="ebms_server.audit"):
+        removed = call(api, key, "remove_charts", song_id=1, charts=["O.BMS"], reason="다른 곡 키음")
+    # 사유와 뺀 파일이 접속기록에 남습니다.
+    assert any("action=mcp.remove_charts" in r.message and "removed_files=o.bms" in r.message and "다른 곡 키음" in r.message
+               for r in caplog.records)
+    assert removed["removed_files"] == ["o.bms"]
+    assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["q.bms"]
+
+    assert call(api, key, "delete_song", song_id=1, reason="깨짐")["level"] == "unused"
+    assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"] is None
+    assert call(api, key, "delete_song", song_id=1, reason="깨짐", level="deleted")["purged"] is True
+    assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"]
+    bad = rpc(api, key, "tools/call", {"name": "delete_song", "arguments": {"song_id": 1, "reason": "", "level": "x"}})
+    assert bad["result"]["isError"]

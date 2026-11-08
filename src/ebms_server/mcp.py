@@ -3,7 +3,11 @@
 권한은 사이트와 같은 두 단계입니다. `Authorization: Bearer`로 클라이언트 세션키(사용자)나 관리자 API 키(`ebms_ak_...`)를 보내고,
 tools/list는 그 권한으로 쓸 수 있는 도구만 보여 주며 권한 밖의 도구는 부를 수 없습니다. 웹 세션(쿠키)으로는 쓰지 못합니다.
 
-관리자 도구는 병합 충돌 판단입니다. 충돌 곡을 읽고 충돌 파일마다 old(기존 유지)·new(새 파일)·unsure 추천을 남깁니다.
+관리자 도구는 두 가지입니다.
+
+1. 병합 충돌 판단: 충돌 곡을 읽고 충돌 파일마다 old(기존 유지)·new(새 파일)·unsure 추천을 남깁니다.
+2. 등록된 곡 정리: 렌더 색인이 찾은 중복(dup)·섞임(mixed)을 보고 곡을 나누거나(split_song) 합칩니다(merge_songs).
+   이건 추천이 아니라 바로 적용됩니다. 되돌리려면 반대 도구(나눈 곡은 합치고, 합친 차트는 나눔)를 씁니다.
 
 - 서버는 판단하지 않습니다. 비교 수치(키음 상관계수·싱크 오차, 영상 프레임 차이, 품질, 차트 diff, 그 파일을 쓰는 차트)만 주고
   판단 기준은 initialize의 instructions(INSTRUCTIONS)로 알려 줍니다.
@@ -25,7 +29,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import audit, auth, conflicts, db, media_match, preview, staging
+from . import admin, audit, auth, conflicts, db, importer, media_match, preview, render_check, staging
 from .staging import StageError
 
 logger = logging.getLogger(__name__)
@@ -33,7 +37,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "ebms-conflicts", "version": "1"}
+SERVER_INFO = {"name": "ebms", "version": "2"}
 AI_CHOICES = ("old", "new", "unsure")
 # get_conflict_case 한 번에 주는 충돌 수
 CASE_LIMIT = 20
@@ -80,6 +84,30 @@ next_offset이 있으면 그 offset으로 다음 페이지. 페이지를 받을 
 5. 이미지·영상: 내용이 같고 품질만 다르면 품질 좋은 쪽, 내용이 다르면(다른 그림·다른 영상) unsure.
 6. 파일을 풀지 못하거나(error) 한쪽이 깨졌으면 정상인 쪽, 둘 다 이상하면 unsure.
 7. 확신이 없으면 unsure. 틀린 old/new보다 unsure가 낫습니다. confidence는 0~1, reason은 한국어 한 문장.
+
+---
+등록된 곡 정리(중복·섞임). 위 충돌 판단과 따로입니다. split_song·merge_songs는 바로 적용되니 확실할 때만 부릅니다.
+
+순서: list_song_findings → get_song(관련 곡) → 필요하면 compare_songs → get_compare_result(끝날 때까지 몇 초 간격으로) →
+split_song / merge_songs / 아니면 set_finding_status(dismissed).
+- mixed(곡 하나에 렌더가 다른 차트 묶음이 여럿): groups는 렌더가 같은 차트끼리 묶은 것입니다. 차트의 제목·아티스트(get_song)가
+  묶음끼리 다르면 다른 곡이 섞인 것이니, 원래 곡이 아닌 묶음(보통 작은 쪽, 제목이 폴더명과 다른 쪽)마다 split_song 합니다.
+  같은 곡의 다른 버전(롱 버전·리믹스·기믹 차트)도 키음이 다르면 다른 곡으로 봅니다. 제목·아티스트가 같고 난이도 표기만 다르며
+  키음 수가 비슷하면(렌더만 조금 다른 같은 곡) 나누지 말고 dismissed로 둡니다. 애매하면 아무것도 하지 말고 남깁니다.
+- dup(두 곡이 같은 곡): get_song으로 두 곡 제목·아티스트가 같은 곡인지 보고, 맞으면 차트가 많은 쪽(같으면 번호가 작은 쪽)에
+  다른 쪽을 merge_songs 합니다. 같은 이름에 내용이 다른 파일이 있으면 서버가 합칠 곡을 하위 폴더에 넣으므로 소리는 바뀌지 않습니다.
+- 나누거나 합친 곡의 발견은 저절로 닫히고 다음 색인 때 다시 검사합니다. 처리하지 않을 발견만 set_finding_status로 닫습니다.
+- 방향: 살릴 수 있는 것만 살리고 나머지는 지웁니다. 곡 상태는 사용 → 제외(delete_song level unused, 복원 가능) →
+  삭제(level deleted, 복원 불가) 3단계입니다.
+- split_song은 먼저 dry_run=true로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
+  shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)면 다른 곡 차트가 이 곡의 같은 이름 키음(01.wav 등)으로 재생되던
+  경우라 나눠도 소리가 틀립니다. 살릴 수 없으니 remove_charts로 그 차트들을 빼고, reason에 "다른 곡 키음으로 재생(원본 필요)"과
+  제목을 적습니다. 원본을 나중에 다시 임포트하면 새 곡으로 들어옵니다.
+- 원래 곡(폴더명과 맞는 묶음) 자체가 깨졌으면(키음이 거의 없음, 차트를 읽을 수 없음) delete_song level unused로 제외합니다.
+  level deleted는 이미 제외한 곡을 지울 때만 씁니다.
+- 키음 팩 폴더에 여러 사람이 각자 BMS를 넣은 곡(모든 묶음이 같은 키음을 나눠 씀, 서로 제목이 다름)은 원래 곡 하나로 정할 수 없으니
+  건드리지 말고 발견을 열어 둔 채 "키음 팩"으로 보고합니다(임포트 때 정리할 예정).
+- 한 번에 많이 고치지 말고 발견 하나씩 처리하고, 처리한 결과(나눈 곡 번호 등)를 요약해 남깁니다.
 """
 
 # admin: True면 관리자만 보고 부를 수 있습니다.
@@ -187,6 +215,145 @@ TOOLS = [
                 },
             },
             "required": ["stage_id", "unit_id", "items"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "list_song_findings",
+        "description": (
+            "렌더 색인이 찾은 등록 곡 문제. kind dup: song_a·song_b가 같은 곡(score, chart/other_chart). "
+            "kind mixed: song_a 안에 렌더가 다른 차트 묶음(groups, 차트 경로 목록)이 여럿."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["", "dup", "mixed"], "description": "없으면 둘 다"},
+                "status": {"type": "string", "enum": ["open", "dismissed"], "description": "기본 open"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "기본 50"},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        "admin": True,
+    },
+    {
+        "name": "get_song",
+        "description": "등록된 곡 정보: 폴더명, 차트마다 sha256·경로·제목·아티스트·BPM·장르·키음 수, 파일 수와 크기.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"song_id": {"type": "integer"}},
+            "required": ["song_id"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "compare_songs",
+        "description": (
+            "곡들의 차트를 서버에서 렌더해 같은 곡끼리 묶는 작업을 시작합니다(곡 50개·차트 5000개까지). "
+            "job_id를 get_compare_result로 봅니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "songs": {"type": "array", "items": {"type": "integer"}},
+                "charts": {
+                    "type": "object",
+                    "description": "곡 번호(문자열) → 볼 차트 경로들. 없는 곡은 모든 차트",
+                    "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "required": ["songs"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "get_compare_result",
+        "description": "compare_songs 작업의 진행(done/total)과 결과(groups: 같은 곡 묶음, unrendered).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}},
+            "required": ["job_id"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "split_song",
+        "description": (
+            "곡에서 차트 몇 개를 새 곡으로 나눕니다(바로 적용). 그 차트가 쓰는 키음·BGA·이미지를 같이 넣고, 남는 차트도 쓰는 파일은 "
+            "양쪽에 둡니다. 모든 차트는 나눌 수 없습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "folder": {"type": "string", "description": "새 곡 폴더명(보통 '[아티스트] 제목'). 없으면 원래 곡 폴더명"},
+                "dry_run": {"type": "boolean", "description": "true면 바꾸지 않고 옮길·복사할 파일과 shared_only만 봅니다"},
+            },
+            "required": ["song_id", "charts"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "merge_songs",
+        "description": (
+            "source 곡을 song_id 곡에 합치고 source를 사용 중지합니다(바로 적용). 같은 경로에 내용이 다른 파일이 있으면 "
+            "source 곡 전체를 하위 폴더에 넣습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer", "description": "남길 곡"},
+                "source": {"type": "integer", "description": "합치고 사용 중지할 곡"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "source"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "remove_charts",
+        "description": (
+            "곡에서 차트 몇 개를 뺍니다(바로 적용). 소리가 틀려 살릴 수 없는 차트(split_song dry_run의 shared_only)를 지울 때 씁니다. "
+            "곡 zip에서 차트 파일을 빼고, 같은 차트를 나중에 원본으로 다시 임포트하면 새 곡으로 들어옵니다. 모든 차트는 뺄 수 없습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "charts", "reason"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "delete_song",
+        "description": (
+            "곡 전체를 내립니다(바로 적용). level unused(제외): 파일을 보관하고 같은 차트 재임포트를 막으며 복원할 수 있음. "
+            "level deleted(삭제): 보관 파일까지 지워 복원할 수 없고 재임포트는 막지 않음."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "level": {"type": "string", "enum": ["unused", "deleted"], "description": "기본 unused"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "reason"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "set_finding_status",
+        "description": "발견을 닫거나(dismissed: 문제 아님, 다시 띄우지 않음) 다시 엽니다(open).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "finding_id": {"type": "integer"},
+                "status": {"type": "string", "enum": ["open", "dismissed"]},
+            },
+            "required": ["finding_id", "status"],
         },
         "admin": True,
     },
@@ -602,6 +769,124 @@ def whoami(user) -> dict:
     return {"id": user.id, "nickname": user.display_name, "role": "admin" if user.is_admin else "user"}
 
 
+# ---- 등록된 곡 정리 ----
+
+SONG_OTHER_FILES = 100
+
+
+def _http(fn, *args):
+    """관리자 API 함수의 HTTPException을 도구 오류로 바꿉니다."""
+    try:
+        return fn(*args)
+    except HTTPException as e:
+        raise ToolError(f"{e.status_code}: {e.detail}") from None
+
+
+def list_song_findings(kind: str = "", status: str = "open", limit: int = 50, offset: int = 0) -> dict:
+    from . import render_index
+
+    if kind not in ("", "dup", "mixed") or status not in ("open", "dismissed"):
+        raise ToolError("kind는 dup·mixed, status는 open·dismissed입니다.")
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    items = render_index.findings(status, kind, limit + 1, offset)
+    more = len(items) > limit
+    return {
+        "findings": items[:limit],
+        "total_open": render_index.count_findings("open"),
+        "next_offset": offset + limit if more else None,
+    }
+
+
+def get_song(song_id: int) -> dict:
+    detail = _http(admin.get_song_detail, int(song_id))
+    with db.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT files FROM song WHERE id = %s", (detail["id"],))
+        row = cur.fetchone()
+        entries = {e["path"]: e for e in json.loads(row[0] or "[]")} if row else {}
+        database = db.Database()
+        charts = []
+        for chart in detail["charts"]:
+            item = {"sha256": chart["sha256"], "path": chart["path"]}
+            entry = entries.get(chart["path"])
+            try:
+                content = database._read_song_member(cur, detail["id"], entry) if entry else None
+            except ValueError:
+                content = None
+            if content is not None and hashlib.sha256(content).hexdigest() == chart["sha256"]:
+                try:
+                    item.update(db.chart_meta(content))
+                except db.ChartEncodingError as e:
+                    item["meta_error"] = str(e)
+                item["sounds"] = len(db.chart_sounds(content, posixpath.dirname(chart["path"])))
+            else:
+                item["meta_error"] = "곡 zip에 차트 파일이 없습니다(차트 청크에만 있음)."
+            charts.append(item)
+    others = [f["path"] for f in detail["files"] if "chart" not in f]
+    return {
+        "id": detail["id"], "folder": detail["folder"], "size": detail["size"], "charts": charts,
+        "file_count": len(detail["files"]), "other_files": others[:SONG_OTHER_FILES],
+        "other_files_more": max(0, len(others) - SONG_OTHER_FILES),
+    }
+
+
+def compare_songs(songs: list[int], charts: dict | None = None) -> dict:
+    try:
+        job = render_check.start([int(s) for s in songs], {int(k): list(v) for k, v in (charts or {}).items()})
+    except LookupError as e:
+        raise ToolError(str(e)) from None
+    return {"job_id": job.id, "total": job.total}
+
+
+def get_compare_result(job_id: str) -> dict:
+    job = importer.get_job(job_id)
+    if job is None or job.kind != "render":
+        raise ToolError("job not found")
+    j = job.json()
+    return {k: j[k] for k in ("id", "status", "total", "done", "error", "result")}
+
+
+def split_song(user, song_id: int, charts: list[str], folder: str = "", dry_run: bool = False) -> dict:
+    return _http(admin.split_song, int(song_id), list(charts), folder, user.id, bool(dry_run))
+
+
+def merge_songs(user, song_id: int, source: int, reason: str = "") -> dict:
+    return _http(admin.merge_songs, int(song_id), int(source), reason, user.id)
+
+
+def remove_charts(user, song_id: int, charts: list[str], reason: str = "") -> dict:
+    detail = _http(admin.get_song_detail, int(song_id))
+    by_path = {c["path"].lower(): c["sha256"] for c in detail["charts"]}
+    shas = {c["sha256"] for c in detail["charts"]}
+    picked = [c if c in shas else by_path.get(str(c).lower(), str(c)) for c in charts]
+    body = admin.ChartDetach(charts=picked, reason=reason)
+    from . import render_index
+
+    result = _http(admin.detach_charts, int(song_id), body, user)
+    render_index.forget_songs([int(song_id)])
+    return result
+
+
+def delete_song(user, song_id: int, reason: str = "", level: str = "unused") -> dict:
+    if level not in ("unused", "deleted"):
+        raise ToolError("level은 unused(제외)·deleted(삭제)입니다.")
+    if level == "deleted":
+        return _http(admin.purge_song, int(song_id), reason, user.id)
+    from . import render_index
+
+    result = _http(admin.delete_song, int(song_id), user, admin.SongDelete(reason=reason))
+    render_index.forget_songs([int(song_id)])
+    return {**result, "song_id": int(song_id), "level": "unused"}
+
+
+def set_finding_status(finding_id: int, status: str) -> dict:
+    from . import render_index
+
+    if not render_index.set_status(int(finding_id), status):
+        raise ToolError("finding not found")
+    return {"id": int(finding_id), "status": status}
+
+
 # 관리자 도구(whoami는 사용자를 받으므로 _call에서 따로 부릅니다)
 HANDLERS = {
     "list_conflict_units": list_conflict_units,
@@ -609,6 +894,18 @@ HANDLERS = {
     "get_file_diff": get_file_diff,
     "get_sound_clip": get_sound_clip,
     "submit_recommendation": submit_recommendation,
+    "list_song_findings": list_song_findings,
+    "get_song": get_song,
+    "compare_songs": compare_songs,
+    "get_compare_result": get_compare_result,
+    "set_finding_status": set_finding_status,
+}
+# 부른 사용자를 첫 인자로 받는 도구(바로 적용하는 도구, 기록에 남김)
+USER_HANDLERS = {
+    "split_song": split_song,
+    "merge_songs": merge_songs,
+    "remove_charts": remove_charts,
+    "delete_song": delete_song,
 }
 
 
@@ -640,7 +937,12 @@ def _call(request: Request, user, params: dict) -> dict:
     if tool["admin"] and not user.is_admin:
         raise PermissionError(name)
     try:
-        value = whoami(user) if name == "whoami" else HANDLERS[name](**args)
+        if name == "whoami":
+            value = whoami(user)
+        elif name in USER_HANDLERS:
+            value = USER_HANDLERS[name](user, **args)
+        else:
+            value = HANDLERS[name](**args)
     except TypeError as e:
         return {"content": [{"type": "text", "text": f"인자가 맞지 않습니다: {e}"}], "isError": True}
     except (ToolError, StageError, ValueError) as e:
@@ -648,6 +950,15 @@ def _call(request: Request, user, params: dict) -> dict:
         return {"content": [{"type": "text", "text": str(message)}], "isError": True}
     if isinstance(value, Content):
         return {"content": list(value)}
+    if name in USER_HANDLERS and not args.get("dry_run"):
+        # 무엇을 왜 바꿨는지 나중에 되짚을 수 있게 결과 요약과 사유를 남깁니다.
+        detail = {k: value[k] for k in ("song_id", "from", "merged_from", "level", "purged", "subfolder") if value.get(k) is not None}
+        for k in ("charts", "detached", "removed_files", "moved_files"):
+            if value.get(k):
+                detail[k] = ",".join(map(str, value[k]))
+        if args.get("reason"):
+            detail["reason"] = args["reason"]
+        audit.record(request, user.id, f"mcp.{name}", str(args.get("song_id")), **detail)
     if name == "submit_recommendation":
         # 접속기록은 ebms.log에도 같은 줄이 남습니다.
         audit.record(request, user.id, "mcp.recommend", f"{args.get('stage_id')}/{args.get('unit_id')}", saved=value["saved"])

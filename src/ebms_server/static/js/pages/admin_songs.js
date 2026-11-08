@@ -119,18 +119,50 @@ async function loadDeleted(page = 1) {
             tr.append(td);
         }
         const td = document.createElement("td");
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn btn-sm btn-outline-primary text-nowrap";
-        btn.textContent = "복원";
-        btn.addEventListener("click", () => restoreSong(row, btn));
-        td.append(btn);
+        td.className = "text-nowrap";
+        if (row.purged_at) {
+            // 삭제한 곡: 옮겨 둔 파일이 없어 복원할 수 없습니다.
+            const badge = document.createElement("span");
+            badge.className = "badge text-bg-secondary";
+            badge.textContent = "삭제됨";
+            badge.title = new Date(row.purged_at * 1000).toLocaleString();
+            td.append(badge);
+        } else {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn btn-sm btn-outline-primary text-nowrap me-1";
+            btn.textContent = "복원";
+            btn.addEventListener("click", () => restoreSong(row, btn));
+            const purge = document.createElement("button");
+            purge.type = "button";
+            purge.className = "btn btn-sm btn-outline-danger text-nowrap";
+            purge.textContent = "삭제";
+            purge.addEventListener("click", () => purgeSong(row, purge));
+            td.append(btn, purge);
+        }
         tr.append(td);
         deletedRows.append(tr);
     }
     document.getElementById("deleted-empty").classList.toggle("d-none", data.items.length > 0);
     renderPager(document.getElementById("deleted-pager"), data, loadDeleted);
     deletedLoaded = true;
+}
+
+async function purgeSong(row, btn) {
+    const typed = prompt(
+        `#${row.song_id} ${row.folder} 곡을 삭제합니다. 서버에 옮겨 둔 파일까지 지워 다시 복원할 수 없습니다.\n` +
+        `제외와 달리 같은 차트를 다시 임포트하면 막지 않습니다.\n\n삭제하려면 곡 번호 ${row.song_id}를 입력하세요.`
+    );
+    if (typed === null) return;
+    if (typed.trim() !== String(row.song_id)) { alert("곡 번호가 맞지 않아 삭제하지 않았습니다."); return; }
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/admin/songs/${row.song_id}/purge`, { method: "POST" });
+        if (!res.ok) { alert(await detail(res)); return; }
+        loadDeleted(deletedPage);
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 async function restoreSong(row, btn) {

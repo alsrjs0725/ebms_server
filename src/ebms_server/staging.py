@@ -547,7 +547,8 @@ def _analyze_units(stage: dict, prints) -> None:
                 chart["deleted"] = None
                 if row is not None and row[0] is None:
                     cur.execute(
-                        "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s ORDER BY song_id DESC LIMIT 1",
+                        "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s AND purged_at IS NULL"
+                        " ORDER BY song_id DESC LIMIT 1",
                         (f'%"{chart["sha256"]}"%',),
                     )
                     d = cur.fetchone()

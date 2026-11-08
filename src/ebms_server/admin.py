@@ -162,7 +162,7 @@ def search_songs(q: str = "", page: int = 1) -> dict:
     return _page_json(items, total, page)
 
 
-DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at")
+DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at", "purged_at")
 
 
 def search_deleted_songs(q: str = "", page: int = 1) -> dict:
@@ -469,6 +469,8 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
     """사용 중지한 곡을 같은 번호로 되돌립니다. 클라이언트는 다음 동기화 때 다시 받습니다."""
     try:
         db.Database().restore_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+    except db.SongPurgedError:
+        raise HTTPException(status_code=410, detail="삭제한 곡이라 복원할 수 없습니다.")
     except LookupError:
         raise HTTPException(status_code=404, detail="사용 중지한 곡이 아닙니다.")
     except TimeoutError:
@@ -483,6 +485,30 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
         raise HTTPException(status_code=500, detail=f"옮겨 둔 파일로 복원하지 못했습니다: {e}")
     logger.info(f"song {song_id} restored by {admin.id}")
     return get_song_detail(song_id)
+
+
+def purge_song(song_id: int, reason: str, admin_id: str) -> dict:
+    """곡 삭제(db.purge_song). 사용 중인 곡이면 사용 중지한 뒤 삭제합니다. 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    reason = reason.strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    try:
+        done = db.Database().purge_song(song_id, reason, admin_id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    if not done:
+        raise HTTPException(status_code=404, detail="song not found")
+    render_index.forget_songs([song_id])
+    logger.info(f"song {song_id} purged by {admin_id}: {reason}")
+    return {"ok": True, "song_id": song_id, "purged": True}
+
+
+@router.post("/api/admin/songs/{song_id}/purge")
+def api_purge_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: SongDelete | None = None):
+    """곡을 삭제합니다(사용 → 제외 → 삭제). 옮겨 둔 파일까지 지워 복원할 수 없고, 같은 차트의 재임포트는 막지 않습니다."""
+    return purge_song(song_id, body.reason if body else "", admin.id)
 
 
 class ChartDetach(BaseModel):
@@ -513,9 +539,74 @@ def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depend
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
         raise HTTPException(status_code=404, detail="song not found")
-    logger.info(f"song {song_id} charts detached by {admin.id}: {result}")
+    logger.info(f"song {song_id} charts detached by {admin.id}: {result} reason={reason!r}")
     return result
 
+
+class SongSplit(BaseModel):
+    # 새 곡으로 옮길 차트(sha256이나 곡 zip 안 차트 경로)
+    charts: list[str]
+    # 새 곡 폴더명. 없으면 원래 곡 폴더명
+    folder: str = ""
+    # 바꾸지 않고 결과(옮길·복사할 파일, shared_only)만 봅니다.
+    dry_run: bool = False
+
+
+class SongMerge(BaseModel):
+    # 이 곡에 합칠(합친 뒤 사용 중지할) 곡 번호
+    source: int
+    reason: str = ""
+
+
+def split_song(song_id: int, charts: list[str], folder: str, admin_id: str, dry_run: bool = False) -> dict:
+    """곡 나누기(db.split_song). 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    try:
+        result = db.Database().split_song(song_id, charts, folder, timeout=DELETE_LOCK_TIMEOUT, dry_run=dry_run)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    if dry_run:
+        return result
+    render_index.forget_songs([song_id, result["song_id"]])
+    logger.info(f"song {song_id} split by {admin_id}: {result}")
+    return result
+
+
+def merge_songs(song_id: int, source: int, reason: str, admin_id: str) -> dict:
+    """곡 합치기(db.merge_songs). 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    reason = reason.strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    try:
+        result = db.Database().merge_songs(song_id, source, reason, admin_id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    render_index.forget_songs([song_id, source])
+    logger.info(f"song {source} merged into {song_id} by {admin_id}: {result}")
+    return result
+
+
+@router.post("/api/admin/songs/{song_id}/split")
+def api_split_song(song_id: int, body: SongSplit, admin: Annotated[User, Depends(web_admin)]):
+    """곡에서 차트 몇 개를 새 곡으로 나눕니다(다른 곡 차트가 섞인 곡). 차트가 쓰는 키음·BGA도 같이 옮기거나 복사합니다."""
+    return split_song(song_id, body.charts, body.folder, admin.id, body.dry_run)
+
+
+@router.post("/api/admin/songs/{song_id}/merge")
+def api_merge_songs(song_id: int, body: SongMerge, admin: Annotated[User, Depends(web_admin)]):
+    """다른 곡(source)을 이 곡에 합치고 source를 사용 중지합니다(같은 곡이 두 번호로 나뉜 경우)."""
+    return merge_songs(song_id, body.source, body.reason, admin.id)
 
 class RenderCompare(BaseModel):
     songs: list[int]

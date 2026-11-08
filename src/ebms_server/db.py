@@ -265,6 +265,7 @@ SCHEMA = [
             reason TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             deleted_by CHAR(36),
             deleted_at BIGINT UNSIGNED NOT NULL,
+            purged_at BIGINT UNSIGNED,
 
             PRIMARY KEY (song_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -374,6 +375,8 @@ MISSING_COLUMNS = [
     ("song", "pre_chunk", "INT UNSIGNED"),
     ("pre_chunk", "sig", "VARCHAR(1024)"),
     ("pre_chunk", "songs", "VARCHAR(1024)"),
+    # 삭제(purge_song)한 시각. 있으면 옮겨 둔 파일이 없어 복원할 수 없고, 같은 차트를 다시 임포트할 수 있습니다.
+    ("deleted_song", "purged_at", "BIGINT UNSIGNED"),
 ]
 MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk")]
 # 곡·청크를 저장소 파일로 옮기기 전(#152) 데이터를 두던 테이블·컬럼. 다 옮긴 DB에서 서버 시작 때 지웁니다.
@@ -672,6 +675,36 @@ def kinds_from_charts(paths: list[str], charts: dict[str, bytes]) -> dict[str, s
     return kinds
 
 
+def chart_used_files(charts: dict[str, bytes], names: list[str]) -> set[str]:
+    """차트들이 쓰는 곡 zip 항목(키음·BGA, 사전 헤더가 가리키는 이미지·프리뷰, 차트 폴더의 preview* 오디오).
+    charts는 {곡 zip 안 경로: 내용}, names는 곡 zip의 파일 경로입니다. 플레이어는 확장자만 다른 파일도 대신 읽으므로
+    키음·BGA는 확장자를 보지 않습니다. 차트 파일은 넣지 않습니다."""
+    play_stems: set[str] = set()
+    pre: dict[str, set[str]] = defaultdict(set)
+    chart_dirs: set[str] = set()
+    for path, content in charts.items():
+        base = posixpath.dirname(path)
+        chart_dirs.add(base.lower())
+        targets, stems = _chart_refs(content, base)
+        play_stems |= stems
+        for target, formats in targets:
+            pre[posixpath.splitext(target)[0]].update(formats)
+    used = set()
+    for name in names:
+        lower = name.lower()
+        stem, ext = posixpath.splitext(lower)
+        if ext in constant.BMS_FORMAT:
+            continue
+        preview_file = (
+            posixpath.basename(lower).startswith("preview")
+            and ext in constant.AUDIO_FORMAT
+            and posixpath.dirname(lower) in chart_dirs
+        )
+        if stem in play_stems or ext in pre.get(stem, ()) or preview_file:
+            used.add(name)
+    return used
+
+
 def file_kinds(zf: zipfile.ZipFile) -> dict[str, str]:
     """곡 zip 항목별 다운로드 구분(kinds_from_charts 참고)."""
     paths = [info.filename for info in zf.infolist() if not info.is_dir()]
@@ -844,6 +877,10 @@ def _song_zipinfo(name: str) -> zipfile.ZipInfo:
 
 class AmbiguousSongError(ValueError):
     """새 폴더의 차트가 기존 곡 여러 개와 겹쳐 어느 곡에 넣을지 정할 수 없습니다. 등록하지 않고 폴더는 남깁니다."""
+
+
+class SongPurgedError(LookupError):
+    """삭제(purge_song)해 옮겨 둔 파일이 없는 곡."""
 
 
 class ChartInUseError(ValueError):
@@ -1661,7 +1698,8 @@ class Database:
             if cur.fetchone() is None:
                 continue
             cur.execute(
-                "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s ORDER BY song_id DESC LIMIT 1",
+                "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s AND purged_at IS NULL"
+                " ORDER BY song_id DESC LIMIT 1",
                 (f'%"{sha256}"%',),
             )
             row = cur.fetchone()
@@ -2004,6 +2042,22 @@ class Database:
             self.logger.warning(f"delete_song: Song[{song_id}] charts not found anywhere: {sorted(wanted)}")
         return found
 
+    def _write_unused(self, song_id: int, data: bytes, chart_data: dict[str, bytes]) -> pathlib.Path:
+        """사용 중지할 곡의 zip과 차트를 UNUSED_DIR/{song_id}/에 씁니다. DB에서 지우기 전에 파일을 끝까지 써 두고,
+        다 쓴 뒤 폴더 이름을 바꿔 반쯤 쓴 폴더가 남지 않게 합니다."""
+        target = self.unused_dir(song_id)
+        tmp = constant.UNUSED_DIR / f".{song_id}.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        (tmp / "charts").mkdir(parents=True)
+        for name, content in [("song.zip", data), *((f"charts/{n}", c) for n, c in chart_data.items())]:
+            with open(tmp / name, "wb") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(tmp, target)
+        return target
+
     def delete_song(
         self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
     ) -> bool:
@@ -2035,17 +2089,7 @@ class Database:
                     charts = [list(r) for r in cur.fetchall()]
                     chart_data = self._song_charts(cur, song_id, data, charts)
 
-                    # DB에서 지우기 전에 파일을 끝까지 써 둡니다. 다 쓴 뒤 폴더 이름을 바꿔 반쯤 쓴 폴더가 남지 않게 합니다.
-                    tmp = constant.UNUSED_DIR / f".{song_id}.tmp"
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    (tmp / "charts").mkdir(parents=True)
-                    for name, content in [("song.zip", data), *((f"charts/{n}", c) for n, c in chart_data.items())]:
-                        with open(tmp / name, "wb") as f:
-                            f.write(content)
-                            f.flush()
-                            os.fsync(f.fileno())
-                    shutil.rmtree(target, ignore_errors=True)
-                    os.replace(tmp, target)
+                    self._write_unused(song_id, data, chart_data)
                     written = True
 
                     cur.execute(
@@ -2085,13 +2129,15 @@ class Database:
             with connect() as con, con.cursor() as cur:
                 try:
                     cur.execute(
-                        "SELECT folder, size, sha256, chart_list FROM deleted_song WHERE song_id = %s FOR UPDATE",
+                        "SELECT folder, size, sha256, chart_list, purged_at FROM deleted_song WHERE song_id = %s FOR UPDATE",
                         (song_id,),
                     )
                     row = cur.fetchone()
                     if row is None:
                         raise LookupError(f"song {song_id} is not unused")
-                    folder, size, sha256, chart_list = row
+                    folder, size, sha256, chart_list, purged_at = row
+                    if purged_at is not None:
+                        raise SongPurgedError(f"song {song_id} was deleted")
                     data = (source / "song.zip").read_bytes()
                     if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
                         raise ValueError(f"{source}/song.zip does not match song {song_id}")
@@ -2209,6 +2255,284 @@ class Database:
             self._write_lock.release()
         preview.kick()
         return {"detached": sorted(wanted), "removed_files": sorted(removed)}
+
+    @staticmethod
+    def _resolve_charts(charts: dict[str, tuple[int, str]], wanted: list[str], song_id: int) -> set[str]:
+        """차트 sha256이나 곡 zip 안 차트 경로(대소문자 무시)를 sha256으로 바꿉니다. charts는 {sha256: (크기, 경로)}."""
+        by_path = {filename.lower(): chart_id for chart_id, (_, filename) in charts.items() if filename}
+        found, unknown = set(), []
+        for item in wanted:
+            chart_id = item if item in charts else by_path.get(item.lower())
+            if chart_id is None:
+                unknown.append(item)
+            else:
+                found.add(chart_id)
+        if unknown:
+            raise ValueError(f"not charts of song {song_id}: {', '.join(sorted(unknown))}")
+        return found
+
+    @staticmethod
+    def _rewrite_zip(data: bytes, drop: set[str], add: list[tuple[str, bytes]] = ()) -> bytes:
+        """곡 zip에서 drop 항목을 빼고 add를 뒤에 붙인 새 zip(남는 항목은 압축 방식 그대로)."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as out:
+            for info in src.infolist():
+                if info.filename not in drop:
+                    out.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=6)
+            for arcname, content in add:
+                out.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+        return buf.getvalue()
+
+    def _update_song_zip(self, cur, song_id: int, data: bytes) -> None:
+        cur.execute(
+            "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = %s",
+            (len(data), hashlib.sha256(data).hexdigest(), json.dumps(zip_entries(data)), song_id),
+        )
+        self._put_song_data(cur, song_id, data)
+
+    def split_song(
+        self, song_id: int, chart_ids: list[str], folder: str = "", timeout: float | None = None, dry_run: bool = False
+    ) -> dict | None:
+        """곡에서 차트 몇 개를 새 곡으로 나눕니다(다른 곡 차트가 섞인 곡 정리). 원본 폴더 없이 서버에서 합니다. 없는 곡이면 None.
+
+        chart_ids는 차트 sha256이나 곡 zip 안 차트 경로입니다. 새 곡 zip에는 옮기는 차트 파일과 그 차트가 쓰는 파일
+        (chart_used_files: 키음·BGA·사전 이미지·프리뷰)을 같은 경로로 넣습니다. 남는 차트도 쓰는 파일은 양쪽에 두고(copied),
+        옮기는 차트만 쓰던 파일은 원래 곡에서 뺍니다(moved). 어느 차트도 쓰지 않는 파일(설명서 등)은 원래 곡에 둡니다.
+        folder가 없으면 원래 곡 폴더명을 씁니다. 모든 차트를 옮기려 하면 ValueError.
+        되돌리려면 새 곡을 원래 곡으로 merge_songs 합니다. dry_run이면 바꾸지 않고 결과만 계산합니다(song_id는 None).
+        {"song_id": 새 곡, "from": 원래 곡, "charts": [sha256], "moved_files", "copied_files"}를 반환합니다.
+        옮기는 차트만 쓰는 파일이 하나도 없으면(키음을 모두 남는 차트와 같이 씀) "shared_only": True입니다. 다른 곡 차트가
+        이 곡의 같은 이름 키음으로 재생되던 경우라 나눠도 소리는 그대로 틀리고, 원본 키음이 있어야 고쳐집니다."""
+        if not chart_ids:
+            raise ValueError("charts required")
+        folder = folder.strip()
+        if len(folder) > 255:
+            raise ValueError("folder must be at most 255 characters")
+        self._lock(timeout)
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT folder, pre_chunk FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    old_folder, pre_chunk = row
+                    cur.execute("SELECT id, size, filename FROM chart WHERE song_id = %s ORDER BY id", (song_id,))
+                    rows = [list(r) for r in cur.fetchall()]
+                    charts = {r[0]: (r[1], r[2]) for r in rows}
+                    wanted = self._resolve_charts(charts, chart_ids, song_id)
+                    if wanted == set(charts):
+                        raise ValueError("곡의 모든 차트는 나눌 수 없습니다.")
+                    data = self._song_data(cur, song_id)
+                    if data is None:
+                        raise ValueError(f"song {song_id}: zip data not found")
+                    chart_data = self._song_charts(cur, song_id, data, rows)
+                    content = {
+                        r[0]: chart_data.get(chart_arcname(r[0], pathlib.PurePosixPath(r[2] or f"{r[0]}.bms")))
+                        for r in rows
+                    }
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        infos = {info.filename: info for info in zf.infolist() if not info.is_dir()}
+                        names = list(infos)
+                        # 곡 zip 안에 같은 내용으로 든 차트 파일
+                        in_zip = {
+                            chart_id for chart_id, (size, filename) in charts.items()
+                            if filename in infos and infos[filename].file_size == size
+                            and content.get(chart_id) is not None and zf.read(infos[filename]) == content[chart_id]
+                        }
+                        keep = set(charts) - wanted
+                        used_moving = chart_used_files(
+                            {charts[c][1]: content[c] for c in wanted if content.get(c) is not None and charts[c][1]}, names
+                        )
+                        used_keep = chart_used_files(
+                            {charts[c][1]: content[c] for c in keep if content.get(c) is not None and charts[c][1]}, names
+                        )
+                        moved_charts = {charts[c][1] for c in wanted if c in in_zip}
+                        new_files = sorted(moved_charts | used_moving)
+                        buf = io.BytesIO()
+                        with zipfile.ZipFile(buf, "w") as out:
+                            for name in new_files:
+                                info = infos[name]
+                                out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=6)
+                        new_data = buf.getvalue()
+                    moved_files = used_moving - used_keep
+                    shared_only = bool(used_moving) and not moved_files
+                    if dry_run:
+                        return {
+                            "song_id": None, "from": song_id, "charts": sorted(wanted), "moved_files": sorted(moved_files),
+                            "copied_files": sorted(used_moving & used_keep), "shared_only": shared_only, "dry_run": True,
+                        }
+                    old_data = self._rewrite_zip(data, moved_charts | moved_files)
+
+                    cur.execute(
+                        "INSERT INTO song (id, size, sha256, folder, files) VALUES (%s, %s, %s, %s, %s)",
+                        (self._next_song_id(cur), len(new_data), hashlib.sha256(new_data).hexdigest(),
+                         folder or old_folder, json.dumps(zip_entries(new_data))),
+                    )
+                    new_id = cur.lastrowid
+                    self._put_song_data(cur, new_id, new_data)
+                    self._update_song_zip(cur, song_id, old_data)
+                    for chart_id in sorted(wanted):
+                        cur.execute("UPDATE chart SET song_id = %s WHERE id = %s AND song_id = %s", (new_id, chart_id, song_id))
+                    for chunk_no in sorted({song_id // constant.SONGS_PER_MANIFEST_CHUNK, new_id // constant.SONGS_PER_MANIFEST_CHUNK}):
+                        self._rebuild_manifest_chunk(cur, chunk_no)
+                    chunks = {self._place_song(cur, new_id)}
+                    if pre_chunk is not None:
+                        chunks.add(pre_chunk)
+                    for chunk_no in sorted(chunks):
+                        self._rebuild_pre_chunk(cur, chunk_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        preview.kick()
+        result = {
+            "song_id": new_id, "from": song_id, "charts": sorted(wanted),
+            "moved_files": sorted(moved_files), "copied_files": sorted(used_moving & used_keep),
+            "shared_only": shared_only,
+        }
+        self.logger.info(f"split_song: Song[{song_id}] -> new song[{new_id}] {result}")
+        return result
+
+    def merge_songs(
+        self, song_id: int, source_id: int, reason: str = "", deleted_by: str | None = None,
+        timeout: float | None = None,
+    ) -> dict | None:
+        """source_id 곡을 song_id 곡에 합칩니다(같은 곡이 두 번호로 나뉜 것 정리). 원본 폴더 없이 서버에서 합니다.
+        어느 곡이 없으면 None.
+
+        source 곡 zip의 파일 중 song_id 곡에 없는 것은 더하고, 같은 경로(대소문자 무시)에 같은 내용이면 하나만 둡니다.
+        같은 경로에 내용이 다른 파일이 하나라도 있으면 source 곡 전체를 하위 폴더(subfolder)에 넣어 차트가 원래 쓰던 파일
+        그대로 재생되게 합니다(차트 경로도 그 폴더로 바뀜). source 곡의 차트는 song_id 곡으로 옮기고, 빈 source 곡은
+        사용 중지(deleted_song, 사유 reason)합니다. 사용 중지 기록의 차트가 이제 song_id 곡에 있으므로 그대로 복원은 안 되고
+        (409), 되돌리려면 그 차트들을 split_song 합니다.
+        {"song_id", "merged_from", "charts", "added_files", "subfolder"}를 반환합니다."""
+        if song_id == source_id:
+            raise ValueError("cannot merge a song into itself")
+        self._lock(timeout)
+        written = False
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT id, folder, size, sha256, pre_chunk FROM song WHERE id IN (%s, %s) FOR UPDATE",
+                        (song_id, source_id),
+                    )
+                    rows = {r[0]: r[1:] for r in cur.fetchall()}
+                    if song_id not in rows or source_id not in rows:
+                        return None
+                    src_folder, src_size, src_sha256, src_pre = rows[source_id]
+                    dst_pre = rows[song_id][3]
+                    data = self._song_data(cur, song_id)
+                    src_data = self._song_data(cur, source_id)
+                    if data is None or src_data is None:
+                        raise ValueError("song zip data not found")
+                    if hashlib.sha256(src_data).hexdigest() != src_sha256:
+                        raise ValueError(f"song {source_id}: zip data does not match its sha256")
+                    cur.execute("SELECT id, size, filename FROM chart WHERE song_id = %s ORDER BY id", (source_id,))
+                    src_charts = [list(r) for r in cur.fetchall()]
+                    src_chart_data = self._song_charts(cur, source_id, src_data, src_charts)
+
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf, zipfile.ZipFile(io.BytesIO(src_data)) as sz:
+                        existing = {i.filename.rstrip("/").lower(): i for i in zf.infolist()}
+                        src_files = [i for i in sz.infolist() if not i.is_dir()]
+                        add, conflict = [], False
+                        for info in src_files:
+                            old = existing.get(info.filename.lower())
+                            if old is None:
+                                add.append(info)
+                            elif old.is_dir() or old.file_size != info.file_size or zf.read(old) != sz.read(info):
+                                conflict = True
+                        subfolder = None
+                        if conflict:
+                            base = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", src_folder).strip(" .") or f"song{source_id}"
+                            subfolder = base
+                            n = 2
+                            while any(k == subfolder.lower() or k.startswith(subfolder.lower() + "/") for k in existing):
+                                subfolder = f"{base} ({n})"
+                                n += 1
+                            add = src_files
+                        prefix = f"{subfolder}/" if subfolder else ""
+                        new_files = [(prefix + info.filename, sz.read(info)) for info in add]
+                    if new_files:
+                        buf = io.BytesIO(data)
+                        with zipfile.ZipFile(buf, mode="a") as zf:
+                            for arcname, content in new_files:
+                                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                        self._update_song_zip(cur, song_id, buf.getvalue())
+
+                    self._write_unused(source_id, src_data, src_chart_data)
+                    written = True
+                    cur.execute(
+                        """
+                        INSERT INTO deleted_song
+                            (song_id, folder, size, sha256, charts, chart_list, reason, deleted_by, deleted_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (source_id, src_folder, src_size, src_sha256, len(src_charts),
+                         json.dumps(src_charts, ensure_ascii=False), reason or f"#{song_id}에 합침", deleted_by,
+                         int(time.time())),
+                    )
+                    for chart_id, _, filename in src_charts:
+                        cur.execute(
+                            "UPDATE chart SET song_id = %s, filename = %s WHERE id = %s AND song_id = %s",
+                            (song_id, prefix + filename if filename else filename, chart_id, source_id),
+                        )
+                    cur.execute("DELETE FROM download_grant WHERE song_id = %s", (source_id,))
+                    cur.execute("DELETE FROM song WHERE id = %s", (source_id,))
+                    for chunk_no in sorted({song_id // constant.SONGS_PER_MANIFEST_CHUNK, source_id // constant.SONGS_PER_MANIFEST_CHUNK}):
+                        self._rebuild_manifest_chunk(cur, chunk_no)
+                    for chunk_no in sorted({c for c in (dst_pre, src_pre) if c is not None}):
+                        self._rebuild_pre_chunk(cur, chunk_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    if written:
+                        shutil.rmtree(self.unused_dir(source_id), ignore_errors=True)
+                    raise
+        finally:
+            self._write_lock.release()
+        preview.kick()
+        result = {
+            "song_id": song_id, "merged_from": source_id, "charts": sorted(c[0] for c in src_charts),
+            "added_files": sorted(a for a, _ in new_files), "subfolder": subfolder,
+        }
+        self.logger.info(f"merge_songs: Song[{source_id}] merged into song[{song_id}] {result}")
+        return result
+
+    def purge_song(
+        self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
+    ) -> bool:
+        """곡을 삭제합니다(사용 → 제외 → 삭제의 마지막 단계). 사용 중인 곡이면 먼저 사용 중지(제외)합니다.
+        없는 곡이면 False.
+
+        옮겨 둔 파일(UNUSED_DIR/{song_id}/)을 지우고 deleted_song.purged_at을 남깁니다. 번호는 결번 그대로이고 복원은
+        안 됩니다(SongPurgedError). 제외와 달리 같은 차트를 다시 임포트하면 막지 않습니다(깨끗한 원본을 다시 받을 수 있게).
+        차트 청크에서는 뺄 수 없어 차트 행은 곡 없이 남습니다. 이미 삭제한 곡이면 그대로 True."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT 1 FROM song WHERE id = %s", (song_id,))
+            active = cur.fetchone() is not None
+        if active and not self.delete_song(song_id, reason, deleted_by, timeout=timeout):
+            return False
+        self._lock(timeout)
+        try:
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT purged_at FROM deleted_song WHERE song_id = %s FOR UPDATE", (song_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                if row[0] is None:
+                    if reason and not active:
+                        cur.execute("UPDATE deleted_song SET reason = %s WHERE song_id = %s", (reason, song_id))
+                    cur.execute("UPDATE deleted_song SET purged_at = %s WHERE song_id = %s", (int(time.time()), song_id))
+                    con.commit()
+        finally:
+            self._write_lock.release()
+        shutil.rmtree(self.unused_dir(song_id), ignore_errors=True)
+        self.logger.info(f"purge_song: Song[{song_id}] deleted by {deleted_by}: {reason}")
+        return True
 
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
