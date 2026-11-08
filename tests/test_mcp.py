@@ -194,6 +194,9 @@ def test_song_cleanup_tools(client, monkeypatch):
     con.close()
     found = call(api, key, "list_song_findings", kind="mixed")["findings"]
     assert [(f["kind"], f["song_a"]) for f in found] == [("mixed", 1)]
+    brief = call(api, key, "list_song_findings", brief=True)["findings"]
+    assert brief == [{"id": found[0]["id"], "kind": "mixed", "song_a": 1, "folder_a": found[0]["folder_a"],
+                      "groups": [[1, "a.bms"], [1, "b.bms"]]}]
 
     split = call(api, key, "split_song", song_id=1, charts=["b.bms"], folder="[y] B")
     assert split["song_id"] == 2 and split["moved_files"] == ["b.wav"]
