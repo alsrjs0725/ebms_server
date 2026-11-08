@@ -101,18 +101,21 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
 - 나누거나 합친 곡의 발견은 저절로 닫히고 다음 색인 때 다시 검사합니다. 처리하지 않을 발견만 set_finding_status로 닫습니다.
 - 방향: 살릴 수 있는 것만 살리고 나머지는 지웁니다. 곡 상태는 사용 → 제외(delete_song level unused, 복원 가능) →
   삭제(level deleted, 복원 불가) 3단계입니다.
-- split_song은 먼저 dry_run=true로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
+- split_song은 먼저 preview_split(또는 dry_run=true)으로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
   shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)는 두 경우가 있습니다. 먼저 제목·아티스트를 원래 곡(폴더명·큰 묶음)과
   비교합니다.
   (a) 제목·아티스트가 같은 곡 계열(같은 제목에 난이도·버전 표기만 다름, 같은 아티스트, 피아노 솔로·arr·remix 표기 등 같은 곡의
       편곡)이면 같은 키음 세트로 만든 변형 차트라 소리가 맞습니다. 나누지도 빼지도 말고 set_finding_status(dismissed)로 닫습니다.
   (b) 제목이 다른 곡(다른 제목, 보통 다른 아티스트)이면 다른 곡 차트가 이 곡의 같은 이름 키음(01.wav 등)으로 재생되던 경우라
       소리가 틀립니다. remove_charts로 빼고 reason에 "다른 곡 키음으로 재생(원본 필요)"과 제목을 적습니다.
+  제목이 달라도 같은 키음 세트로 만든 다른 곡(같은 작가의 키음 공유 곡)일 수 있습니다. stage에서 shared_only로 뺀 차트의 절반이
+  이런 정상 곡이었습니다. 제목만으로 (b)가 확실하지 않으면 빼지 말고 split_song으로 새 곡으로 살리거나 발견을 열어 둡니다.
   애매하면(제목이 비었거나 판단이 서지 않음) 빼지 말고 발견을 열어 둡니다. 잘못 뺐으면 restore_charts로 되돌립니다.
 - 원래 곡(폴더명과 맞는 묶음) 자체가 깨졌으면(키음이 거의 없음, 차트를 읽을 수 없음) delete_song level unused로 제외합니다.
   level deleted는 이미 제외한 곡을 지울 때만 씁니다.
 - 키음 팩 폴더에 여러 사람이 각자 BMS를 넣은 곡(모든 묶음이 같은 키음을 나눠 씀, 서로 제목이 다름)은 원래 곡 하나로 정할 수 없으니
   건드리지 말고 발견을 열어 둔 채 "키음 팩"으로 보고합니다(임포트 때 정리할 예정).
+- 발견 목록은 list_song_findings brief=true로 20~30개씩 훑고, 필요한 곡만 get_song으로 봅니다(전체 목록은 매우 큽니다).
 - 한 번에 많이 고치지 말고 발견 하나씩 처리하고, 처리한 결과(나눈 곡 번호 등)를 요약해 남깁니다.
 """
 
@@ -237,6 +240,10 @@ TOOLS = [
                 "status": {"type": "string", "enum": ["open", "dismissed"], "description": "기본 open"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "기본 50"},
                 "offset": {"type": "integer", "minimum": 0},
+                "brief": {
+                    "type": "boolean",
+                    "description": "true면 짧게: id·kind·곡 번호·폴더와 mixed 묶음마다 [차트 수, 첫 차트 경로]만. 목록을 훑을 때 씁니다.",
+                },
             },
         },
         "admin": True,
@@ -300,6 +307,23 @@ TOOLS = [
                 "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
                 "folder": {"type": "string", "description": "새 곡 폴더명(보통 '[아티스트] 제목'). 없으면 원래 곡 폴더명"},
                 "dry_run": {"type": "boolean", "description": "true면 바꾸지 않고 옮길·복사할 파일과 shared_only만 봅니다"},
+            },
+            "required": ["song_id", "charts"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "preview_split",
+        "description": (
+            "split_song을 바꾸지 않고 미리 봅니다(split_song dry_run과 같음). 옮길·복사할 파일과 shared_only. "
+            "판단만 하는 에이전트는 split_song 대신 이 도구를 쓰고 split_song은 막아 둡니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "folder": {"type": "string"},
             },
             "required": ["song_id", "charts"],
         },
@@ -816,7 +840,7 @@ def _http(fn, *args):
         raise ToolError(f"{e.status_code}: {e.detail}") from None
 
 
-def list_song_findings(kind: str = "", status: str = "open", limit: int = 50, offset: int = 0) -> dict:
+def list_song_findings(kind: str = "", status: str = "open", limit: int = 50, offset: int = 0, brief: bool = False) -> dict:
     from . import render_index
 
     if kind not in ("", "dup", "mixed") or status not in ("open", "dismissed"):
@@ -825,11 +849,23 @@ def list_song_findings(kind: str = "", status: str = "open", limit: int = 50, of
     offset = max(0, int(offset))
     items = render_index.findings(status, kind, limit + 1, offset)
     more = len(items) > limit
+    items = items[:limit]
+    if brief:
+        items = [_brief_finding(f) for f in items]
     return {
-        "findings": items[:limit],
+        "findings": items,
         "total_open": render_index.count_findings("open"),
         "next_offset": offset + limit if more else None,
     }
+
+
+def _brief_finding(f: dict) -> dict:
+    out = {"id": f["id"], "kind": f["kind"], "song_a": f["song_a"], "folder_a": f["folder_a"]}
+    if f["kind"] == "dup":
+        out.update(song_b=f["song_b"], folder_b=f["folder_b"], score=f["score"])
+    else:
+        out["groups"] = [[len(g), g[0] if g else None] for g in f["detail"].get("groups", [])]
+    return out
 
 
 def get_song(song_id: int, detail: bool = False) -> dict:
@@ -895,6 +931,10 @@ def split_song(user, song_id: int, charts: list[str], folder: str = "", dry_run:
     return _http(admin.split_song, int(song_id), list(charts), folder, user.id, bool(dry_run))
 
 
+def preview_split(song_id: int, charts: list[str], folder: str = "") -> dict:
+    return _http(admin.split_song, int(song_id), list(charts), folder, "", True)
+
+
 def merge_songs(user, song_id: int, source: int, reason: str = "") -> dict:
     return _http(admin.merge_songs, int(song_id), int(source), reason, user.id)
 
@@ -947,6 +987,7 @@ HANDLERS = {
     "get_song": get_song,
     "compare_songs": compare_songs,
     "get_compare_result": get_compare_result,
+    "preview_split": preview_split,
     "set_finding_status": set_finding_status,
 }
 # 부른 사용자를 첫 인자로 받는 도구(바로 적용하는 도구, 기록에 남김)
