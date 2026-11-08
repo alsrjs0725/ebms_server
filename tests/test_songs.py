@@ -382,3 +382,25 @@ def test_split_shared_only(client, monkeypatch):
     upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
     dry = client.post("/api/admin/songs/1/split", json={"charts": ["o.bms"], "dry_run": True}).json()
     assert dry["shared_only"] is True and dry["moved_files"] == [] and dry["copied_files"] == ["01.wav"]
+
+
+def test_purge_song(client, monkeypatch):
+    """사용 → 제외 → 삭제: 삭제하면 옮겨 둔 파일을 지워 복원할 수 없고, 같은 차트는 다시 임포트됩니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
+    upload(client, "b.zip", make_zip({"b.bms": b"#TITLE B\n"}))
+    # 제외한 곡 삭제
+    assert client.delete("/api/admin/songs/1").status_code == 200
+    assert db_module.Database.unused_dir(1).exists()
+    assert client.post("/api/admin/songs/1/purge", json={"reason": "깨진 곡"}).status_code == 200
+    assert not db_module.Database.unused_dir(1).exists()
+    row = client.get("/api/admin/songs/deleted").json()["items"][0]
+    assert row["song_id"] == 1 and row["purged_at"] and row["reason"] == "깨진 곡"
+    assert client.post("/api/admin/songs/1/restore").status_code == 410
+    # 사용 중인 곡은 제외한 뒤 삭제
+    assert client.post("/api/admin/songs/2/purge").status_code == 200
+    assert client.get("/api/admin/songs/2").status_code == 404
+    assert client.post("/api/admin/songs/9/purge").status_code == 404
+    # 삭제한 곡의 차트는 다시 임포트할 수 있습니다(새 번호).
+    job = upload(client, "again.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
+    assert job["songs"][0]["song_id"] == 3 and not job["songs"][0].get("skipped")

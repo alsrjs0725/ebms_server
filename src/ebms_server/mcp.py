@@ -97,9 +97,16 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
 - dup(두 곡이 같은 곡): get_song으로 두 곡 제목·아티스트가 같은 곡인지 보고, 맞으면 차트가 많은 쪽(같으면 번호가 작은 쪽)에
   다른 쪽을 merge_songs 합니다. 같은 이름에 내용이 다른 파일이 있으면 서버가 합칠 곡을 하위 폴더에 넣으므로 소리는 바뀌지 않습니다.
 - 나누거나 합친 곡의 발견은 저절로 닫히고 다음 색인 때 다시 검사합니다. 처리하지 않을 발견만 set_finding_status로 닫습니다.
-- split_song은 먼저 dry_run=true로 봅니다. shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)면 다른 곡 차트가 이 곡의
-  같은 이름 키음(01.wav 등)으로 재생되던 경우입니다. 나눠도 소리는 그대로 틀리니 나누지 말고 발견을 열어 둔 채
-  "원본 키음 필요"로 보고합니다(그 곡 원본 폴더를 구해 다시 넣어야 고쳐짐).
+- 방향: 살릴 수 있는 것만 살리고 나머지는 지웁니다. 곡 상태는 사용 → 제외(delete_song level unused, 복원 가능) →
+  삭제(level deleted, 복원 불가) 3단계입니다.
+- split_song은 먼저 dry_run=true로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
+  shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)면 다른 곡 차트가 이 곡의 같은 이름 키음(01.wav 등)으로 재생되던
+  경우라 나눠도 소리가 틀립니다. 살릴 수 없으니 remove_charts로 그 차트들을 빼고, reason에 "다른 곡 키음으로 재생(원본 필요)"과
+  제목을 적습니다. 원본을 나중에 다시 임포트하면 새 곡으로 들어옵니다.
+- 원래 곡(폴더명과 맞는 묶음) 자체가 깨졌으면(키음이 거의 없음, 차트를 읽을 수 없음) delete_song level unused로 제외합니다.
+  level deleted는 이미 제외한 곡을 지울 때만 씁니다.
+- 키음 팩 폴더에 여러 사람이 각자 BMS를 넣은 곡(모든 묶음이 같은 키음을 나눠 씀, 서로 제목이 다름)은 원래 곡 하나로 정할 수 없으니
+  건드리지 말고 발견을 열어 둔 채 "키음 팩"으로 보고합니다(임포트 때 정리할 예정).
 - 한 번에 많이 고치지 말고 발견 하나씩 처리하고, 처리한 결과(나눈 곡 번호 등)를 요약해 남깁니다.
 """
 
@@ -300,6 +307,40 @@ TOOLS = [
                 "reason": {"type": "string"},
             },
             "required": ["song_id", "source"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "remove_charts",
+        "description": (
+            "곡에서 차트 몇 개를 뺍니다(바로 적용). 소리가 틀려 살릴 수 없는 차트(split_song dry_run의 shared_only)를 지울 때 씁니다. "
+            "곡 zip에서 차트 파일을 빼고, 같은 차트를 나중에 원본으로 다시 임포트하면 새 곡으로 들어옵니다. 모든 차트는 뺄 수 없습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "charts", "reason"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "delete_song",
+        "description": (
+            "곡 전체를 내립니다(바로 적용). level unused(제외): 파일을 보관하고 같은 차트 재임포트를 막으며 복원할 수 있음. "
+            "level deleted(삭제): 보관 파일까지 지워 복원할 수 없고 재임포트는 막지 않음."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "level": {"type": "string", "enum": ["unused", "deleted"], "description": "기본 unused"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "reason"],
         },
         "admin": True,
     },
@@ -813,6 +854,31 @@ def merge_songs(user, song_id: int, source: int, reason: str = "") -> dict:
     return _http(admin.merge_songs, int(song_id), int(source), reason, user.id)
 
 
+def remove_charts(user, song_id: int, charts: list[str], reason: str = "") -> dict:
+    detail = _http(admin.get_song_detail, int(song_id))
+    by_path = {c["path"].lower(): c["sha256"] for c in detail["charts"]}
+    shas = {c["sha256"] for c in detail["charts"]}
+    picked = [c if c in shas else by_path.get(str(c).lower(), str(c)) for c in charts]
+    body = admin.ChartDetach(charts=picked, reason=reason)
+    from . import render_index
+
+    result = _http(admin.detach_charts, int(song_id), body, user)
+    render_index.forget_songs([int(song_id)])
+    return result
+
+
+def delete_song(user, song_id: int, reason: str = "", level: str = "unused") -> dict:
+    if level not in ("unused", "deleted"):
+        raise ToolError("level은 unused(제외)·deleted(삭제)입니다.")
+    if level == "deleted":
+        return _http(admin.purge_song, int(song_id), reason, user.id)
+    from . import render_index
+
+    result = _http(admin.delete_song, int(song_id), user, admin.SongDelete(reason=reason))
+    render_index.forget_songs([int(song_id)])
+    return {**result, "song_id": int(song_id), "level": "unused"}
+
+
 def set_finding_status(finding_id: int, status: str) -> dict:
     from . import render_index
 
@@ -838,6 +904,8 @@ HANDLERS = {
 USER_HANDLERS = {
     "split_song": split_song,
     "merge_songs": merge_songs,
+    "remove_charts": remove_charts,
+    "delete_song": delete_song,
 }
 
 

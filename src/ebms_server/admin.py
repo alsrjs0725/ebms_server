@@ -162,7 +162,7 @@ def search_songs(q: str = "", page: int = 1) -> dict:
     return _page_json(items, total, page)
 
 
-DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at")
+DELETED_COLUMNS = ("song_id", "folder", "size", "sha256", "charts", "reason", "deleted_by", "deleted_at", "purged_at")
 
 
 def search_deleted_songs(q: str = "", page: int = 1) -> dict:
@@ -469,6 +469,8 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
     """사용 중지한 곡을 같은 번호로 되돌립니다. 클라이언트는 다음 동기화 때 다시 받습니다."""
     try:
         db.Database().restore_song(song_id, timeout=DELETE_LOCK_TIMEOUT)
+    except db.SongPurgedError:
+        raise HTTPException(status_code=410, detail="삭제한 곡이라 복원할 수 없습니다.")
     except LookupError:
         raise HTTPException(status_code=404, detail="사용 중지한 곡이 아닙니다.")
     except TimeoutError:
@@ -483,6 +485,30 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
         raise HTTPException(status_code=500, detail=f"옮겨 둔 파일로 복원하지 못했습니다: {e}")
     logger.info(f"song {song_id} restored by {admin.id}")
     return get_song_detail(song_id)
+
+
+def purge_song(song_id: int, reason: str, admin_id: str) -> dict:
+    """곡 삭제(db.purge_song). 사용 중인 곡이면 사용 중지한 뒤 삭제합니다. 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    reason = reason.strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    try:
+        done = db.Database().purge_song(song_id, reason, admin_id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    if not done:
+        raise HTTPException(status_code=404, detail="song not found")
+    render_index.forget_songs([song_id])
+    logger.info(f"song {song_id} purged by {admin_id}: {reason}")
+    return {"ok": True, "song_id": song_id, "purged": True}
+
+
+@router.post("/api/admin/songs/{song_id}/purge")
+def api_purge_song(song_id: int, admin: Annotated[User, Depends(web_admin)], body: SongDelete | None = None):
+    """곡을 삭제합니다(사용 → 제외 → 삭제). 옮겨 둔 파일까지 지워 복원할 수 없고, 같은 차트의 재임포트는 막지 않습니다."""
+    return purge_song(song_id, body.reason if body else "", admin.id)
 
 
 class ChartDetach(BaseModel):

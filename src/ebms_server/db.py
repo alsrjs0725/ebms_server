@@ -265,6 +265,7 @@ SCHEMA = [
             reason TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             deleted_by CHAR(36),
             deleted_at BIGINT UNSIGNED NOT NULL,
+            purged_at BIGINT UNSIGNED,
 
             PRIMARY KEY (song_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -374,6 +375,8 @@ MISSING_COLUMNS = [
     ("song", "pre_chunk", "INT UNSIGNED"),
     ("pre_chunk", "sig", "VARCHAR(1024)"),
     ("pre_chunk", "songs", "VARCHAR(1024)"),
+    # 삭제(purge_song)한 시각. 있으면 옮겨 둔 파일이 없어 복원할 수 없고, 같은 차트를 다시 임포트할 수 있습니다.
+    ("deleted_song", "purged_at", "BIGINT UNSIGNED"),
 ]
 MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk")]
 # 곡·청크를 저장소 파일로 옮기기 전(#152) 데이터를 두던 테이블·컬럼. 다 옮긴 DB에서 서버 시작 때 지웁니다.
@@ -874,6 +877,10 @@ def _song_zipinfo(name: str) -> zipfile.ZipInfo:
 
 class AmbiguousSongError(ValueError):
     """새 폴더의 차트가 기존 곡 여러 개와 겹쳐 어느 곡에 넣을지 정할 수 없습니다. 등록하지 않고 폴더는 남깁니다."""
+
+
+class SongPurgedError(LookupError):
+    """삭제(purge_song)해 옮겨 둔 파일이 없는 곡."""
 
 
 class ChartInUseError(ValueError):
@@ -1691,7 +1698,8 @@ class Database:
             if cur.fetchone() is None:
                 continue
             cur.execute(
-                "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s ORDER BY song_id DESC LIMIT 1",
+                "SELECT song_id FROM deleted_song WHERE chart_list LIKE %s AND purged_at IS NULL"
+                " ORDER BY song_id DESC LIMIT 1",
                 (f'%"{sha256}"%',),
             )
             row = cur.fetchone()
@@ -2121,13 +2129,15 @@ class Database:
             with connect() as con, con.cursor() as cur:
                 try:
                     cur.execute(
-                        "SELECT folder, size, sha256, chart_list FROM deleted_song WHERE song_id = %s FOR UPDATE",
+                        "SELECT folder, size, sha256, chart_list, purged_at FROM deleted_song WHERE song_id = %s FOR UPDATE",
                         (song_id,),
                     )
                     row = cur.fetchone()
                     if row is None:
                         raise LookupError(f"song {song_id} is not unused")
-                    folder, size, sha256, chart_list = row
+                    folder, size, sha256, chart_list, purged_at = row
+                    if purged_at is not None:
+                        raise SongPurgedError(f"song {song_id} was deleted")
                     data = (source / "song.zip").read_bytes()
                     if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
                         raise ValueError(f"{source}/song.zip does not match song {song_id}")
@@ -2491,6 +2501,38 @@ class Database:
         }
         self.logger.info(f"merge_songs: Song[{source_id}] merged into song[{song_id}] {result}")
         return result
+
+    def purge_song(
+        self, song_id: int, reason: str = "", deleted_by: str | None = None, timeout: float | None = None
+    ) -> bool:
+        """곡을 삭제합니다(사용 → 제외 → 삭제의 마지막 단계). 사용 중인 곡이면 먼저 사용 중지(제외)합니다.
+        없는 곡이면 False.
+
+        옮겨 둔 파일(UNUSED_DIR/{song_id}/)을 지우고 deleted_song.purged_at을 남깁니다. 번호는 결번 그대로이고 복원은
+        안 됩니다(SongPurgedError). 제외와 달리 같은 차트를 다시 임포트하면 막지 않습니다(깨끗한 원본을 다시 받을 수 있게).
+        차트 청크에서는 뺄 수 없어 차트 행은 곡 없이 남습니다. 이미 삭제한 곡이면 그대로 True."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT 1 FROM song WHERE id = %s", (song_id,))
+            active = cur.fetchone() is not None
+        if active and not self.delete_song(song_id, reason, deleted_by, timeout=timeout):
+            return False
+        self._lock(timeout)
+        try:
+            with connect() as con, con.cursor() as cur:
+                cur.execute("SELECT purged_at FROM deleted_song WHERE song_id = %s FOR UPDATE", (song_id,))
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                if row[0] is None:
+                    if reason and not active:
+                        cur.execute("UPDATE deleted_song SET reason = %s WHERE song_id = %s", (reason, song_id))
+                    cur.execute("UPDATE deleted_song SET purged_at = %s WHERE song_id = %s", (int(time.time()), song_id))
+                    con.commit()
+        finally:
+            self._write_lock.release()
+        shutil.rmtree(self.unused_dir(song_id), ignore_errors=True)
+        self.logger.info(f"purge_song: Song[{song_id}] deleted by {deleted_by}: {reason}")
+        return True
 
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""

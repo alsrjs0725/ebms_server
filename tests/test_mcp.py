@@ -62,7 +62,7 @@ def test_initialize_and_tools(client, monkeypatch):
     assert names == {
         "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
         "list_song_findings", "get_song", "compare_songs", "get_compare_result", "split_song", "merge_songs",
-        "set_finding_status",
+        "remove_charts", "delete_song", "set_finding_status",
     }
     assert call(api, key, "whoami")["role"] == "admin"
     assert rpc(api, key, "nope")["error"]["code"] == -32601
@@ -208,3 +208,23 @@ def test_song_cleanup_tools(client, monkeypatch):
     con.close()
     assert call(api, key, "set_finding_status", finding_id=fid, status="dismissed") == {"id": fid, "status": "dismissed"}
     assert call(api, key, "list_song_findings")["findings"] == []
+
+
+def test_remove_and_delete_tools(client, monkeypatch):
+    """살릴 수 없는 차트는 빼고, 곡 전체는 제외 → 삭제."""
+    admin_login(client, monkeypatch)
+    key = create_key(client)
+    api = TestClient(client.app)
+    upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
+    dry = call(api, key, "split_song", song_id=1, charts=["o.bms"], dry_run=True)
+    assert dry["shared_only"] is True and call(api, key, "get_song", song_id=1)["charts"][1]["path"] == "q.bms"
+    removed = call(api, key, "remove_charts", song_id=1, charts=["O.BMS"], reason="다른 곡 키음")
+    assert removed["removed_files"] == ["o.bms"]
+    assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["q.bms"]
+
+    assert call(api, key, "delete_song", song_id=1, reason="깨짐")["level"] == "unused"
+    assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"] is None
+    assert call(api, key, "delete_song", song_id=1, reason="깨짐", level="deleted")["purged"] is True
+    assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"]
+    bad = rpc(api, key, "tools/call", {"name": "delete_song", "arguments": {"song_id": 1, "reason": "", "level": "x"}})
+    assert bad["result"]["isError"]
