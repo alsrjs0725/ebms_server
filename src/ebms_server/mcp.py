@@ -101,7 +101,7 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
 - 나누거나 합친 곡의 발견은 저절로 닫히고 다음 색인 때 다시 검사합니다. 처리하지 않을 발견만 set_finding_status로 닫습니다.
 - 방향: 살릴 수 있는 것만 살리고 나머지는 지웁니다. 곡 상태는 사용 → 제외(delete_song level unused, 복원 가능) →
   삭제(level deleted, 복원 불가) 3단계입니다.
-- split_song은 먼저 dry_run=true로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
+- split_song은 먼저 preview_split(또는 dry_run=true)으로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
   shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)는 두 경우가 있습니다. 먼저 제목·아티스트를 원래 곡(폴더명·큰 묶음)과
   비교합니다.
   (a) 제목·아티스트가 같은 곡 계열(같은 제목에 난이도·버전 표기만 다름, 같은 아티스트, 피아노 솔로·arr·remix 표기 등 같은 곡의
@@ -307,6 +307,23 @@ TOOLS = [
                 "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
                 "folder": {"type": "string", "description": "새 곡 폴더명(보통 '[아티스트] 제목'). 없으면 원래 곡 폴더명"},
                 "dry_run": {"type": "boolean", "description": "true면 바꾸지 않고 옮길·복사할 파일과 shared_only만 봅니다"},
+            },
+            "required": ["song_id", "charts"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "preview_split",
+        "description": (
+            "split_song을 바꾸지 않고 미리 봅니다(split_song dry_run과 같음). 옮길·복사할 파일과 shared_only. "
+            "판단만 하는 에이전트는 split_song 대신 이 도구를 쓰고 split_song은 막아 둡니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "folder": {"type": "string"},
             },
             "required": ["song_id", "charts"],
         },
@@ -914,6 +931,10 @@ def split_song(user, song_id: int, charts: list[str], folder: str = "", dry_run:
     return _http(admin.split_song, int(song_id), list(charts), folder, user.id, bool(dry_run))
 
 
+def preview_split(song_id: int, charts: list[str], folder: str = "") -> dict:
+    return _http(admin.split_song, int(song_id), list(charts), folder, "", True)
+
+
 def merge_songs(user, song_id: int, source: int, reason: str = "") -> dict:
     return _http(admin.merge_songs, int(song_id), int(source), reason, user.id)
 
@@ -966,6 +987,7 @@ HANDLERS = {
     "get_song": get_song,
     "compare_songs": compare_songs,
     "get_compare_result": get_compare_result,
+    "preview_split": preview_split,
     "set_finding_status": set_finding_status,
 }
 # 부른 사용자를 첫 인자로 받는 도구(바로 적용하는 도구, 기록에 남김)

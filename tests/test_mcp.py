@@ -63,7 +63,7 @@ def test_initialize_and_tools(client, monkeypatch):
     names = {t["name"] for t in rpc(api, key, "tools/list")["result"]["tools"]}
     assert names == {
         "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
-        "list_song_findings", "get_song", "compare_songs", "get_compare_result", "split_song", "merge_songs",
+        "list_song_findings", "get_song", "compare_songs", "get_compare_result", "preview_split", "split_song", "merge_songs",
         "remove_charts", "restore_charts", "delete_song", "set_finding_status",
     }
     assert call(api, key, "whoami")["role"] == "admin"
@@ -198,6 +198,8 @@ def test_song_cleanup_tools(client, monkeypatch):
     assert brief == [{"id": found[0]["id"], "kind": "mixed", "song_a": 1, "folder_a": found[0]["folder_a"],
                       "groups": [[1, "a.bms"], [1, "b.bms"]]}]
 
+    preview = call(api, key, "preview_split", song_id=1, charts=["b.bms"])
+    assert preview["dry_run"] and preview["moved_files"] == ["b.wav"]
     split = call(api, key, "split_song", song_id=1, charts=["b.bms"], folder="[y] B")
     assert split["song_id"] == 2 and split["moved_files"] == ["b.wav"]
     # 나눈 곡의 발견은 닫혀 다음 색인 때 다시 검사합니다.
