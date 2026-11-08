@@ -124,6 +124,28 @@ EBMS_MYSQL_LOG_DIR=/mnt/ssd/ebms/release/mysql-log
 
   SSD도 부팅 시 자동 마운트되게 해 두세요. 마운트 전에 MySQL이 뜨면 redo log가 없어 시작하지 못합니다.
 
+### MySQL 메모리와 redo
+
+`EBMS_MYSQL_BUFFER_POOL`(기본 512M)은 MySQL이 데이터를 메모리에 올려 두는 크기입니다. 데이터(곡 목록·미리듣기 등, 수 GB)가 이보다 크면 쿼리마다 디스크를 읽어 HDD에서 특히 느려집니다. 서버 RAM 여유(스왑 사용량)를 보고 늘립니다. `EBMS_MYSQL_REDO_CAPACITY`(기본 100M)는 redo log 크기로, 늘리면 큰 import 배치에서 checkpoint 쓰기가 줄어듭니다. 둘 다 env에 넣고 다시 `up` 하면 됩니다(MySQL 재시작).
+
+```bash
+# /opt/ebms/release.env
+EBMS_MYSQL_BUFFER_POOL=2G
+EBMS_MYSQL_REDO_CAPACITY=1G
+```
+
+### 렌더 색인을 SSD에 두기
+
+렌더 색인(`index.sqlite`, 수 GB)은 해시 조회가 거의 모두 랜덤 읽기라 HDD에서 느립니다. `EBMS_RENDER_INDEX_DIR`는 컨테이너 안 경로이므로, SSD에 붙인 캐시 폴더 아래를 가리키면 따로 마운트하지 않아도 됩니다(그만큼 `EBMS_CACHE_MAX_BYTES` 한도에 들어갑니다). 서버를 멈춘 뒤 파일을 옮기고 켭니다.
+
+```bash
+docker compose -p ebms-release --env-file /opt/ebms/release.env stop ebms
+mkdir -p $EBMS_CACHE_DIR/render_index
+cp -a $EBMS_VAR_DIR/render_index/. $EBMS_CACHE_DIR/render_index/
+# /opt/ebms/release.env
+EBMS_RENDER_INDEX_DIR=/app/cache/render_index
+```
+
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |

@@ -20,7 +20,9 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      - --innodb_buffer_pool_size=512M
+      # 버퍼 풀·redo 크기. 데이터가 버퍼 풀보다 크면 쿼리마다 디스크를 읽습니다(docs/deployment.md#mysql-메모리와-redo).
+      - --innodb_buffer_pool_size=${EBMS_MYSQL_BUFFER_POOL:-512M}
+      - --innodb-redo-log-capacity=${EBMS_MYSQL_REDO_CAPACITY:-100M}
       - --max_connections=200
       # 쓰기 로그(binlog·redo log·doublewrite)는 /var/lib/mysql-log에 둡니다. EBMS_MYSQL_LOG_DIR(SSD 등)를 비우면
       # 데이터 폴더를 그 자리에 한 번 더 붙이므로 지금까지와 같은 파일입니다(docs/deployment.md#쓰기-로그를-ssd에-두기).
@@ -82,6 +84,8 @@ services:
       EBMS_RENDER_INDEX_HOURS: ${EBMS_RENDER_INDEX_HOURS:-1}
       EBMS_RENDER_INDEX_MINUTES: ${EBMS_RENDER_INDEX_MINUTES:-60}
       EBMS_RENDER_INDEX_CPUS: ${EBMS_RENDER_INDEX_CPUS:-}
+      # 색인 파일(index.sqlite) 위치(컨테이너 안 경로). 랜덤 읽기가 많아 SSD가 좋습니다. 예: /app/cache/render_index
+      EBMS_RENDER_INDEX_DIR: ${EBMS_RENDER_INDEX_DIR:-/app/var/render_index}
       # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
       EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
       # 로그 시각의 시간대. 비우면 UTC. 예: KST-9(이미지에 tzdata가 없어도 동작)(docs/deployment.md)
