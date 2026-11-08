@@ -608,6 +608,33 @@ def api_merge_songs(song_id: int, body: SongMerge, admin: Annotated[User, Depend
     """다른 곡(source)을 이 곡에 합치고 source를 사용 중지합니다(같은 곡이 두 번호로 나뉜 경우)."""
     return merge_songs(song_id, body.source, body.reason, admin.id)
 
+class ChartAttach(BaseModel):
+    charts: list[str]
+    reason: str = ""
+
+
+def attach_charts(song_id: int, charts: list[str], reason: str, admin_id: str) -> dict:
+    """뗀 차트 되살리기(db.attach_charts). 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    try:
+        result = db.Database().attach_charts(song_id, charts, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    render_index.forget_songs([song_id])
+    logger.info(f"song {song_id} charts attached by {admin_id}: {result} reason={reason!r}")
+    return result
+
+
+@router.post("/api/admin/songs/{song_id}/charts/attach")
+def api_attach_charts(song_id: int, body: ChartAttach, admin: Annotated[User, Depends(web_admin)]):
+    """뗀 차트(sha256)를 원본 없이 다시 붙입니다. 차트 청크에 남은 내용을 원래 경로로 곡 zip에 넣습니다."""
+    return attach_charts(song_id, body.charts, body.reason, admin.id)
+
 class RenderCompare(BaseModel):
     songs: list[int]
     # 곡 id → 볼 차트 경로들. 없는 곡은 모든 차트

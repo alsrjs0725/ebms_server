@@ -62,7 +62,7 @@ def test_initialize_and_tools(client, monkeypatch):
     assert names == {
         "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
         "list_song_findings", "get_song", "compare_songs", "get_compare_result", "split_song", "merge_songs",
-        "remove_charts", "delete_song", "set_finding_status",
+        "remove_charts", "restore_charts", "delete_song", "set_finding_status",
     }
     assert call(api, key, "whoami")["role"] == "admin"
     assert rpc(api, key, "nope")["error"]["code"] == -32601
@@ -176,9 +176,13 @@ def test_song_cleanup_tools(client, monkeypatch):
         "a.bms": b"#TITLE A\n#ARTIST x\n#WAV01 a.wav\n", "b.bms": b"#TITLE B\n#ARTIST y\n#WAV01 b.wav\n",
         "a.wav": b"a", "b.wav": b"b",
     }))
-    song = call(api, key, "get_song", song_id=1)
+    song = call(api, key, "get_song", song_id=1, detail=True)
     assert [(c["path"], c["title"], c["artist"], c["sounds"]) for c in song["charts"]] == [("a.bms", "A", "x", 1), ("b.bms", "B", "y", 1)]
     assert song["other_files"] == ["a.wav", "b.wav"]
+    # 기본은 짧은 응답(제목 표 + [경로, 표 번호, 키음 수])
+    short = call(api, key, "get_song", song_id=1)
+    assert short["titles"] == [["A", "x"], ["B", "y"]] and short["charts"] == [["a.bms", 0, 1], ["b.bms", 1, 1]]
+    assert "other_files" not in short
     assert rpc(api, key, "tools/call", {"name": "get_song", "arguments": {"song_id": 9}})["result"]["isError"]
 
     assert call(api, key, "list_song_findings")["findings"] == []
@@ -199,7 +203,7 @@ def test_song_cleanup_tools(client, monkeypatch):
 
     merged = call(api, key, "merge_songs", song_id=1, source=2)
     assert merged["merged_from"] == 2 and merged["subfolder"] is None
-    assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["a.bms", "b.bms"]
+    assert [c[0] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["a.bms", "b.bms"]
 
     con = render_index.connect()
     render_index._put_finding(con, "dup", 1, 3, 1.0, {})
@@ -217,14 +221,23 @@ def test_remove_and_delete_tools(client, monkeypatch, caplog):
     api = TestClient(client.app)
     upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
     dry = call(api, key, "split_song", song_id=1, charts=["o.bms"], dry_run=True)
-    assert dry["shared_only"] is True and call(api, key, "get_song", song_id=1)["charts"][1]["path"] == "q.bms"
+    assert dry["shared_only"] is True and call(api, key, "get_song", song_id=1)["charts"][1][0] == "q.bms"
     with caplog.at_level("INFO", logger="ebms_server.audit"):
         removed = call(api, key, "remove_charts", song_id=1, charts=["O.BMS"], reason="다른 곡 키음")
     # 사유와 뺀 파일이 접속기록에 남습니다.
     assert any("action=mcp.remove_charts" in r.message and "removed_files=o.bms" in r.message and "다른 곡 키음" in r.message
                for r in caplog.records)
     assert removed["removed_files"] == ["o.bms"]
-    assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["q.bms"]
+    assert [c[0] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["q.bms"]
+    # 잘못 뺀 차트는 원본 없이 되살립니다.
+    restored = call(api, key, "restore_charts", song_id=1, charts=removed["detached"], reason="같은 곡 변형")
+    assert restored == {"attached": removed["detached"], "added_files": ["o.bms"]}
+    assert [c[0] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["o.bms", "q.bms"]
+    assert client.get("/api/admin/songs/1/file", params={"path": "o.bms"}).content == b"#TITLE O\n#WAV01 01.wav\n"
+    # 이미 붙은 차트는 400
+    again = rpc(api, key, "tools/call", {"name": "restore_charts", "arguments": {"song_id": 1, "charts": removed["detached"], "reason": ""}})
+    assert again["result"]["isError"]
+    call(api, key, "remove_charts", song_id=1, charts=["o.bms"], reason="다시")
 
     assert call(api, key, "delete_song", song_id=1, reason="깨짐")["level"] == "unused"
     assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"] is None

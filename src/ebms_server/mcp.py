@@ -100,9 +100,13 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
 - 방향: 살릴 수 있는 것만 살리고 나머지는 지웁니다. 곡 상태는 사용 → 제외(delete_song level unused, 복원 가능) →
   삭제(level deleted, 복원 불가) 3단계입니다.
 - split_song은 먼저 dry_run=true로 봅니다. shared_only=false(그 묶음만 쓰는 키음이 있음)면 살릴 수 있으니 split_song 합니다.
-  shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)면 다른 곡 차트가 이 곡의 같은 이름 키음(01.wav 등)으로 재생되던
-  경우라 나눠도 소리가 틀립니다. 살릴 수 없으니 remove_charts로 그 차트들을 빼고, reason에 "다른 곡 키음으로 재생(원본 필요)"과
-  제목을 적습니다. 원본을 나중에 다시 임포트하면 새 곡으로 들어옵니다.
+  shared_only=true(옮길 차트만 쓰는 키음이 하나도 없음)는 두 경우가 있습니다. 먼저 제목·아티스트를 원래 곡(폴더명·큰 묶음)과
+  비교합니다.
+  (a) 제목·아티스트가 같은 곡 계열(같은 제목에 난이도·버전 표기만 다름, 같은 아티스트, 피아노 솔로·arr·remix 표기 등 같은 곡의
+      편곡)이면 같은 키음 세트로 만든 변형 차트라 소리가 맞습니다. 나누지도 빼지도 말고 set_finding_status(dismissed)로 닫습니다.
+  (b) 제목이 다른 곡(다른 제목, 보통 다른 아티스트)이면 다른 곡 차트가 이 곡의 같은 이름 키음(01.wav 등)으로 재생되던 경우라
+      소리가 틀립니다. remove_charts로 빼고 reason에 "다른 곡 키음으로 재생(원본 필요)"과 제목을 적습니다.
+  애매하면(제목이 비었거나 판단이 서지 않음) 빼지 말고 발견을 열어 둡니다. 잘못 뺐으면 restore_charts로 되돌립니다.
 - 원래 곡(폴더명과 맞는 묶음) 자체가 깨졌으면(키음이 거의 없음, 차트를 읽을 수 없음) delete_song level unused로 제외합니다.
   level deleted는 이미 제외한 곡을 지울 때만 씁니다.
 - 키음 팩 폴더에 여러 사람이 각자 BMS를 넣은 곡(모든 묶음이 같은 키음을 나눠 씀, 서로 제목이 다름)은 원래 곡 하나로 정할 수 없으니
@@ -237,10 +241,16 @@ TOOLS = [
     },
     {
         "name": "get_song",
-        "description": "등록된 곡 정보: 폴더명, 차트마다 sha256·경로·제목·아티스트·BPM·장르·키음 수, 파일 수와 크기.",
+        "description": (
+            "등록된 곡 정보: 폴더명, 차트마다 경로·제목·아티스트·키음 수, 파일 수와 크기. 응답을 짧게 하려고 같은 제목·아티스트는 "
+            "titles 표로 묶고 차트는 그 번호(t)만 줍니다. sha256·BPM·장르·차트 아닌 파일 목록은 detail=true일 때만."
+        ),
         "inputSchema": {
             "type": "object",
-            "properties": {"song_id": {"type": "integer"}},
+            "properties": {
+                "song_id": {"type": "integer"},
+                "detail": {"type": "boolean", "description": "sha256·bpm·genre·other_files까지(기본 false)"},
+            },
             "required": ["song_id"],
         },
         "admin": True,
@@ -321,6 +331,23 @@ TOOLS = [
             "properties": {
                 "song_id": {"type": "integer"},
                 "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 경로나 sha256"},
+                "reason": {"type": "string"},
+            },
+            "required": ["song_id", "charts", "reason"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "restore_charts",
+        "description": (
+            "remove_charts로 뺀 차트를 원본 없이 다시 붙입니다(바로 적용). 차트 저장소에 남은 내용을 원래 경로로 곡 zip에 넣습니다. "
+            "키음은 그 곡에 남아 있어야 합니다. 잘못 뺀 차트를 되돌릴 때 씁니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "song_id": {"type": "integer"},
+                "charts": {"type": "array", "items": {"type": "string"}, "description": "차트 sha256(remove_charts 결과의 detached)"},
                 "reason": {"type": "string"},
             },
             "required": ["song_id", "charts", "reason"],
@@ -798,19 +825,19 @@ def list_song_findings(kind: str = "", status: str = "open", limit: int = 50, of
     }
 
 
-def get_song(song_id: int) -> dict:
-    detail = _http(admin.get_song_detail, int(song_id))
+def get_song(song_id: int, detail: bool = False) -> dict:
+    song = _http(admin.get_song_detail, int(song_id))
     with db.connect() as con, con.cursor() as cur:
-        cur.execute("SELECT files FROM song WHERE id = %s", (detail["id"],))
+        cur.execute("SELECT files FROM song WHERE id = %s", (song["id"],))
         row = cur.fetchone()
         entries = {e["path"]: e for e in json.loads(row[0] or "[]")} if row else {}
         database = db.Database()
         charts = []
-        for chart in detail["charts"]:
+        for chart in song["charts"]:
             item = {"sha256": chart["sha256"], "path": chart["path"]}
             entry = entries.get(chart["path"])
             try:
-                content = database._read_song_member(cur, detail["id"], entry) if entry else None
+                content = database._read_song_member(cur, song["id"], entry) if entry else None
             except ValueError:
                 content = None
             if content is not None and hashlib.sha256(content).hexdigest() == chart["sha256"]:
@@ -822,12 +849,23 @@ def get_song(song_id: int) -> dict:
             else:
                 item["meta_error"] = "곡 zip에 차트 파일이 없습니다(차트 청크에만 있음)."
             charts.append(item)
-    others = [f["path"] for f in detail["files"] if "chart" not in f]
-    return {
-        "id": detail["id"], "folder": detail["folder"], "size": detail["size"], "charts": charts,
-        "file_count": len(detail["files"]), "other_files": others[:SONG_OTHER_FILES],
-        "other_files_more": max(0, len(others) - SONG_OTHER_FILES),
-    }
+    others = [f["path"] for f in song["files"] if "chart" not in f]
+    out = {"id": song["id"], "folder": song["folder"], "size": song["size"], "file_count": len(song["files"])}
+    if detail:
+        out.update(charts=charts, other_files=others[:SONG_OTHER_FILES], other_files_more=max(0, len(others) - SONG_OTHER_FILES))
+        return out
+    # 짧은 응답: 제목·아티스트 표 + 차트마다 [경로, 표 번호, 키음 수]. agy 등은 긴 응답을 파일로 빼서 셸로 읽으려다 멈춥니다.
+    titles: list[list[str]] = []
+    index: dict[tuple[str, str], int] = {}
+    rows = []
+    for c in charts:
+        key = (c.get("title", ""), c.get("artist", ""))
+        if key not in index:
+            index[key] = len(titles)
+            titles.append(list(key))
+        rows.append([c["path"], index[key], c.get("sounds")] + ([c["meta_error"]] if "meta_error" in c else []))
+    out.update(titles=titles, charts=rows, chart_format="[path, t(titles 번호), sounds(키음 수), (meta_error)]")
+    return out
 
 
 def compare_songs(songs: list[int], charts: dict | None = None) -> dict:
@@ -865,6 +903,10 @@ def remove_charts(user, song_id: int, charts: list[str], reason: str = "") -> di
     result = _http(admin.detach_charts, int(song_id), body, user)
     render_index.forget_songs([int(song_id)])
     return result
+
+
+def restore_charts(user, song_id: int, charts: list[str], reason: str = "") -> dict:
+    return _http(admin.attach_charts, int(song_id), [str(c) for c in charts], reason, user.id)
 
 
 def delete_song(user, song_id: int, reason: str = "", level: str = "unused") -> dict:
@@ -905,6 +947,7 @@ USER_HANDLERS = {
     "split_song": split_song,
     "merge_songs": merge_songs,
     "remove_charts": remove_charts,
+    "restore_charts": restore_charts,
     "delete_song": delete_song,
 }
 
@@ -953,7 +996,7 @@ def _call(request: Request, user, params: dict) -> dict:
     if name in USER_HANDLERS and not args.get("dry_run"):
         # 무엇을 왜 바꿨는지 나중에 되짚을 수 있게 결과 요약과 사유를 남깁니다.
         detail = {k: value[k] for k in ("song_id", "from", "merged_from", "level", "purged", "subfolder") if value.get(k) is not None}
-        for k in ("charts", "detached", "removed_files", "moved_files"):
+        for k in ("charts", "detached", "attached", "removed_files", "added_files", "moved_files"):
             if value.get(k):
                 detail[k] = ",".join(map(str, value[k]))
         if args.get("reason"):

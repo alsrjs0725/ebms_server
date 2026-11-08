@@ -168,15 +168,16 @@ AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) �
 | `get_sound_clip` | 관리자 | 키음 충돌의 기존·새 소리를 같은 구간(`start`초부터 `seconds`초, 기본 10초·최대 30초)으로 잘라 MCP content로 줍니다: 오디오(`audio/mpeg`, 192kbps)와 스펙트로그램(`image/png`). `audio`·`spectrogram`을 false로 하면 뺍니다. 오디오를 못 받는 모델은 스펙트로그램을 봅니다 |
 | `submit_recommendation` | 관리자 | 충돌 파일마다 `old`/`new`/`unsure` 추천(`confidence`, `reason`)과 곡 전체 판단(`summary`, `split_recommended`, `issues`, `model`)을 저장합니다 |
 | `list_song_findings` | 관리자 | 렌더 색인이 찾은 등록 곡 문제(`/api/admin/render/findings`와 같음). `kind`(`dup`/`mixed`), `status`(기본 `open`), `limit`(기본 50, 최대 200)·`offset`, 다음 쪽은 `next_offset` |
-| `get_song` | 관리자 | 곡 폴더명, 차트마다 `sha256`·`path`·`title`·`artist`·`bpm`·`genre`·`sounds`(키음 수), 파일 수와 차트 아닌 파일 앞 100개 |
+| `get_song` | 관리자 | 곡 폴더명·크기·파일 수와 차트. 기본은 짧은 응답(`titles` 제목·아티스트 표, `charts`는 `[경로, titles 번호, 키음 수]`)이고, `detail` true면 차트마다 `sha256`·`bpm`·`genre`와 차트 아닌 파일 앞 100개까지 줍니다. agy는 긴 응답을 파일로 빼서 셸로 읽으려다 멈추므로 기본을 짧게 둡니다 |
 | `compare_songs` · `get_compare_result` | 관리자 | 렌더 비교(`POST /api/admin/render/compare`) 시작 → `job_id`, 진행·결과(`groups`, `unrendered`) |
 | `split_song` | 관리자 | 곡 나누기(`POST /api/admin/songs/{id}/split`). **바로 적용** |
 | `merge_songs` | 관리자 | 곡 합치기(`POST /api/admin/songs/{id}/merge`). **바로 적용** |
 | `remove_charts` | 관리자 | 살릴 수 없는 차트 빼기(`POST /api/admin/songs/{id}/charts/detach`, 차트 경로나 sha256). **바로 적용** |
+| `restore_charts` | 관리자 | 잘못 뺀 차트 되살리기(`POST /api/admin/songs/{id}/charts/attach`). **바로 적용** |
 | `delete_song` | 관리자 | 곡 전체 내리기. `level` `unused`(제외, 기본: 파일 보관·재임포트 막음·복원 가능) / `deleted`(삭제, `POST .../purge`). **바로 적용** |
 | `set_finding_status` | 관리자 | 발견을 닫거나(`dismissed`) 다시 엶(`open`) |
 
-`split_song`·`merge_songs`·`remove_charts`·`delete_song`은 관리자 접속기록에 `action=mcp.split_song` 등으로 남습니다. 곡 정리 판단 기준(살릴 수 있는 묶음만 나누고 다른 곡 키음으로 재생되던 차트는 뺌, 키음 팩 폴더는 건드리지 않음 등)도 `instructions`에 있습니다.
+`split_song`·`merge_songs`·`remove_charts`·`delete_song`은 관리자 접속기록에 `action=mcp.split_song` 등으로 남습니다. 곡 정리 판단 기준(살릴 수 있는 묶음만 나누고, 전용 키음이 없는 묶음은 같은 곡 변형이면 닫고 제목이 다른 곡일 때만 뺌, 키음 팩 폴더는 건드리지 않음 등)도 `instructions`에 있습니다.
 
 추천은 묶음의 곡 정보(`unit.ai`)에 따로 저장하고 관리자가 고른 것(`resolutions`)은 바꾸지 않습니다. 충돌 해결 창에 파일마다 AI 추천과 이유가 보이고, **AI 추천대로 고르기**를 누르면 고르지 않은 파일 중 old·new로 추천된 것만 고릅니다(unsure는 직접 고름). 적용은 관리자가 합니다. 판단 기준은 `initialize` 응답의 `instructions`로 클라이언트에 알려 줍니다.
 
