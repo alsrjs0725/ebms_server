@@ -2534,6 +2534,79 @@ class Database:
         self.logger.info(f"purge_song: Song[{song_id}] deleted by {deleted_by}: {reason}")
         return True
 
+    def attach_charts(self, song_id: int, chart_ids: list[str], timeout: float | None = None) -> dict | None:
+        """detach_charts·remove_charts로 뗀 차트를 원본 없이 다시 곡에 붙입니다(잘못 뗀 차트 되살리기). 없는 곡이면 None.
+
+        뗀 차트는 차트 행(song_id 비어 있음)과 차트 청크에 남아 있으므로, 청크에서 내용을 꺼내 원래 경로(chart.filename)로
+        곡 zip에 다시 넣고 곡에 붙입니다. 키음은 곡 zip에 그대로 있어야 합니다(이 함수는 키음을 넣지 않음).
+        곡에 붙어 있거나 사용 중지 기록에 든 차트, 같은 경로에 다른 파일이 있는 차트는 ValueError.
+        {"attached": [sha256], "added_files": [경로]}를 반환합니다."""
+        wanted = sorted(set(chart_ids))
+        if not wanted:
+            raise ValueError("charts required")
+        self._lock(timeout)
+        try:
+            with connect() as con, con.cursor() as cur:
+                try:
+                    cur.execute("SELECT pre_chunk FROM song WHERE id = %s FOR UPDATE", (song_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    pre_chunk = row[0]
+                    rows = []
+                    for chart_id in wanted:
+                        cur.execute("SELECT id, size, filename, song_id FROM chart WHERE id = %s", (chart_id,))
+                        found = cur.fetchone()
+                        if found is None:
+                            raise ValueError(f"chart not found: {chart_id}")
+                        if found[3] is not None:
+                            raise ValueError(f"chart {chart_id} is attached to song {found[3]}")
+                        cur.execute("SELECT song_id FROM deleted_song WHERE chart_list LIKE %s AND purged_at IS NULL",
+                                    (f'%"{chart_id}"%',))
+                        unused = cur.fetchone()
+                        if unused is not None:
+                            raise ValueError(f"chart {chart_id} belongs to unused song {unused[0]}; restore that song")
+                        if not found[2]:
+                            raise ValueError(f"chart {chart_id} has no path")
+                        rows.append([found[0], found[1], found[2]])
+                    data = self._song_data(cur, song_id)
+                    if data is None:
+                        raise ValueError(f"song {song_id}: zip data not found")
+                    chart_data = self._song_charts(cur, song_id, data, rows)
+                    add = []
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        existing = {i.filename.rstrip("/").lower(): i for i in zf.infolist()}
+                        for chart_id, size, filename in rows:
+                            content = chart_data.get(chart_arcname(chart_id, pathlib.PurePosixPath(filename)))
+                            if content is None or hashlib.sha256(content).hexdigest() != chart_id:
+                                raise ValueError(f"chart {chart_id}: content not found in chart chunks")
+                            old = existing.get(filename.lower())
+                            if old is None:
+                                add.append((filename, content))
+                            elif old.is_dir() or zf.read(old) != content:
+                                raise ValueError(f"song {song_id} already has a different file at {filename}")
+                    if add:
+                        buf = io.BytesIO(data)
+                        with zipfile.ZipFile(buf, mode="a") as zf:
+                            for arcname, content in add:
+                                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                        self._update_song_zip(cur, song_id, buf.getvalue())
+                    for chart_id, _, _ in rows:
+                        cur.execute("UPDATE chart SET song_id = %s WHERE id = %s AND song_id IS NULL", (song_id, chart_id))
+                    self._rebuild_manifest_chunk(cur, song_id // constant.SONGS_PER_MANIFEST_CHUNK)
+                    if pre_chunk is not None:
+                        self._rebuild_pre_chunk(cur, pre_chunk)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+        finally:
+            self._write_lock.release()
+        preview.kick()
+        result = {"attached": wanted, "added_files": sorted(a for a, _ in add)}
+        self.logger.info(f"attach_charts: Song[{song_id}] {result}")
+        return result
+
     def deleted_reason(self, song_id: int) -> str | None:
         """지운 곡이면 삭제 사유(없으면 빈 문자열), 아니면 None."""
         with connect() as con, con.cursor() as cur:
