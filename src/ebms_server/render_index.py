@@ -101,15 +101,14 @@ def _song_row(song_id: int) -> tuple[list[dict], db.StoreFile | None]:
 
 
 def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
-    """곡 하나를 (다시) 색인하고 그 곡이 낀 중복·섞임을 찾습니다."""
+    """곡 하나를 (다시) 색인하고 그 곡이 낀 중복·섞임을 찾습니다.
+    렌더(곡 하나에 수 분)는 쓰기 전에 끝내고, 색인 파일 쓰기 잠금은 저장·검색하는 짧은 동안만 잡습니다.
+    (렌더 중 잠금을 잡으면 나누기·합치기 뒤 forget_songs, 임포트 지문 저장이 60초 기다리다 실패합니다.)"""
     files, file = _song_row(song_id)
     paths = [f["path"] for f in files if f["path"].lower().endswith(constant.BMS_FORMAT)]
-    _forget_song(con, song_id)
-    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
-    dups: dict[int, dict] = {}
     if paths and file is None:
         raise FileNotFoundError(f"song {song_id} file")
-    stored = 0
+    rendered: dict[str, render_match.Fingerprint | None] = {}
     if file is not None and paths:
         with os.fdopen(os.dup(file._fd), "rb") as raw, zipfile.ZipFile(raw) as zf:
             file.close()
@@ -118,17 +117,22 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
                 part = paths[start : start + 16]
                 fps = render_match.fingerprints(names, zf.read, part, nice=True)
                 for path in part:
-                    fp = fps.get(path)
-                    put = fingerprint.store(con, song_id, path, fp.features if fp else [])
-                    if put is None:
-                        continue
-                    _, feats, query = put
-                    found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
-                    for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
-                        if score is not None and score >= render_match.SAME and not found(other_song):
-                            dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
-                    stored += 1
-                    _group(groups, path, fp)
+                    rendered[path] = fps.get(path)
+    _forget_song(con, song_id)
+    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
+    dups: dict[int, dict] = {}
+    stored = 0
+    for path, fp in rendered.items():
+        put = fingerprint.store(con, song_id, path, fp.features if fp else [])
+        if put is None:
+            continue
+        _, feats, query = put
+        found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
+        for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
+            if score is not None and score >= render_match.SAME and not found(other_song):
+                dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
+        stored += 1
+        _group(groups, path, fp)
     for other, d in dups.items():
         a, b = sorted((song_id, other))
         _put_finding(con, "dup", a, b, round(d["score"], 3), d if a == song_id else
