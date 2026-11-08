@@ -305,3 +305,80 @@ def test_detach_all_and_merge(client, monkeypatch):
     assert commit(client, job)["songs"][0]["song_id"] == 1
     assert {c["sha256"] for c in client.get("/api/admin/songs/1").json()["charts"]} == {
         hashlib.sha256(b"#TITLE A\n").hexdigest(), sha_b}
+
+
+def test_split_song(client, monkeypatch):
+    """섞인 곡에서 차트를 새 곡으로 나누면 그 차트가 쓰는 키음도 같이 가고, 남는 차트도 쓰는 키음은 양쪽에 남습니다."""
+    admin_login(client, monkeypatch)
+    a = b"#TITLE A\n#WAV01 a.wav\n#WAV02 common.wav\n"
+    b = b"#TITLE B\n#WAV01 b.ogg\n#WAV02 common.ogg\n#BMP01 bg.png\n#STAGEFILE b_stage.jpg\n"
+    upload(client, "mixed.zip", make_zip({
+        "a.bms": a, "b.bms": b, "a.wav": b"a", "b.wav": b"b", "common.wav": b"c", "bg.png": b"p",
+        "b_stage.jpg": b"s", "readme.txt": b"r",
+    }))
+    sha_a, sha_b = (hashlib.sha256(c).hexdigest() for c in (a, b))
+
+    assert client.post("/api/admin/songs/1/split", json={"charts": ["a.bms", "b.bms"]}).status_code == 400
+    assert client.post("/api/admin/songs/1/split", json={"charts": ["x.bms"]}).status_code == 400
+    assert client.post("/api/admin/songs/9/split", json={"charts": ["b.bms"]}).status_code == 404
+    # dry_run은 바꾸지 않습니다.
+    dry = client.post("/api/admin/songs/1/split", json={"charts": [sha_b], "dry_run": True}).json()
+    assert dry["dry_run"] is True and dry["song_id"] is None and dry["moved_files"] == ["b.wav", "b_stage.jpg", "bg.png"]
+    assert client.get("/api/admin/songs/2").status_code == 404
+    # 차트 경로(대소문자 무시)나 sha256으로 고릅니다.
+    r = client.post("/api/admin/songs/1/split", json={"charts": ["B.BMS"], "folder": "B song"})
+    assert r.status_code == 200
+    result = r.json()
+    assert result == {
+        "song_id": 2, "from": 1, "charts": [sha_b],
+        "moved_files": ["b.wav", "b_stage.jpg", "bg.png"], "copied_files": ["common.wav"], "shared_only": False,
+    }
+    old = client.get("/api/admin/songs/1").json()
+    new = client.get("/api/admin/songs/2").json()
+    assert {f["path"] for f in old["files"]} == {"a.bms", "a.wav", "common.wav", "readme.txt"}
+    assert {f["path"] for f in new["files"]} == {"b.bms", "b.wav", "common.wav", "bg.png", "b_stage.jpg"}
+    assert [c["sha256"] for c in old["charts"]] == [sha_a] and [c["sha256"] for c in new["charts"]] == [sha_b]
+    assert new["folder"] == "B song"
+    assert {s["song_id"]: s["charts"] for s in manifest_songs()} == {1: [sha_a], 2: [sha_b]}
+    assert client.get("/api/admin/songs/2/file", params={"path": "b.wav"}).content == b"b"
+
+    # 되돌리기: 나눈 곡을 다시 합칩니다(같은 경로 같은 내용은 하나만).
+    r = client.post("/api/admin/songs/1/merge", json={"source": 2})
+    assert r.status_code == 200
+    assert r.json()["subfolder"] is None and r.json()["added_files"] == ["b.bms", "b.wav", "b_stage.jpg", "bg.png"]
+    song = client.get("/api/admin/songs/1").json()
+    assert {c["sha256"] for c in song["charts"]} == {sha_a, sha_b}
+    assert client.get("/api/admin/songs/2").status_code == 404
+    assert [s["song_id"] for s in manifest_songs()] == [1]
+
+
+def test_merge_songs_conflict_subfolder(client, monkeypatch):
+    """같은 경로에 내용이 다른 파일이 있으면 합칠 곡 전체를 하위 폴더에 넣어 원래 키음으로 재생되게 합니다."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"a.bms": b"#TITLE A\n#WAV01 01.ogg\n", "01.ogg": b"a"}))
+    job = stage(client, "b.zip", make_zip({"b.bms": b"#TITLE A2\n#WAV01 01.ogg\n", "01.ogg": b"other"}))
+    unit = client.get(f"/api/admin/import/stages/{job['stage_id']}").json()["items"][0]
+    client.put(f"/api/admin/import/stages/{job['stage_id']}/units/{unit['id']}", json={"target": "new"})
+    assert commit(client, job)["songs"][0]["song_id"] == 2
+    folder = client.get("/api/admin/songs/2").json()["folder"]
+
+    assert client.post("/api/admin/songs/1/merge", json={"source": 1}).status_code == 400
+    assert client.post("/api/admin/songs/1/merge", json={"source": 9}).status_code == 404
+    r = client.post("/api/admin/songs/1/merge", json={"source": 2, "reason": "같은 곡"})
+    assert r.status_code == 200 and r.json()["subfolder"] == folder
+    song = client.get("/api/admin/songs/1").json()
+    assert {f["path"] for f in song["files"]} == {"a.bms", "01.ogg", f"{folder}/b.bms", f"{folder}/01.ogg"}
+    assert {c["path"] for c in song["charts"]} == {"a.bms", f"{folder}/b.bms"}
+    assert client.get("/api/admin/songs/1/file", params={"path": f"{folder}/01.ogg"}).content == b"other"
+    deleted = client.get("/api/admin/songs/deleted").json()["items"]
+    assert [(d["song_id"], d["reason"]) for d in deleted] == [(2, "같은 곡")]
+    # 차트가 다른 곡에 있으므로 복원은 409
+    assert client.post("/api/admin/songs/2/restore").status_code == 409
+
+
+def test_split_shared_only(client, monkeypatch):
+    """다른 곡 차트가 이 곡의 같은 이름 키음으로 재생되던 경우: 옮길 차트만 쓰는 키음이 없어 shared_only."""
+    admin_login(client, monkeypatch)
+    upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
+    dry = client.post("/api/admin/songs/1/split", json={"charts": ["o.bms"], "dry_run": True}).json()
+    assert dry["shared_only"] is True and dry["moved_files"] == [] and dry["copied_files"] == ["01.wav"]

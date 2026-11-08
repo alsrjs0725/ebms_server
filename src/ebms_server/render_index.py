@@ -72,6 +72,20 @@ def _forget_song(con: sqlite3.Connection, song_id: int) -> None:
     con.execute("DELETE FROM finding WHERE status = 'open' AND (song_a = ? OR song_b = ?)", (song_id, song_id))
 
 
+def forget_songs(song_ids: list[int]) -> None:
+    """곡을 나누거나 합친 뒤 그 곡들의 색인과 열린 발견을 지웁니다. 다음 색인 회차에 새 곡처럼 먼저 다시 색인합니다."""
+    if not _path().exists():
+        return
+    con = connect()
+    try:
+        for song_id in song_ids:
+            _forget_song(con, song_id)
+        con.commit()
+    except sqlite3.Error:
+        logger.exception(f"render index forget failed[songs {song_ids}]")
+    finally:
+        con.close()
+
 def _song_row(song_id: int) -> tuple[list[dict], db.StoreFile | None]:
     """곡 zip의 파일 목록과 연 저장소 파일. 색인 프로세스에서 db.Database()(시작 작업이 무거움)를 만들지 않으려고 직접 읽습니다."""
     with db.connect() as con, con.cursor() as cur:

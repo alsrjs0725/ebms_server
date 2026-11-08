@@ -517,6 +517,71 @@ def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depend
     return result
 
 
+class SongSplit(BaseModel):
+    # 새 곡으로 옮길 차트(sha256이나 곡 zip 안 차트 경로)
+    charts: list[str]
+    # 새 곡 폴더명. 없으면 원래 곡 폴더명
+    folder: str = ""
+    # 바꾸지 않고 결과(옮길·복사할 파일, shared_only)만 봅니다.
+    dry_run: bool = False
+
+
+class SongMerge(BaseModel):
+    # 이 곡에 합칠(합친 뒤 사용 중지할) 곡 번호
+    source: int
+    reason: str = ""
+
+
+def split_song(song_id: int, charts: list[str], folder: str, admin_id: str, dry_run: bool = False) -> dict:
+    """곡 나누기(db.split_song). 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    try:
+        result = db.Database().split_song(song_id, charts, folder, timeout=DELETE_LOCK_TIMEOUT, dry_run=dry_run)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    if dry_run:
+        return result
+    render_index.forget_songs([song_id, result["song_id"]])
+    logger.info(f"song {song_id} split by {admin_id}: {result}")
+    return result
+
+
+def merge_songs(song_id: int, source: int, reason: str, admin_id: str) -> dict:
+    """곡 합치기(db.merge_songs). 관리자 API와 MCP가 같이 씁니다."""
+    from . import render_index
+
+    reason = reason.strip()
+    if len(reason) > REASON_MAX:
+        raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
+    try:
+        result = db.Database().merge_songs(song_id, source, reason, admin_id, timeout=DELETE_LOCK_TIMEOUT)
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    render_index.forget_songs([song_id, source])
+    logger.info(f"song {source} merged into {song_id} by {admin_id}: {result}")
+    return result
+
+
+@router.post("/api/admin/songs/{song_id}/split")
+def api_split_song(song_id: int, body: SongSplit, admin: Annotated[User, Depends(web_admin)]):
+    """곡에서 차트 몇 개를 새 곡으로 나눕니다(다른 곡 차트가 섞인 곡). 차트가 쓰는 키음·BGA도 같이 옮기거나 복사합니다."""
+    return split_song(song_id, body.charts, body.folder, admin.id, body.dry_run)
+
+
+@router.post("/api/admin/songs/{song_id}/merge")
+def api_merge_songs(song_id: int, body: SongMerge, admin: Annotated[User, Depends(web_admin)]):
+    """다른 곡(source)을 이 곡에 합치고 source를 사용 중지합니다(같은 곡이 두 번호로 나뉜 경우)."""
+    return merge_songs(song_id, body.source, body.reason, admin.id)
+
 class RenderCompare(BaseModel):
     songs: list[int]
     # 곡 id → 볼 차트 경로들. 없는 곡은 모든 차트

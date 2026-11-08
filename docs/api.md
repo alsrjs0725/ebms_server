@@ -167,6 +167,14 @@ AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) �
 | `get_file_diff` | 관리자 | 텍스트 충돌 파일의 전체 diff(최대 2000줄) |
 | `get_sound_clip` | 관리자 | 키음 충돌의 기존·새 소리를 같은 구간(`start`초부터 `seconds`초, 기본 10초·최대 30초)으로 잘라 MCP content로 줍니다: 오디오(`audio/mpeg`, 192kbps)와 스펙트로그램(`image/png`). `audio`·`spectrogram`을 false로 하면 뺍니다. 오디오를 못 받는 모델은 스펙트로그램을 봅니다 |
 | `submit_recommendation` | 관리자 | 충돌 파일마다 `old`/`new`/`unsure` 추천(`confidence`, `reason`)과 곡 전체 판단(`summary`, `split_recommended`, `issues`, `model`)을 저장합니다 |
+| `list_song_findings` | 관리자 | 렌더 색인이 찾은 등록 곡 문제(`/api/admin/render/findings`와 같음). `kind`(`dup`/`mixed`), `status`(기본 `open`), `limit`(기본 50, 최대 200)·`offset`, 다음 쪽은 `next_offset` |
+| `get_song` | 관리자 | 곡 폴더명, 차트마다 `sha256`·`path`·`title`·`artist`·`bpm`·`genre`·`sounds`(키음 수), 파일 수와 차트 아닌 파일 앞 100개 |
+| `compare_songs` · `get_compare_result` | 관리자 | 렌더 비교(`POST /api/admin/render/compare`) 시작 → `job_id`, 진행·결과(`groups`, `unrendered`) |
+| `split_song` | 관리자 | 곡 나누기(`POST /api/admin/songs/{id}/split`). **바로 적용** |
+| `merge_songs` | 관리자 | 곡 합치기(`POST /api/admin/songs/{id}/merge`). **바로 적용** |
+| `set_finding_status` | 관리자 | 발견을 닫거나(`dismissed`) 다시 엶(`open`) |
+
+`split_song`·`merge_songs`는 관리자 접속기록에 `action=mcp.split_song` 등으로 남습니다. 곡 정리 판단 기준(섞임은 제목·아티스트가 다른 묶음만 나누고, 애매하면 그대로 둠 등)도 `instructions`에 있습니다.
 
 추천은 묶음의 곡 정보(`unit.ai`)에 따로 저장하고 관리자가 고른 것(`resolutions`)은 바꾸지 않습니다. 충돌 해결 창에 파일마다 AI 추천과 이유가 보이고, **AI 추천대로 고르기**를 누르면 고르지 않은 파일 중 old·new로 추천된 것만 고릅니다(unsure는 직접 고름). 적용은 관리자가 합니다. 판단 기준은 `initialize` 응답의 `instructions`로 클라이언트에 알려 줍니다.
 
