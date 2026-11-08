@@ -43,7 +43,9 @@ def test_user_sees_only_user_tools(client, monkeypatch):
     api = TestClient(client.app)
     tools = {t["name"] for t in rpc(api, token, "tools/list")["result"]["tools"]}
     assert tools == {"whoami"}
-    assert call(api, token, "whoami")["role"] == "user"
+    me = call(api, token, "whoami")
+    assert me["role"] == "user"
+    assert me["server"].startswith("http")
     denied = rpc(api, token, "tools/call", {"name": "list_conflict_units", "arguments": {}})
     assert denied["error"]["code"] == -32003
 
