@@ -185,3 +185,5 @@ agy 등록 예(관리자 API 키는 관리자 페이지의 API 키에서 만듭�
 ```
 agy mcp add --header "Authorization: Bearer ebms_ak_..." ebms https://<서버 주소>/api/mcp
 ```
+
+agy는 서버 `instructions`를 `~/.gemini/antigravity-cli/mcp/<서버 이름>/instructions.md` 파일로 두고 모델이 읽게 합니다. 비대화(`agy -p`)로 돌릴 때는 프롬프트에 서버 이름(예: "ebms MCP 서버의 instructions대로")을 넣고, 권한에 `mcp(ebms/*)`와 그 폴더의 `read_file`(필요하면 `command(ls)`)을 허용해야 합니다. 그렇지 않으면 지침을 못 읽고 바로 끝납니다.

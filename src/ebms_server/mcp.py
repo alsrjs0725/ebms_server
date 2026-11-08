@@ -951,8 +951,14 @@ def _call(request: Request, user, params: dict) -> dict:
     if isinstance(value, Content):
         return {"content": list(value)}
     if name in USER_HANDLERS and not args.get("dry_run"):
-        audit.record(request, user.id, f"mcp.{name}", str(args.get("song_id")),
-                     **{k: value[k] for k in ("song_id", "from", "merged_from") if k in value})
+        # 무엇을 왜 바꿨는지 나중에 되짚을 수 있게 결과 요약과 사유를 남깁니다.
+        detail = {k: value[k] for k in ("song_id", "from", "merged_from", "level", "purged", "subfolder") if value.get(k) is not None}
+        for k in ("charts", "detached", "removed_files", "moved_files"):
+            if value.get(k):
+                detail[k] = ",".join(map(str, value[k]))
+        if args.get("reason"):
+            detail["reason"] = args["reason"]
+        audit.record(request, user.id, f"mcp.{name}", str(args.get("song_id")), **detail)
     if name == "submit_recommendation":
         # 접속기록은 ebms.log에도 같은 줄이 남습니다.
         audit.record(request, user.id, "mcp.recommend", f"{args.get('stage_id')}/{args.get('unit_id')}", saved=value["saved"])

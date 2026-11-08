@@ -539,7 +539,7 @@ def detach_charts(song_id: int, body: ChartDetach, admin: Annotated[User, Depend
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
         raise HTTPException(status_code=404, detail="song not found")
-    logger.info(f"song {song_id} charts detached by {admin.id}: {result}")
+    logger.info(f"song {song_id} charts detached by {admin.id}: {result} reason={reason!r}")
     return result
 
 

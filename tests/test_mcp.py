@@ -210,7 +210,7 @@ def test_song_cleanup_tools(client, monkeypatch):
     assert call(api, key, "list_song_findings")["findings"] == []
 
 
-def test_remove_and_delete_tools(client, monkeypatch):
+def test_remove_and_delete_tools(client, monkeypatch, caplog):
     """살릴 수 없는 차트는 빼고, 곡 전체는 제외 → 삭제."""
     admin_login(client, monkeypatch)
     key = create_key(client)
@@ -218,7 +218,11 @@ def test_remove_and_delete_tools(client, monkeypatch):
     upload(client, "q.zip", make_zip({"q.bms": b"#TITLE Q\n#WAV01 01.wav\n", "o.bms": b"#TITLE O\n#WAV01 01.wav\n", "01.wav": b"q"}))
     dry = call(api, key, "split_song", song_id=1, charts=["o.bms"], dry_run=True)
     assert dry["shared_only"] is True and call(api, key, "get_song", song_id=1)["charts"][1]["path"] == "q.bms"
-    removed = call(api, key, "remove_charts", song_id=1, charts=["O.BMS"], reason="다른 곡 키음")
+    with caplog.at_level("INFO", logger="ebms_server.audit"):
+        removed = call(api, key, "remove_charts", song_id=1, charts=["O.BMS"], reason="다른 곡 키음")
+    # 사유와 뺀 파일이 접속기록에 남습니다.
+    assert any("action=mcp.remove_charts" in r.message and "removed_files=o.bms" in r.message and "다른 곡 키음" in r.message
+               for r in caplog.records)
     assert removed["removed_files"] == ["o.bms"]
     assert [c["path"] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["q.bms"]
 
