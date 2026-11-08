@@ -314,7 +314,8 @@ def status_() -> dict:
             out.update(json.loads(row[0]) if row else {})
             out["indexed_songs"] = con.execute("SELECT COUNT(*) FROM song").fetchone()[0]
             out["indexed_charts"] = con.execute("SELECT COUNT(*) FROM chart").fetchone()[0]
-            out["open_findings"] = con.execute("SELECT COUNT(*) FROM finding WHERE status = 'open'").fetchone()[0]
+            sql, args = _skip_stale(con, "SELECT COUNT(*) FROM finding WHERE status = 'open'", [])
+            out["open_findings"] = con.execute(sql, args).fetchone()[0]
         finally:
             con.close()
     if not out["running"]:
@@ -373,6 +374,8 @@ def findings(state: str = "open", kind: str = "", limit: int = 200, offset: int 
         if kind:
             sql += " AND kind = ?"
             args.append(kind)
+        if state == "open":
+            sql, args = _skip_stale(con, sql, args)
         rows = con.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
     finally:
         con.close()
@@ -393,9 +396,31 @@ def count_findings(state: str = "open") -> int:
         return 0
     con = connect()
     try:
-        return con.execute("SELECT COUNT(*) FROM finding WHERE status = ?", (state,)).fetchone()[0]
+        sql, args = "SELECT COUNT(*) FROM finding WHERE status = ?", [state]
+        if state == "open":
+            sql, args = _skip_stale(con, sql, args)
+        return con.execute(sql, args).fetchone()[0]
     finally:
         con.close()
+
+
+def _stale_songs(con: sqlite3.Connection) -> list[int]:
+    """색인한 뒤 내용이 바뀌었거나 없어진 곡. 나누기·합치기 직후 forget_songs가 색인 잠금으로 실패해도
+    그 곡의 옛 발견을 감추고, 다음 색인 회차(changed)에서 다시 검사합니다."""
+    known = fingerprint.songs(con)
+    if not known:
+        return []
+    live = _live_songs()
+    return sorted(s for s, sha in known.items() if live.get(s) != sha)
+
+
+def _skip_stale(con: sqlite3.Connection, sql: str, args: list) -> tuple[str, list]:
+    stale = _stale_songs(con)
+    if not stale or len(stale) > 10000:  # SQLite 인자 수 한도
+        return sql, args
+    marks = ", ".join("?" * len(stale))
+    sql += f" AND song_a NOT IN ({marks}) AND song_b NOT IN ({marks})"
+    return sql, [*args, *stale, *stale]
 
 
 def _folders(song_ids: set[int]) -> dict[int, str]:
