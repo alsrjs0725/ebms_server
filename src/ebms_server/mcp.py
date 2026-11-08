@@ -29,7 +29,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import admin, audit, auth, conflicts, db, importer, media_match, preview, render_check, staging
+from . import admin, audit, auth, conflicts, constant, db, importer, media_match, preview, render_check, staging
 from .staging import StageError
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,8 @@ SPECTRUM_SIZE = "640x240"
 CLIP_TIMEOUT = 120
 
 INSTRUCTIONS = """\
+먼저 whoami를 불러 server가 작업하려는 서버 주소인지 확인하세요. 다르면 아무것도 바꾸지 말고 멈춥니다.
+
 EBMS 곡 임포트에서 기존 곡에 병합하려다 같은 경로에 내용이 다른 파일이 있어 멈춘 곡(충돌)을 판단합니다.
 파일마다 old(기존 곡 파일 유지)·new(새 파일로 바꿈)·unsure(사람이 봐야 함) 중 하나를 추천하고 submit_recommendation으로 남깁니다.
 추천은 저장만 되고 바로 적용되지 않습니다. 관리자가 화면에서 확인한 뒤 적용합니다.
@@ -118,7 +120,7 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
 TOOLS = [
     {
         "name": "whoami",
-        "description": "이 연결의 사용자(닉네임, 권한: user/admin).",
+        "description": "이 연결의 서버 주소(server)와 사용자(닉네임, 권한: user/admin).",
         "inputSchema": {"type": "object", "properties": {}},
         "admin": False,
     },
@@ -793,7 +795,12 @@ def submit_recommendation(
 
 
 def whoami(user) -> dict:
-    return {"id": user.id, "nickname": user.display_name, "role": "admin" if user.is_admin else "user"}
+    return {
+        "server": constant.PUBLIC_URL,
+        "id": user.id,
+        "nickname": user.display_name,
+        "role": "admin" if user.is_admin else "user",
+    }
 
 
 # ---- 등록된 곡 정리 ----
