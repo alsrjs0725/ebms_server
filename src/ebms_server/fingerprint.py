@@ -205,18 +205,31 @@ def candidates(con: sqlite3.Connection, query: list[tuple[int, int]], song_id: i
     return out[:MAX_CANDIDATES]
 
 
-def store(con: sqlite3.Connection, song_id: int, path: str, features: list[np.ndarray]) -> tuple[int, list[np.ndarray], list[tuple[int, int]]] | None:
-    """차트 특징(분기별)을 저장하고 해시를 색인에 넣습니다. 커밋은 부르는 쪽이 합니다.
-    (차트 id, 저장한 그대로(양자화된) 특징, 질의 해시) 또는 저장할 특징이 없으면 None."""
+def prepare(features: list[np.ndarray]) -> tuple[bytes, list[np.ndarray], list[tuple[int, int]]] | None:
+    """저장할 형태로 바꿉니다: (저장할 blob, 저장한 그대로(양자화된) 특징, 질의 해시). 저장할 특징이 없으면 None."""
     feats = [f for f in features if len(f)][:MAX_STORED_VARIANTS]
     if not feats:
         return None
     blob = variants_blob(feats)
     feats = variants(blob)  # 저장한 그대로(양자화된 값)로 비교합니다.
+    return blob, feats, sorted({hv for f in feats for hv in hashes(f)})
+
+
+def store_prepared(con: sqlite3.Connection, song_id: int, path: str, prepared: tuple[bytes, list[np.ndarray], list[tuple[int, int]]]) -> int:
+    """prepare()한 차트 특징을 저장합니다. 커밋은 부르는 쪽이 합니다. 차트 id."""
+    blob, _, query = prepared
     chart_id = con.execute("INSERT INTO chart(song_id, path, features) VALUES (?, ?, ?)", (song_id, path, blob)).lastrowid
-    query = sorted({hv for f in feats for hv in hashes(f)})
     con.executemany("INSERT OR IGNORE INTO hash(h, chart, t) VALUES (?, ?, ?)", [(h, chart_id, t) for h, t in query])
-    return chart_id, feats, query
+    return chart_id
+
+
+def store(con: sqlite3.Connection, song_id: int, path: str, features: list[np.ndarray]) -> tuple[int, list[np.ndarray], list[tuple[int, int]]] | None:
+    """차트 특징(분기별)을 저장하고 해시를 색인에 넣습니다. 커밋은 부르는 쪽이 합니다.
+    (차트 id, 저장한 그대로(양자화된) 특징, 질의 해시) 또는 저장할 특징이 없으면 None."""
+    prepared = prepare(features)
+    if prepared is None:
+        return None
+    return store_prepared(con, song_id, path, prepared), prepared[1], prepared[2]
 
 
 def search(
@@ -278,8 +291,16 @@ def songs(con: sqlite3.Connection) -> dict[int, str]:
     return dict(con.execute("SELECT id, sha256 FROM song").fetchall())
 
 
+HASH_BITS = 27  # hashes(): 대역 5비트×3 + 간격 6비트×2
+COMPACT_STEP = 1 << 19  # 한 번에 지울 해시 범위(256조각). 조각마다 커밋해 쓰기 잠금을 짧게 잡습니다.
+
+
 def compact(con: sqlite3.Connection) -> int:
-    """지운 차트의 해시를 지웁니다."""
-    n = con.execute("DELETE FROM hash WHERE chart NOT IN (SELECT id FROM chart)").rowcount
-    con.commit()
+    """지운 차트의 해시를 지웁니다. 표 전체를 훑으므로 해시 범위 조각마다 커밋합니다."""
+    n = 0
+    for start in range(0, 1 << HASH_BITS, COMPACT_STEP):
+        n += con.execute(
+            "DELETE FROM hash WHERE h >= ? AND h < ? AND chart NOT IN (SELECT id FROM chart)", (start, start + COMPACT_STEP)
+        ).rowcount
+        con.commit()
     return n
