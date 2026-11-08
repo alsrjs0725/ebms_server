@@ -194,6 +194,15 @@ def test_song_cleanup_tools(client, monkeypatch):
     con.close()
     found = call(api, key, "list_song_findings", kind="mixed")["findings"]
     assert [(f["kind"], f["song_a"]) for f in found] == [("mixed", 1)]
+    # 색인한 뒤 곡이 바뀌면(forget이 잠금으로 실패한 경우) 옛 발견은 감춥니다.
+    con = render_index.connect()
+    render_index.fingerprint.mark_song(con, 1, "old", 2)
+    con.commit()
+    assert call(api, key, "list_song_findings")["findings"] == []
+    assert render_index.count_findings("open") == 0
+    con.execute("DELETE FROM song")
+    con.commit()
+    con.close()
     brief = call(api, key, "list_song_findings", brief=True)["findings"]
     assert brief == [{"id": found[0]["id"], "kind": "mixed", "song_a": 1, "folder_a": found[0]["folder_a"],
                       "groups": [[1, "a.bms"], [1, "b.bms"]]}]

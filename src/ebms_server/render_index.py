@@ -101,15 +101,14 @@ def _song_row(song_id: int) -> tuple[list[dict], db.StoreFile | None]:
 
 
 def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
-    """곡 하나를 (다시) 색인하고 그 곡이 낀 중복·섞임을 찾습니다."""
+    """곡 하나를 (다시) 색인하고 그 곡이 낀 중복·섞임을 찾습니다.
+    렌더(곡 하나에 수 분)는 쓰기 전에 끝내고, 색인 파일 쓰기 잠금은 저장·검색하는 짧은 동안만 잡습니다.
+    (렌더 중 잠금을 잡으면 나누기·합치기 뒤 forget_songs, 임포트 지문 저장이 60초 기다리다 실패합니다.)"""
     files, file = _song_row(song_id)
     paths = [f["path"] for f in files if f["path"].lower().endswith(constant.BMS_FORMAT)]
-    _forget_song(con, song_id)
-    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
-    dups: dict[int, dict] = {}
     if paths and file is None:
         raise FileNotFoundError(f"song {song_id} file")
-    stored = 0
+    rendered: dict[str, render_match.Fingerprint | None] = {}
     if file is not None and paths:
         with os.fdopen(os.dup(file._fd), "rb") as raw, zipfile.ZipFile(raw) as zf:
             file.close()
@@ -118,17 +117,22 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
                 part = paths[start : start + 16]
                 fps = render_match.fingerprints(names, zf.read, part, nice=True)
                 for path in part:
-                    fp = fps.get(path)
-                    put = fingerprint.store(con, song_id, path, fp.features if fp else [])
-                    if put is None:
-                        continue
-                    _, feats, query = put
-                    found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
-                    for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
-                        if score is not None and score >= render_match.SAME and not found(other_song):
-                            dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
-                    stored += 1
-                    _group(groups, path, fp)
+                    rendered[path] = fps.get(path)
+    _forget_song(con, song_id)
+    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
+    dups: dict[int, dict] = {}
+    stored = 0
+    for path, fp in rendered.items():
+        put = fingerprint.store(con, song_id, path, fp.features if fp else [])
+        if put is None:
+            continue
+        _, feats, query = put
+        found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
+        for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
+            if score is not None and score >= render_match.SAME and not found(other_song):
+                dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
+        stored += 1
+        _group(groups, path, fp)
     for other, d in dups.items():
         a, b = sorted((song_id, other))
         _put_finding(con, "dup", a, b, round(d["score"], 3), d if a == song_id else
@@ -314,7 +318,8 @@ def status_() -> dict:
             out.update(json.loads(row[0]) if row else {})
             out["indexed_songs"] = con.execute("SELECT COUNT(*) FROM song").fetchone()[0]
             out["indexed_charts"] = con.execute("SELECT COUNT(*) FROM chart").fetchone()[0]
-            out["open_findings"] = con.execute("SELECT COUNT(*) FROM finding WHERE status = 'open'").fetchone()[0]
+            sql, args = _skip_stale(con, "SELECT COUNT(*) FROM finding WHERE status = 'open'", [])
+            out["open_findings"] = con.execute(sql, args).fetchone()[0]
         finally:
             con.close()
     if not out["running"]:
@@ -373,6 +378,8 @@ def findings(state: str = "open", kind: str = "", limit: int = 200, offset: int 
         if kind:
             sql += " AND kind = ?"
             args.append(kind)
+        if state == "open":
+            sql, args = _skip_stale(con, sql, args)
         rows = con.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
     finally:
         con.close()
@@ -393,9 +400,31 @@ def count_findings(state: str = "open") -> int:
         return 0
     con = connect()
     try:
-        return con.execute("SELECT COUNT(*) FROM finding WHERE status = ?", (state,)).fetchone()[0]
+        sql, args = "SELECT COUNT(*) FROM finding WHERE status = ?", [state]
+        if state == "open":
+            sql, args = _skip_stale(con, sql, args)
+        return con.execute(sql, args).fetchone()[0]
     finally:
         con.close()
+
+
+def _stale_songs(con: sqlite3.Connection) -> list[int]:
+    """색인한 뒤 내용이 바뀌었거나 없어진 곡. 나누기·합치기 직후 forget_songs가 색인 잠금으로 실패해도
+    그 곡의 옛 발견을 감추고, 다음 색인 회차(changed)에서 다시 검사합니다."""
+    known = fingerprint.songs(con)
+    if not known:
+        return []
+    live = _live_songs()
+    return sorted(s for s, sha in known.items() if live.get(s) != sha)
+
+
+def _skip_stale(con: sqlite3.Connection, sql: str, args: list) -> tuple[str, list]:
+    stale = _stale_songs(con)
+    if not stale or len(stale) > 10000:  # SQLite 인자 수 한도
+        return sql, args
+    marks = ", ".join("?" * len(stale))
+    sql += f" AND song_a NOT IN ({marks}) AND song_b NOT IN ({marks})"
+    return sql, [*args, *stale, *stale]
 
 
 def _folders(song_ids: set[int]) -> dict[int, str]:
