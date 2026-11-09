@@ -1,4 +1,4 @@
-"""차트 렌더 비교(render_match) 테스트: 분기, 끝나지 않는 차트, 일치율."""
+"""차트 렌더 비교(render_match) 테스트: 분기 고정, 끝나지 않는 차트, 일치율."""
 import shutil
 import subprocess
 import time
@@ -11,43 +11,14 @@ from ebms_server import preview, render_match
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 
-def lines_of(chart: bytes) -> list[bytes]:
-    return preview._bms_lines(chart)
-
-
-def test_branch_charts_cover_every_body():
+def test_random_uses_first_branch_only():
+    # 분기는 따로 렌더하지 않고 미리듣기처럼 #RANDOM을 1로 고정합니다(#IF 1 본문만 울림).
     chart = (
-        b"#WAV01 a.wav\n"
-        b"#RANDOM 3\n"
-        b"#IF 1\n#00101:01\n"
-        b"#ELSEIF 2\n#00201:01\n"
-        b"#ELSE\n#00301:01\n"
-        b"#ENDIF\n#ENDRANDOM\n"
-        # 바깥 2일 때만 들어가는 안쪽 분기
-        b"#RANDOM 2\n#IF 2\n#RANDOM 4\n#IF 4\n#00401:01\n#ENDIF\n#ENDRANDOM\n#ENDIF\n#ENDRANDOM\n"
-        # 갈 수 없는 분기(#RANDOM 범위 밖, 고정값과 다름)
-        b"#RANDOM 2\n#IF 5\n#00501:01\n#ENDIF\n#ENDRANDOM\n"
-        b"#SETRANDOM 1\n#IF 2\n#00601:01\n#ENDIF\n"
+        b"#BPM 120\n#WAV01 a.wav\n#WAV02 b.wav\n"
+        b"#RANDOM 2\n#IF 1\n#00101:01\n#ELSE\n#00101:02\n#ENDIF\n#ENDRANDOM\n"
     )
-    texts, truncated = render_match.branch_charts(chart)
-    assert not truncated
-    seen = set()
-    for text in texts:
-        seen |= {line[:6] for line in lines_of(text) if line[:6] in (b"#00101", b"#00201", b"#00301", b"#00401", b"#00501", b"#00601")}
-    assert seen == {b"#00101", b"#00201", b"#00301", b"#00401"}
-    # 결과가 같은 차트는 하나만
-    assert len({tuple(lines_of(t)) for t in texts}) == len(texts)
-
-
-def test_branch_charts_limit():
-    chart = b"#WAV01 a.wav\n#RANDOM 100\n" + b"".join(b"#IF %d\n#%03d01:01\n#ENDIF\n" % (i, i) for i in range(1, 101)) + b"#ENDRANDOM\n"
-    texts, truncated = render_match.branch_charts(chart, limit=10)
-    assert len(texts) == 10 and truncated
-
-
-def test_no_random_is_one_chart():
-    chart = b"#WAV01 a.wav\n#00101:01\n"
-    assert render_match.branch_charts(chart) == ([chart], False)
+    sounds, truncated = render_match._sounds(chart)
+    assert not truncated and [s.name for s in sounds] == ["a.wav"]
 
 
 def test_endless_chart_is_clipped():
