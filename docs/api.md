@@ -176,6 +176,13 @@ AI 클라이언트(agy, Claude 등)용 [MCP](https://modelcontextprotocol.io) �
 | `restore_charts` | 관리자 | 잘못 뺀 차트 되살리기(`POST /api/admin/songs/{id}/charts/attach`). **바로 적용** |
 | `delete_song` | 관리자 | 곡 전체 내리기. `level` `unused`(제외, 기본: 파일 보관·재임포트 막음·복원 가능) / `deleted`(삭제, `POST .../purge`). **바로 적용** |
 | `set_finding_status` | 관리자 | 발견을 닫거나(`dismissed`) 다시 엶(`open`) |
+| `preview_split` | 관리자 | `split_song` 미리보기(읽기 전용, 판단 에이전트용) |
+| `list_import_stages` | 관리자 | 임포트 대기 묶음 목록과 판정별 곡 수 |
+| `list_import_units` | 관리자 | 대기 곡 짧은 목록(판정·후보 곡·렌더 일치율), `show`로 거르기 |
+| `get_import_unit` | 관리자 | 대기 곡 하나의 차트·판정·지난 commit 결과 |
+| `set_import_target` | 관리자 | 대기 곡(또는 차트)의 대상 `auto`/`new`/`skip`/곡 번호, 접속기록에 남음 |
+| `commit_import` | 관리자 | 묶음(또는 `unit_ids`만) 등록 작업 시작, 접속기록에 남음 |
+| `get_import_job` | 관리자 | 임포트 작업 진행 |
 
 `split_song`·`merge_songs`·`remove_charts`·`delete_song`은 관리자 접속기록에 `action=mcp.split_song` 등으로 남습니다. 곡 정리 판단 기준(살릴 수 있는 묶음만 나누고, 전용 키음이 없는 묶음은 같은 곡 변형이면 닫고 제목이 다른 곡일 때만 뺌, 키음 팩 폴더는 건드리지 않음 등)도 `instructions`에 있습니다.
 
