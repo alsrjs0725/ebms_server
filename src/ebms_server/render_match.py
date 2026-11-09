@@ -63,6 +63,9 @@ ORDER_MIN = 50
 MAX_SECONDS = 1800.0
 MAX_SOUNDS = 200_000
 MAX_VARIANTS = 64
+# 이보다 큰 차트 파일은 렌더하지 않습니다. 보통 차트는 1MB 안쪽이고, 수백 MB짜리 장난 차트(CRAZYBUS 등)는 파싱·분기 복사만으로
+# 메모리를 10GB 넘게 써서 색인 프로세스가 OOM으로 죽습니다.
+MAX_CHART_BYTES = 8 * 1024 * 1024
 # 분기 쌍 비교 한도(차트 둘을 비교할 때)
 MAX_PAIRS = 512
 
@@ -262,7 +265,12 @@ def fingerprints(
     cut: dict[str, bool] = {}
     for path in charts:
         try:
-            texts, cut[path] = branch_charts(read(path))
+            content = read(path)
+            if len(content) > MAX_CHART_BYTES:
+                logger.warning(f"render_match: skipped huge chart[{path}] {len(content)} bytes")
+                continue
+            texts, cut[path] = branch_charts(content)
+            del content
             parsed[path] = [_sounds(text, seconds) for text in texts]
         except Exception as e:  # 깨진 차트는 렌더하지 않습니다.
             logger.info(f"render_match: parse failed[{path}]: {e}")
