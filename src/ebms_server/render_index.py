@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import resource
 import sqlite3
 import threading
 import time
@@ -27,6 +28,13 @@ from .templating import templates
 logger = logging.getLogger(__name__)
 
 NICE = 10
+# 한 번에 렌더하는 차트 수(같은 키음을 한 번만 풂). 결과는 바로 줄여 저장할 형태로 바꿉니다.
+RENDER_PART = 16
+# 최대 메모리가 이만큼 늘 때마다 로그에 곡을 남깁니다.
+MEMORY_LOG_STEP_KB = 512 * 1024
+_peak_kb = 0
+# 같은 곡에서 색인 회차가 이만큼 거듭 죽으면 그 곡을 실패로 표시합니다.
+CRASH_STRIKES = 2
 
 
 # ---- 발견 ----
@@ -110,31 +118,39 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
     paths = [f["path"] for f in files if f["path"].lower().endswith(constant.BMS_FORMAT)]
     if paths and file is None:
         raise FileNotFoundError(f"song {song_id} file")
-    rendered: dict[str, render_match.Fingerprint | None] = {}
+    # 렌더한 특징은 차트마다 바로 저장할 형태(압축 blob + 해시)로 줄이고, 다른 곡 찾기·곡 안 묶기도 그 자리에서 한 뒤 버립니다.
+    # 곡 전체의 렌더 결과(분기마다 전체 길이 특징)를 모아 두면 차트가 많은 곡에서 메모리가 10GB를 넘어 OOM으로 죽습니다.
+    # 다른 곡 찾기는 읽기만 하므로(흔한 해시를 많이 읽어 느림) 쓰기 전에 합니다. 같은 곡 차트는 search가 빼므로 순서와 무관.
+    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
+    dups: dict[int, dict] = {}
+    prepared: dict[str, tuple[bytes, None, list[tuple[int, int]]]] = {}  # 차트 경로 → 저장할 (blob, _, 해시)
     if file is not None and paths:
         with os.fdopen(os.dup(file._fd), "rb") as raw, zipfile.ZipFile(raw) as zf:
             file.close()
             names = [i.filename for i in zf.infolist() if not i.is_dir()]
-            for start in range(0, len(paths), 16):
-                part = paths[start : start + 16]
+            sizes = {i.filename: i.file_size for i in zf.infolist()}
+            huge = [p for p in paths if sizes.get(p, 0) > render_match.MAX_CHART_BYTES]
+            if huge:
+                # 읽지도 않고 건너뜁니다(render_match.MAX_CHART_BYTES).
+                logger.warning(f"render index: skipped huge charts[song {song_id}]: {huge}")
+                paths = [p for p in paths if p not in huge]
+            for start in range(0, len(paths), RENDER_PART):
+                part = paths[start : start + RENDER_PART]
                 fps = render_match.fingerprints(names, zf.read, part, nice=True)
                 for path in part:
-                    rendered[path] = fps.get(path)
-    # 다른 곡 찾기도 읽기만 하므로(흔한 해시를 많이 읽어 느림) 쓰기 전에 끝냅니다. 같은 곡 차트는 search가 빼므로 순서와 무관.
-    groups: list[tuple[render_match.Fingerprint, list[str]]] = []  # (대표 차트 특징, 같은 묶음 경로들)
-    dups: dict[int, dict] = {}
-    prepared = {}
-    for path, fp in rendered.items():
-        ready = fingerprint.prepare(fp.features if fp else [])
-        if ready is None:
-            continue
-        prepared[path] = ready
-        _, feats, query = ready
-        found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
-        for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
-            if score is not None and score >= render_match.SAME and not found(other_song):
-                dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
-        _group(groups, path, fp)
+                    fp = fps.pop(path, None)
+                    ready = fingerprint.prepare(fp.features if fp else [])
+                    if ready is None:
+                        continue
+                    blob, feats, query = ready
+                    prepared[path] = (blob, None, query)
+                    found = lambda other: other in dups and dups[other]["score"] >= render_match.SAME
+                    for other_song, other_path, score in fingerprint.search(con, feats, song_id, query, skip=found):
+                        if score is not None and score >= render_match.SAME and not found(other_song):
+                            dups[other_song] = {"score": score, "chart": path, "other_chart": other_path}
+                    _group(groups, path, fp)
+                del fps
+    _log_memory(song_id, len(paths))
     con.commit()  # 읽기 트랜잭션을 닫고 아래 쓰기만 짧게
     _forget_song(con, song_id)
     for path, ready in prepared.items():
@@ -151,6 +167,18 @@ def index_song(con: sqlite3.Connection, song_id: int, sha256: str) -> dict:
     return {"song_id": song_id, "charts": stored, "dups": sorted(dups), "groups": len(groups)}
 
 
+def _log_memory(song_id: int, charts: int) -> None:
+    """색인 프로세스의 최대 메모리가 MEMORY_LOG_STEP 넘게 늘면 그 곡을 남깁니다(OOM 원인 곡 찾기)."""
+    global _peak_kb
+    try:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # Linux: KB
+    except (AttributeError, OSError):
+        return
+    if peak - _peak_kb >= MEMORY_LOG_STEP_KB:
+        logger.warning(f"render index memory peak {peak // 1024} MB[song {song_id}, {charts} charts]")
+        _peak_kb = peak
+
+
 def _group(groups: list, path: str, fp: render_match.Fingerprint) -> None:
     """곡 안 묶기: 대표와 '다름'이 아니면 같은 묶음에 넣습니다(애매하면 섞임으로 띄우지 않음).
     같은 곡 안이라 키음 파일이 같으므로 순서 일치율도 봅니다."""
@@ -165,13 +193,35 @@ def _group(groups: list, path: str, fp: render_match.Fingerprint) -> None:
     if best is not None:
         best[1].append(path)
     else:
-        groups.append((fp, [path]))
+        # 대표는 색인에 저장하는 분기 수만 들고 있습니다(분기가 많은 차트의 전체 길이 특징을 묶음마다 쥐지 않게).
+        keep = fingerprint.MAX_STORED_VARIANTS
+        rep = render_match.Fingerprint(fp.features[:keep], fp.orders[:keep], fp.truncated, fp.sounds)
+        groups.append((rep, [path]))
 
 
 def _live_songs() -> dict[int, str]:
     with db.connect() as con, con.cursor() as cur:
         cur.execute("SELECT id, sha256 FROM song")
         return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _crashed_song(con: sqlite3.Connection) -> int | None:
+    """지난 회차가 끝나지 않은 채(finished_at 없음) 색인하던 곡. 정상으로 끝났거나 기록이 없으면 None."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'run'").fetchone()
+    state = json.loads(row[0]) if row else {}
+    if state.get("started_at") and not state.get("finished_at") and isinstance(state.get("song"), int):
+        return state["song"]
+    return None
+
+
+def _strike(con: sqlite3.Connection, song_id: int) -> int:
+    """song_id에서 회차가 죽은 횟수를 하나 늘려 돌려줍니다(다른 곡이면 1부터)."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'crash'").fetchone()
+    crash = json.loads(row[0]) if row else {}
+    count = crash.get("count", 0) + 1 if crash.get("song") == song_id else 1
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('crash', ?)", (json.dumps({"song": song_id, "count": count}),))
+    con.commit()
+    return count
 
 
 def _save_state(con: sqlite3.Connection, **values) -> None:
@@ -190,10 +240,19 @@ def run(minutes: float) -> bool:
     con = connect()
     left = False
     try:
+        crashed = _crashed_song(con)
         _save_state(con, started_at=int(started), finished_at=None, songs=0, song=None, error=None)
         try:
             live = _live_songs()
             known = fingerprint.songs(con)
+            if crashed is not None and crashed in live and _strike(con, crashed) >= CRASH_STRIKES:
+                # 이 곡을 색인하다 끝내지 못하고 죽은 회차가 CRASH_STRIKES번입니다(OOM 등 SIGKILL이라 실패 표시도 못 남김).
+                # 한 번은 재배포·재시작일 수 있어 다시 해 보고, 거듭 죽으면 같은 내용으로는 다시 하지 않도록 실패로 표시합니다.
+                logger.error(f"render index: runs died on song {crashed} {CRASH_STRIKES} times; marked as failed")
+                _forget_song(con, crashed)
+                fingerprint.mark_song(con, crashed, live[crashed], -1)
+                con.commit()
+                known = fingerprint.songs(con)
             gone = set(known) - set(live)
             for song_id in gone:
                 _forget_song(con, song_id)

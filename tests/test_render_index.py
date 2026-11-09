@@ -138,3 +138,95 @@ def test_render_page_paginates_and_trims_groups(client, monkeypatch):
     second = client.get("/admin/render", params={"page": 2}).text
     assert second.count("data-id=") == 3
     assert len(client.get("/api/admin/render/findings", params={"limit": 2, "offset": render_index.PAGE_SIZE + 2}).json()) == 1
+
+
+def test_index_song_keeps_renders_of_one_part_only(monkeypatch, tmp_path):
+    """곡 전체의 렌더 결과를 모아 두지 않습니다(차트가 많은 곡에서 색인 프로세스가 OOM으로 죽던 문제).
+    살아 있는 특징 배열 수가 한 번에 렌더하는 차트 수 × 분기 수를 넘지 않아야 합니다."""
+    import io
+    import weakref
+    import zipfile
+
+    from ebms_server import constant
+
+    monkeypatch.setattr(constant, "RENDER_INDEX_DIR", tmp_path / "ri")
+    paths = [f"c{i:03d}.bms" for i in range(60)]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for p in paths:
+            zf.writestr(p, b"#TITLE x\n")
+    zpath = tmp_path / "song.zip"
+    zpath.write_bytes(buf.getvalue())
+
+    class _File:
+        def __init__(self):
+            import os
+            self._fd = os.open(zpath, os.O_RDONLY)
+
+        def close(self):
+            import os
+            os.close(self._fd)
+
+    monkeypatch.setattr(render_index, "_song_row", lambda song_id: ([{"path": p} for p in paths], _File()))
+    monkeypatch.setattr(render_index, "RENDER_PART", 4)
+    branches = 6
+    alive: list = []
+    peak = [0]
+    rng = np.random.default_rng(1)
+
+    def fake(names, read, part, nice=True):
+        out = {}
+        for p in part:
+            feats = [np.maximum(rng.normal(0, 1, (400, render_match.BANDS)), 0).astype(np.float32) for _ in range(branches)]
+            alive.extend(weakref.ref(f) for f in feats)
+            out[p] = render_match.Fingerprint(feats, [frozenset()] * branches, False, (1, 1))
+        peak[0] = max(peak[0], sum(r() is not None for r in alive))
+        return out
+
+    monkeypatch.setattr(render_index.render_match, "fingerprints", fake)
+    con = render_index.connect()
+    try:
+        result = render_index.index_song(con, 1, "x")
+    finally:
+        con.close()
+    assert result["charts"] == len(paths)
+    # 앞 묶음들의 특징은 버려졌고(묶음 대표는 저장 분기 수만), 한 묶음 분량 + 대표들만 남습니다.
+    assert peak[0] <= 4 * branches + result["groups"] * fingerprint.MAX_STORED_VARIANTS + 4 * branches
+
+
+def test_runs_dying_twice_on_a_song_mark_it_failed(monkeypatch, tmp_path):
+    """SIGKILL(OOM)로 죽은 회차는 실패 표시를 못 남기므로, 같은 곡에서 두 번 죽으면 다음 회차가 실패로 표시합니다."""
+    import json
+
+    from ebms_server import constant
+
+    monkeypatch.setattr(constant, "RENDER_INDEX_DIR", tmp_path / "ri")
+    monkeypatch.setattr(render_index, "_live_songs", lambda: {5: "sha5"})
+    calls = []
+    monkeypatch.setattr(render_index, "index_song", lambda con, song_id, sha: calls.append(song_id))
+
+    def died_on(song_id):
+        con = render_index.connect()
+        con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('run', ?)",
+                    (json.dumps({"started_at": 1, "finished_at": None, "song": song_id}),))
+        con.commit()
+        con.close()
+
+    died_on(5)
+    render_index.run(1)
+    assert calls == [5]  # 한 번 죽은 것은 재시작일 수 있어 다시 해 봄
+    calls.clear()
+    # index_song이 호출됐지만 mark_song을 안 하는 가짜라 아직 색인 안 된 곡. 다시 같은 곡에서 죽음.
+    died_on(5)
+    render_index.run(1)
+    assert calls == []
+    con = render_index.connect()
+    assert con.execute("SELECT charts FROM song WHERE id = 5").fetchone()[0] == -1
+    con.close()
+
+
+def test_huge_chart_is_not_rendered(monkeypatch):
+    monkeypatch.setattr(render_match, "MAX_CHART_BYTES", 10)
+    monkeypatch.setattr(render_match.preview, "_ffmpeg", lambda: "ffmpeg")
+    out = render_match.fingerprints(["a.bms"], lambda p: b"#TITLE " + b"x" * 100, ["a.bms"])
+    assert out == {}
