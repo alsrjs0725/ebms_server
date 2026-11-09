@@ -117,6 +117,23 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
   건드리지 말고 발견을 열어 둔 채 "키음 팩"으로 보고합니다(임포트 때 정리할 예정).
 - 발견 목록은 list_song_findings brief=true로 20~30개씩 훑고, 필요한 곡만 get_song으로 봅니다(전체 목록은 매우 큽니다).
 - 한 번에 많이 고치지 말고 발견 하나씩 처리하고, 처리한 결과(나눈 곡 번호 등)를 요약해 남깁니다.
+
+임포트 대기 묶음 정리(관리자):
+- list_import_stages → list_import_units(show로 나눠 보기) → 필요한 곡만 get_import_unit. 대상은 set_import_target으로 정하고
+  등록은 commit_import(unit_ids로 정한 곡만, slow 기본)로 합니다. commit은 되돌리기 어려우니 묶음 하나·20곡 이하씩, get_import_job이
+  done이 된 뒤 다음으로 넘어갑니다. 다른 commit이 돌고 있으면 409이니 기다립니다.
+- 판정(suggestion.kind)별 기준. 렌더 일치율(render) 0.7 이상은 같은 곡, 0.2 이하는 다른 곡입니다.
+  new: 겹치는 곡이 없음 → auto 그대로(새 곡).
+  add: 차트가 이미 한 곡에 있음(같은 차트 재업로드) → auto 그대로(그 곡에 빠진 파일만 더함).
+  similar: 이름·키음이 비슷한 후보. merge가 있으면 auto가 그 곡에 넣습니다. 후보의 render가 0.7 이상이면 그 곡 번호로,
+    render가 0.2 이하이거나 render_blocked면 new로 정합니다(키음이 다르면 다른 곡). render가 없고 키음 충족률(sounds)만 높으면
+    제목·아티스트가 같을 때만 그 곡으로, 아니면 new.
+  ambiguous: 차트가 여러 곡에 흩어져 있음 → 대부분의 차트가 있는 곡이 폴더명과 맞으면 그 곡 번호로, 아니면 정하지 말고 보고.
+  unused: 사용 중지(제외)한 곡의 차트가 있음 → 건드리지 않습니다(다시 넣지 않으려고 제외한 곡).
+- failed(지난 commit 실패: 헤더 인코딩·파일 오류 등)는 사람이 내려받아 고치는 곡이니 대상을 바꾸지 말고 보고만 합니다.
+  충돌(conflicts>0)은 위의 충돌 판단 흐름(get_conflict_case → submit_recommendation)으로 추천만 남깁니다.
+- 키음 팩 폴더(여러 사람 BMS가 한 폴더, 차트마다 제목이 다름)는 대상을 정하지 말고 "키음 팩"으로 보고합니다.
+- set_import_target과 commit_import에는 reason(판단 근거)을 적습니다.
 """
 
 # admin: True면 관리자만 보고 부를 수 있습니다.
@@ -408,6 +425,83 @@ TOOLS = [
             },
             "required": ["finding_id", "status"],
         },
+        "admin": True,
+    },
+    {
+        "name": "list_import_stages",
+        "description": "임포트 대기 묶음 목록: id, 이름, 상태, 곡·차트 수, 판정별 곡 수(new/add/ambiguous/similar/unused/changed/failed).",
+        "inputSchema": {"type": "object", "properties": {}},
+        "admin": True,
+    },
+    {
+        "name": "list_import_units",
+        "description": (
+            "대기 묶음의 곡을 짧게 한 쪽(50곡)씩: id, 이름, 파일·차트 수, 대상(target), 판정(kind)과 후보 곡(번호·폴더·"
+            "메타 일치·키음 충족률·렌더 일치율), 지난 commit 결과·오류. show로 new/add/ambiguous/similar/unused/changed/failed만."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stage_id": {"type": "string"},
+                "show": {"type": "string", "enum": ["", "new", "add", "ambiguous", "similar", "unused", "changed", "failed"]},
+                "page": {"type": "integer", "minimum": 1},
+                "q": {"type": "string", "description": "폴더·차트 제목·아티스트 검색"},
+            },
+            "required": ["stage_id"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "get_import_unit",
+        "description": "대기 곡 하나: 차트마다 경로·제목·아티스트·차트별 대상·이미 등록된 곡 번호, 판정 전체, 지난 commit 결과.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"stage_id": {"type": "string"}, "unit_id": {"type": "string"}},
+            "required": ["stage_id", "unit_id"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "set_import_target",
+        "description": (
+            "대기 곡의 대상을 정합니다(바로 저장, 등록은 commit_import 때). target: auto(판정대로)/new(새 곡)/skip(넣지 않음)/곡 번호(그 곡에 합침). "
+            "charts로 차트별 대상({경로: 대상 또는 null=곡의 대상})도 정할 수 있습니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stage_id": {"type": "string"},
+                "unit_id": {"type": "string"},
+                "target": {"type": ["string", "integer"]},
+                "charts": {"type": "object"},
+                "reason": {"type": "string", "description": "판단 근거(기록에 남음)"},
+            },
+            "required": ["stage_id", "unit_id", "target"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "commit_import",
+        "description": (
+            "대기 묶음을 정한 대상대로 등록하는 작업을 시작합니다(되돌리기 어려움). unit_ids를 주면 그 곡만 넣습니다. "
+            "작업 id를 돌려주며 get_import_job으로 진행을 봅니다. 다른 임포트·정리 작업과 동시에 돌지 않게 하나씩 합니다."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stage_id": {"type": "string"},
+                "unit_ids": {"type": "array", "items": {"type": "string"}},
+                "slow": {"type": "boolean", "description": "서비스에 디스크를 양보하며 천천히(기본 true)"},
+                "reason": {"type": "string"},
+            },
+            "required": ["stage_id"],
+        },
+        "admin": True,
+    },
+    {
+        "name": "get_import_job",
+        "description": "임포트 작업 진행: 상태(running/done/failed), 전체·끝난 곡 수, 오류. job_id가 없으면 최근 작업들.",
+        "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}},
         "admin": True,
     },
 ]
@@ -976,6 +1070,103 @@ def set_finding_status(finding_id: int, status: str) -> dict:
     return {"id": int(finding_id), "status": status}
 
 
+
+# ---- 임포트 대기 묶음 정리 ----
+
+IMPORT_UNIT_FIELDS = ("id", "name", "files", "target", "result", "error")
+
+
+def _brief_suggestion(suggestion: dict | None, folders: dict) -> dict | None:
+    if not suggestion:
+        return None
+    out = {"kind": suggestion.get("kind")}
+    songs = suggestion.get("songs") or []
+    if songs:
+        out["candidates"] = [
+            {
+                "song": s,
+                "folder": folders.get(s),
+                "matches": (suggestion.get("matches") or {}).get(str(s)),
+                "sounds": (suggestion.get("sounds") or {}).get(str(s)),
+                "render": (suggestion.get("render") or {}).get(str(s)),
+            }
+            for s in songs[:5]
+        ]
+    for key in ("complete", "render_partial", "render_blocked", "deleted", "merge"):
+        if suggestion.get(key):
+            out[key] = suggestion[key]
+    return out
+
+
+def list_import_stages() -> dict:
+    return {"stages": staging.list_stages()}
+
+
+def list_import_units(stage_id: str, show: str = "", page: int = 1, q: str = "") -> dict:
+    data = staging.get_stage(stage_id, int(page), show, q)
+    folders = {int(k): v for k, v in data["songs"].items()}
+    items = []
+    for unit in data["items"]:
+        item = {k: unit.get(k) for k in IMPORT_UNIT_FIELDS if unit.get(k) is not None}
+        item["charts"] = len(unit["charts"])
+        item["suggestion"] = _brief_suggestion(unit.get("suggestion"), folders)
+        if isinstance(unit.get("target"), int):
+            item["target_folder"] = folders.get(unit["target"])
+        if any(c.get("target") is not None for c in unit["charts"]):
+            item["chart_targets"] = True
+        items.append(item)
+    return {"stage": data["name"], "counts": data["counts"], "page": data["page"], "pages": data["pages"], "total": data["total"],
+            "units": items}
+
+
+def get_import_unit(stage_id: str, unit_id: str) -> dict:
+    with staging._lock:
+        stage = staging._load(stage_id)
+    unit = next((u for u in stage["units"] if u["id"] == unit_id), None)
+    if unit is None:
+        raise ToolError("곡이 없습니다(이미 등록됐거나 버린 곡).")
+    suggestion = unit.get("suggestion") or {}
+    ids = set(suggestion.get("songs") or []) | {t for t in [unit["target"], *(c.get("target") for c in unit["charts"])] if isinstance(t, int)}
+    folders = staging._song_folders(ids)
+    return {
+        "id": unit["id"],
+        "name": unit["name"],
+        "folder": unit["folder"],
+        "files": unit["files"],
+        "size": unit["size"],
+        "target": unit["target"],
+        "suggestion": _brief_suggestion(suggestion, folders),
+        "charts": [
+            {k: c.get(k) for k in ("path", "title", "artist", "bpm", "target", "song_id", "deleted") if c.get(k) is not None}
+            for c in unit["charts"]
+        ],
+        "result": unit.get("result"),
+        "error": unit.get("error"),
+        "conflicts": len(conflicts._conflict_paths(unit)),
+    }
+
+
+def set_import_target(user, stage_id: str, unit_id: str, target, charts: dict | None = None, reason: str = "") -> dict:
+    return staging.set_target(stage_id, unit_id, target, charts)
+
+
+def commit_import(user, stage_id: str, unit_ids: list[str] | None = None, slow: bool = True, reason: str = "") -> dict:
+    job = staging.start_commit(stage_id, bool(slow), list(unit_ids) if unit_ids else None)
+    logger.info(f"import commit {job.id} by {user.id} (mcp): stage {stage_id} {job.name}")
+    return {"job_id": job.id, "name": job.name, "status": job.status}
+
+
+def get_import_job(job_id: str = "") -> dict:
+    if job_id:
+        job = importer.get_job(job_id)
+        if job is None:
+            raise ToolError("작업이 없습니다(서버가 다시 시작됐으면 묶음 상태로 확인).")
+        jobs = [job]
+    else:
+        jobs = importer.list_jobs()[:10]
+    return {"jobs": [{k: v for k, v in j.json().items() if k != "songs"} for j in jobs]}
+
+
 # 관리자 도구(whoami는 사용자를 받으므로 _call에서 따로 부릅니다)
 HANDLERS = {
     "list_conflict_units": list_conflict_units,
@@ -989,6 +1180,10 @@ HANDLERS = {
     "get_compare_result": get_compare_result,
     "preview_split": preview_split,
     "set_finding_status": set_finding_status,
+    "list_import_stages": list_import_stages,
+    "list_import_units": list_import_units,
+    "get_import_unit": get_import_unit,
+    "get_import_job": get_import_job,
 }
 # 부른 사용자를 첫 인자로 받는 도구(바로 적용하는 도구, 기록에 남김)
 USER_HANDLERS = {
@@ -997,6 +1192,8 @@ USER_HANDLERS = {
     "remove_charts": remove_charts,
     "restore_charts": restore_charts,
     "delete_song": delete_song,
+    "set_import_target": set_import_target,
+    "commit_import": commit_import,
 }
 
 
@@ -1049,7 +1246,14 @@ def _call(request: Request, user, params: dict) -> dict:
                 detail[k] = ",".join(map(str, value[k]))
         if args.get("reason"):
             detail["reason"] = args["reason"]
-        audit.record(request, user.id, f"mcp.{name}", str(args.get("song_id")), **detail)
+        if name in ("set_import_target", "commit_import"):
+            detail.update({("to" if k == "target" else k): str(args[k]) for k in ("target", "unit_ids", "slow") if k in args})
+            if value.get("job_id"):
+                detail["job"] = value["job_id"]
+            target = f"{args.get('stage_id')}/{args.get('unit_id', '')}"
+        else:
+            target = str(args.get("song_id"))
+        audit.record(request, user.id, f"mcp.{name}", target, **detail)
     if name == "submit_recommendation":
         # 접속기록은 ebms.log에도 같은 줄이 남습니다.
         audit.record(request, user.id, "mcp.recommend", f"{args.get('stage_id')}/{args.get('unit_id')}", saved=value["saved"])

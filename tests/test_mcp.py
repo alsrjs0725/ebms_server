@@ -65,6 +65,7 @@ def test_initialize_and_tools(client, monkeypatch):
         "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
         "list_song_findings", "get_song", "compare_songs", "get_compare_result", "preview_split", "split_song", "merge_songs",
         "remove_charts", "restore_charts", "delete_song", "set_finding_status",
+        "list_import_stages", "list_import_units", "get_import_unit", "set_import_target", "commit_import", "get_import_job",
     }
     assert call(api, key, "whoami")["role"] == "admin"
     assert rpc(api, key, "nope")["error"]["code"] == -32601
@@ -261,3 +262,41 @@ def test_remove_and_delete_tools(client, monkeypatch, caplog):
     assert client.get("/api/admin/songs/deleted").json()["items"][0]["purged_at"]
     bad = rpc(api, key, "tools/call", {"name": "delete_song", "arguments": {"song_id": 1, "reason": "", "level": "x"}})
     assert bad["result"]["isError"]
+
+
+def test_import_tools(client, monkeypatch, caplog):
+    """대기 묶음 보기 → 대상 정하기 → 그 곡만 commit."""
+    import time
+
+    admin_login(client, monkeypatch)
+    key = create_key(client)
+    api = TestClient(client.app)
+    job = stage(client, "two.zip", make_zip({"p/a/a.bms": b"#TITLE A\n#WAV01 a.wav\n", "p/a/a.wav": b"a",
+                                              "p/b/b.bms": b"#TITLE B\n#WAV01 b.wav\n", "p/b/b.wav": b"b"}))
+    sid = job["stage_id"]
+    stages = call(api, key, "list_import_stages")["stages"]
+    assert [s["id"] for s in stages] == [sid]
+    listed = call(api, key, "list_import_units", stage_id=sid)
+    assert listed["total"] == 2 and {u["name"] for u in listed["units"]} == {"a", "b"}
+    assert all(u["suggestion"]["kind"] == "new" and u["charts"] == 1 for u in listed["units"])
+    by_name = {u["name"]: u for u in listed["units"]}
+    unit = call(api, key, "get_import_unit", stage_id=sid, unit_id=by_name["a"]["id"])
+    assert unit["charts"][0]["path"] == "a.bms" and unit["charts"][0]["title"] == "A"
+
+    with caplog.at_level("INFO", logger="ebms_server.audit"):
+        call(api, key, "set_import_target", stage_id=sid, unit_id=by_name["b"]["id"], target="skip", reason="시험")
+    assert any("action=mcp.set_import_target" in r.message and "to=skip" in r.message for r in caplog.records)
+    assert call(api, key, "list_import_units", stage_id=sid, show="changed")["total"] == 1
+    bad = rpc(api, key, "tools/call", {"name": "set_import_target", "arguments": {"stage_id": sid, "unit_id": by_name["a"]["id"],
+                                                                                  "target": "maybe"}})["result"]
+    assert bad["isError"]
+
+    started = call(api, key, "commit_import", stage_id=sid, unit_ids=[by_name["a"]["id"]])
+    for _ in range(200):
+        jobs = call(api, key, "get_import_job", job_id=started["job_id"])["jobs"]
+        if jobs[0]["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert jobs[0]["status"] == "done", jobs
+    left = call(api, key, "list_import_units", stage_id=sid)
+    assert [u["name"] for u in left["units"]] == ["b"]
