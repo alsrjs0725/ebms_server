@@ -17,7 +17,7 @@ import zipfile
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from . import auth, constant, db, fingerprint, render_match
@@ -584,3 +584,26 @@ def api_set_finding(finding_id: int, body: FindingBody, admin: Annotated[User, D
         raise HTTPException(status_code=404, detail="finding not found")
     logger.info(f"render finding {finding_id} {body.status} by {admin.id}")
     return {"ok": True}
+
+
+@router.get("/api/admin/render/audio")
+def api_audio(admin: Annotated[User, Depends(web_admin)], song: int, chart: str):
+    """차트 렌더 음원 상태. 처음 부르면 만들기 시작합니다(render_audio). ready가 되면 /api/admin/render/audio/file로 받습니다."""
+    from . import render_audio
+    try:
+        return render_audio.status(song, chart)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/api/admin/render/audio/file")
+def api_audio_file(admin: Annotated[User, Depends(web_admin)], song: int, chart: str):
+    from . import render_audio
+    try:
+        return FileResponse(render_audio.path(song, chart), media_type="audio/ogg")
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="아직 만들지 않았습니다.")

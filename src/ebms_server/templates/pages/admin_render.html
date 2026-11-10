@@ -3,6 +3,9 @@
 {% block title %}중복·섞임 점검 - EBMS{% endblock %}
 
 {% block content %}
+{% macro listen(song, chart) -%}
+<button class="btn btn-link btn-sm p-0 align-baseline text-break text-start" type="button" data-listen data-song="{{ song }}" data-chart="{{ chart }}" title="렌더 음원 듣기">▶ {{ chart }}</button>
+{%- endmacro %}
 <nav aria-label="breadcrumb">
     <ol class="breadcrumb">
         <li class="breadcrumb-item"><a href="/admin">관리자 홈</a></li>
@@ -14,6 +17,7 @@
     모든 곡의 차트를 키음으로 렌더해 소리 지문을 모아 두고, 다른 곡 번호인데 같은 곡(중복)과 한 곡 안에 섞인 다른 곡(섞임)을 찾습니다.
     {% if state.interval_hours > 0 and state.minutes > 0 %}아직 안 본 곡과 바뀐 곡을 따로 띄운 프로세스에서 상시로 색인하고, 다 보면 {{ state.interval_hours | round(1) }}시간 뒤 다시 봅니다.{% else %}자동으로 색인하지 않으니 <b>지금 색인</b>으로 돌립니다.{% endif %}
     자동으로 고치지 않으니, 확인한 뒤 곡 관리에서 합치거나 떼고 여기서는 <b>넘기기</b>로 목록에서 뺍니다.
+    차트 이름(▶)을 누르면 그 차트를 렌더한 음원을 들어 볼 수 있습니다(처음엔 만드는 데 수 초~수십 초).
 </p>
 
 <div class="card mb-4">
@@ -47,9 +51,9 @@
             </td>
             <td class="small text-break">
                 {% if f.kind == 'dup' %}
-                렌더 일치율 {{ '%.2f' | format(f.score) }}: {{ f.detail.chart }} ↔ {{ f.detail.other_chart }}
+                렌더 일치율 {{ '%.2f' | format(f.score) }}: {{ listen(f.song_a, f.detail.chart) }} ↔ {{ listen(f.song_b, f.detail.other_chart) }}
                 {% else %}
-                {% for g in f.groups %}<div>묶음 {{ loop.index }} ({{ g.size }}): {{ g.shown | join(', ') }}{% if g.size > g.shown | length %} …{% endif %}</div>{% endfor %}
+                {% for g in f.groups %}<div>묶음 {{ loop.index }} ({{ g.size }}): {% for p in g.shown %}{{ listen(f.song_a, p) }}{% if not loop.last %}, {% endif %}{% endfor %}{% if g.size > g.shown | length %} …{% endif %}</div>{% endfor %}
                 {% endif %}
             </td>
             <td class="small"><span data-time="{{ f.created_at }}"></span></td>
@@ -77,6 +81,12 @@
 {% else %}
 <p class="text-muted">항목이 없습니다.</p>
 {% endif %}
+<div id="player" class="card position-sticky bottom-0 mt-3 shadow-sm d-none">
+    <div class="card-body py-2 small">
+        <div id="player-label" class="text-break mb-1"></div>
+        <audio id="player-audio" class="w-100" controls preload="auto"></audio>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
