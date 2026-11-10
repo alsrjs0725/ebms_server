@@ -97,17 +97,6 @@ def test_recompressed_image_is_same(tmp_path):
 
 
 @needs_ffmpeg
-def test_reencoded_video_is_same(tmp_path):
-    mpg = video(tmp_path, "a.mpg", "testsrc", 6, "-c:v", "mpeg1video", "-q:v", "2")
-    mp4 = video(tmp_path, "a.mp4", "testsrc", 6, "-c:v", "mpeg4", "-q:v", "8")
-    other = video(tmp_path, "b.mpg", "smptebars", 6, "-c:v", "mpeg1video")
-    longer = video(tmp_path, "c.mpg", "testsrc", 12, "-c:v", "mpeg1video")
-    assert judge(tmp_path, "m.mpg", mpg, mp4)
-    assert not judge(tmp_path, "m2.mpg", mpg, other)
-    assert not judge(tmp_path, "m3.mpg", mpg, longer)
-
-
-@needs_ffmpeg
 def test_merge_keeps_same_media_without_conflict(database, tmp_path):
     a = b"#TITLE A\n"
     wav = noise(tmp_path, "a.wav")
@@ -296,13 +285,39 @@ def test_image_aspect_4_3_and_16_9(tmp_path):
     assert not judge(tmp_path, "bg4.png", four, other)
 
 
+def cuts(tmp_path, name, seed, *codec, vf=None, seconds=10, size=(160, 120)):
+    """장면이 무작위 길이로 바뀌는 영상(장면마다 무늬가 조금씩 흐름). seed가 같으면 장면이 바뀌는 때가 같습니다."""
+    w, h = size
+    rng = np.random.default_rng(seed)
+    frames = []
+    while len(frames) < seconds * 25:
+        img = (rng.random((h // 8, w // 8)) * 255).astype(np.uint8).repeat(8, 0).repeat(8, 1)
+        frames += [np.roll(img, k, axis=1) for k in range(int(rng.integers(5, 30)))]
+    out = tmp_path / name
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", "25", "-i", "-"]
+    subprocess.run(cmd + (["-vf", vf] if vf else []) + [*codec, str(out)], input=np.stack(frames[: seconds * 25]).tobytes(), check=True)
+    return out.read_bytes()
+
+
 @needs_ffmpeg
-def test_video_aspect_4_3_and_16_9(tmp_path):
-    wide = ffmpeg(tmp_path, "w.mp4", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=6", "-c:v", "mpeg4", "-q:v", "3")
-    cropped = ffmpeg(tmp_path, "c.mpg", "-i", str(tmp_path / "w.mp4"), "-vf", "crop=240:180", "-c:v", "mpeg1video", "-q:v", "2")
-    other = ffmpeg(tmp_path, "o.mpg", "-f", "lavfi", "-i", "smptebars=size=240x180:rate=25:duration=6", "-c:v", "mpeg1video")
-    assert judge(tmp_path, "m1.mp4", wide, cropped)
-    assert not judge(tmp_path, "m2.mp4", wide, other)
+def test_video_by_motion(tmp_path):
+    """영상은 화면 그대로가 아니라 이전 프레임 대비 변화량 곡선으로 봅니다: 화면비·필러박스·크롭이 달라도 장면이 바뀌는 때가 같으면 같습니다."""
+    base = cuts(tmp_path, "a.mp4", 1, "-c:v", "mpeg4", "-q:v", "4")
+    assert judge(tmp_path, "m1.mp4", base, cuts(tmp_path, "a.mpg", 1, "-c:v", "mpeg1video", "-q:v", "2"))
+    # 4:3 → 16:9 필러박스, 가운데만 잘라 1:1
+    assert judge(tmp_path, "m2.mp4", base, cuts(tmp_path, "w.mp4", 1, "-c:v", "mpeg4", vf="pad=214:120:27:0"))
+    assert judge(tmp_path, "m3.mp4", base, cuts(tmp_path, "c.mpg", 1, "-c:v", "mpeg1video", vf="crop=120:120"))
+    # 장면이 바뀌는 때가 다르거나, 0.3초 늦거나, 길이가 다르면 다름
+    assert not judge(tmp_path, "m4.mp4", base, cuts(tmp_path, "b.mpg", 2, "-c:v", "mpeg1video"))
+    assert not judge(tmp_path, "m5.mp4", base, cuts(tmp_path, "d.mpg", 1, "-c:v", "mpeg1video", vf="tpad=start_duration=0.3"))
+    assert not judge(tmp_path, "m6.mp4", base, cuts(tmp_path, "l.mpg", 1, "-c:v", "mpeg1video", seconds=14))
+
+
+def test_still_video_is_not_judged():
+    """변화가 거의 없는 영상은 판정할 특징이 없어 같다고 보지 않습니다(충돌로 보류)."""
+    still = np.full((50, 64 * 64), 100, np.uint8)
+    assert media_match.motion_correlation(media_match.motion(still), media_match.motion(still)) is None
+    assert not media_match.same_video(still, still)
 
 
 def test_aspect_aligned_math():
