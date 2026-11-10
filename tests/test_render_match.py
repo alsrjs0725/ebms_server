@@ -1,4 +1,4 @@
-"""차트 렌더 비교(render_match) 테스트: 분기, 끝나지 않는 차트, 일치율."""
+"""차트 렌더 비교(render_match) 테스트: #RANDOM, 끝나지 않는 차트, 일치율."""
 import shutil
 import subprocess
 import time
@@ -13,41 +13,6 @@ needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg
 
 def lines_of(chart: bytes) -> list[bytes]:
     return preview._bms_lines(chart)
-
-
-def test_branch_charts_cover_every_body():
-    chart = (
-        b"#WAV01 a.wav\n"
-        b"#RANDOM 3\n"
-        b"#IF 1\n#00101:01\n"
-        b"#ELSEIF 2\n#00201:01\n"
-        b"#ELSE\n#00301:01\n"
-        b"#ENDIF\n#ENDRANDOM\n"
-        # 바깥 2일 때만 들어가는 안쪽 분기
-        b"#RANDOM 2\n#IF 2\n#RANDOM 4\n#IF 4\n#00401:01\n#ENDIF\n#ENDRANDOM\n#ENDIF\n#ENDRANDOM\n"
-        # 갈 수 없는 분기(#RANDOM 범위 밖, 고정값과 다름)
-        b"#RANDOM 2\n#IF 5\n#00501:01\n#ENDIF\n#ENDRANDOM\n"
-        b"#SETRANDOM 1\n#IF 2\n#00601:01\n#ENDIF\n"
-    )
-    texts, truncated = render_match.branch_charts(chart)
-    assert not truncated
-    seen = set()
-    for text in texts:
-        seen |= {line[:6] for line in lines_of(text) if line[:6] in (b"#00101", b"#00201", b"#00301", b"#00401", b"#00501", b"#00601")}
-    assert seen == {b"#00101", b"#00201", b"#00301", b"#00401"}
-    # 결과가 같은 차트는 하나만
-    assert len({tuple(lines_of(t)) for t in texts}) == len(texts)
-
-
-def test_branch_charts_limit():
-    chart = b"#WAV01 a.wav\n#RANDOM 100\n" + b"".join(b"#IF %d\n#%03d01:01\n#ENDIF\n" % (i, i) for i in range(1, 101)) + b"#ENDRANDOM\n"
-    texts, truncated = render_match.branch_charts(chart, limit=10)
-    assert len(texts) == 10 and truncated
-
-
-def test_no_random_is_one_chart():
-    chart = b"#WAV01 a.wav\n#00101:01\n"
-    assert render_match.branch_charts(chart) == ([chart], False)
 
 
 def test_endless_chart_is_clipped():
@@ -151,3 +116,16 @@ def test_fingerprints_detect_other_song_sounds(tmp_path):
     assert a.sounds == (3, 3) and not a.truncated
     assert render_match.score(a, a, paired=True) == 1.0
     assert render_match.score(a, b, paired=True) < render_match.SAME
+
+
+@needs_ffmpeg
+def test_random_renders_first_branch_only(tmp_path):
+    """#RANDOM은 미리듣기처럼 1로 보고 차트당 한 번만 렌더합니다(다른 분기 소리는 렌더에 없음)."""
+    chart = (
+        b"#BPM 120\n#WAV01 01.wav\n#WAV02 02.wav\n"
+        b"#RANDOM 2\n#IF 1\n#00101:01\n#ELSE\n#00101:02\n#ENDIF\n#ENDRANDOM\n"
+    )
+    files = {"x.bms": chart, "01.wav": tone(tmp_path, "a.wav", 200), "02.wav": tone(tmp_path, "b.wav", 900)}
+    fp = render_match.fingerprints(list(files), files.__getitem__, ["x.bms"])["x.bms"]
+    assert len(fp.features) == 1 and len(fp.orders) == 1 and not fp.truncated
+    assert fp.sounds == (1, 1)

@@ -4,8 +4,9 @@
 
 - 렌더: preview.py의 차트 해석·키음 찾기·풀기를 그대로 쓰고, 전체 길이를 RATE Hz 모노로 섞습니다.
   볼륨·패닝·BGA는 보지 않습니다(비교하는 양쪽이 같은 규칙이므로).
-- 분기(#RANDOM): 모든 #IF·#ELSEIF·#ELSE 본문이 한 번 이상 들어가도록 #RANDOM 값을 고른 차트들을 만들어
-  각각 렌더합니다(branch_charts). 비교는 분기 중 하나라도 SAME 이상이면 같은 곡입니다.
+- 분기(#RANDOM): 미리듣기처럼 항상 1이 나온 것으로 보고 차트당 한 번만 렌더합니다. 분기마다 내용이 다른 차트는
+  다른 곡으로 나올 수 있고, 그건 받아들입니다(2026-11-09 결정, 분기 수만큼 늘던 렌더 시간·메모리를 없앰).
+  예전에 분기마다 렌더해 저장한 특징(여러 개)도 그대로 비교합니다. 둘 중 하나라도 SAME 이상이면 같은 곡입니다.
 - 특징: 로그 간격 BANDS개 대역 에너지의 로그 값을 시간으로 미분해 양수만 남깁니다(소리가 시작하는 타이밍, onset).
   재인코딩·음질 차이에는 둔하고, 다른 곡 키음이 끼면 타이밍·음색이 달라져 크게 떨어집니다.
 - 순서 일치율: 시간을 빼고 키음이 울리는 순서(찾은 파일 경로, 확장자 제외)만 ORDER_GRAM개씩 이어 겹치는 비율입니다.
@@ -15,18 +16,15 @@
   SEGMENT_SECONDS 구간마다 가장 잘 맞는 후보의 상관이 SEGMENT_CORR 이상인 구간 비율입니다. 양방향 중 작은 값.
   STOP·BPM 기믹으로 중간부터 어긋나는 차트도 후보 지연이 여러 개라 맞춰집니다.
 - 끝나지 않는 차트(아주 느린 BPM, 거대한 마디 길이·STOP 등): MAX_SECONDS 뒤의 소리는 버리고, 소리 수는
-  MAX_SOUNDS, 분기 렌더 수는 MAX_VARIANTS, 한 곡 렌더 시간은 deadline까지만 씁니다. 잘린 경우 결과에 표시합니다.
+  MAX_SOUNDS, 한 곡 렌더 시간은 deadline까지만 씁니다. 잘린 경우 결과에 표시합니다.
 
 2026-10-29 release 실험(곡 zip, gingerrush 원본): 같은 곡 0.78~1.00, 다른 곡 0.00~0.10.
 """
-import hashlib
 import logging
 import math
 import pathlib
 import posixpath
-import re
 import tempfile
-import time
 from collections.abc import Callable
 
 import numpy as np
@@ -62,18 +60,15 @@ ORDER_MIN = 50
 # 끝나지 않는 차트 대비 한도
 MAX_SECONDS = 1800.0
 MAX_SOUNDS = 200_000
-MAX_VARIANTS = 64
 # 이보다 큰 차트 파일은 렌더하지 않습니다. 보통 차트는 1MB 안쪽이고, 수백 MB짜리 장난 차트(CRAZYBUS 등)는 파싱·분기 복사만으로
 # 메모리를 10GB 넘게 써서 색인 프로세스가 OOM으로 죽습니다.
 MAX_CHART_BYTES = 8 * 1024 * 1024
 # 분기 쌍 비교 한도(차트 둘을 비교할 때)
 MAX_PAIRS = 512
 
-_RANDOM = re.compile(rb"#(RANDOM|RONDAM)\b", re.I)
-
 
 class Fingerprint:
-    """차트 하나의 렌더 특징. features는 분기마다 하나(분기가 없으면 하나), orders는 분기마다 키음 순서 묶음 집합,
+    """차트 하나의 렌더 특징. features는 렌더마다 하나(지금은 하나, 예전 색인은 분기마다 하나), orders는 그 키음 순서 묶음 집합,
     truncated는 한도 때문에 잘렸는지, sounds는 (찾은 키음 수, 쓰는 키음 수)."""
 
     __slots__ = ("features", "orders", "truncated", "sounds")
@@ -92,99 +87,6 @@ class Fingerprint:
 
     def __repr__(self) -> str:
         return f"Fingerprint({len(self.features)} branches, truncated={self.truncated}, sounds={self.sounds})"
-
-
-# ---- 분기 ----
-
-
-def _command(raw: bytes) -> tuple[bytes, bytes] | None:
-    line = raw.strip()
-    if not line.startswith(b"#"):
-        return None
-    word = line.split(None, 1)
-    return word[0].upper(), (word[1].strip() if len(word) > 1 else b"")
-
-
-def _int(value: bytes) -> int | None:
-    try:
-        number = float(value)
-    except ValueError:
-        return None
-    return int(number) if math.isfinite(number) and number == int(number) else None
-
-
-def _branch_needs(lines: list[bytes]) -> list[dict[int, int]]:
-    """#IF·#ELSEIF·#ELSE 본문마다 그 본문에 들어가려면 필요한 {#RANDOM 줄 번호: 값}. 들어갈 수 없는 본문은 뺍니다.
-    preview._bms_lines와 같은 규칙(#RANDOM은 바깥 분기와 상관없이 쌓임)으로 읽습니다."""
-    needs = []
-    randoms: list[tuple[int | None, int]] = []  # (조절할 수 있는 #RANDOM 줄 번호 또는 None, 범위 또는 고정값)
-    # 열린 #IF 블록: [블록의 #RANDOM, 바깥 조건, 지금 본문 조건(None이면 갈 수 없음), 블록에서 쓴 값들]
-    ifs: list[list] = []
-    for index, raw in enumerate(lines):
-        parsed = _command(raw)
-        if parsed is None:
-            continue
-        command, arg = parsed
-        if command in (b"#RANDOM", b"#RONDAM"):
-            randoms.append((index, max(1, _int(arg) or 1)))
-        elif command == b"#SETRANDOM":
-            randoms.append((None, _int(arg) or 1))
-        elif command == b"#ENDRANDOM":
-            if randoms:
-                randoms.pop()
-        elif command in (b"#IF", b"#ELSEIF", b"#ELSE"):
-            if command == b"#IF":
-                outer = ifs[-1][2] if ifs else {}
-                ifs.append([randoms[-1] if randoms else None, outer, None, set()])
-            elif not ifs:
-                continue
-            block = ifs[-1]
-            random, outer = block[0], block[1]
-            value = _int(arg) if command != b"#ELSE" else None
-            if command == b"#ELSE" and random is not None:
-                line, span = random
-                value = next((v for v in range(1, span + 1) if v not in block[3]), None) if line is not None else (
-                    span if span not in block[3] else None)
-            need = None
-            if outer is not None and random is not None and value is not None:
-                line, span = random
-                if line is None:
-                    need = outer if value == span else None
-                elif 1 <= value <= span and outer.get(line, value) == value:
-                    need = {**outer, line: value}
-            if command != b"#ELSE" and value is not None:
-                block[3].add(value)
-            block[2] = need
-            if need is not None:
-                needs.append(need)
-        elif command in (b"#ENDIF", b"#END") and ifs:
-            ifs.pop()
-    return needs
-
-
-def branch_charts(chart: bytes, limit: int = MAX_VARIANTS) -> tuple[list[bytes], bool]:
-    """#RANDOM 분기를 모두 한 번 이상 지나도록 #RANDOM을 #SETRANDOM으로 바꾼 차트들과, limit 때문에 빠진 분기가
-    있는지. 고르지 않은 #RANDOM은 preview처럼 1입니다. 결과가 같은 차트는 하나만 남깁니다. #RANDOM이 없으면(bmson 포함) 그대로."""
-    if not _RANDOM.search(chart):
-        return [chart], False
-    lines = chart.splitlines()
-    variants: list[dict[int, int]] = [{}]
-    for need in sorted(_branch_needs(lines), key=lambda n: (-len(n), sorted(n.items()))):
-        for variant in variants:
-            if all(variant.get(line, value) == value for line, value in need.items()):
-                variant.update(need)
-                break
-        else:
-            variants.append(dict(need))
-    truncated = len(variants) > limit
-    out, seen = [], set()
-    for variant in variants[:limit]:
-        text = b"\n".join(b"#SETRANDOM %d" % variant[i] if i in variant else line for i, line in enumerate(lines))
-        key = hashlib.sha256(b"\n".join(preview._bms_lines(text))).digest()
-        if key not in seen:
-            seen.add(key)
-            out.append(text)
-    return out, truncated
 
 
 # ---- 렌더 ----
@@ -250,38 +152,33 @@ def features(buf: np.ndarray) -> np.ndarray:
 
 
 def fingerprints(
-    names: list[str], read: Callable[[str], bytes], charts: list[str], deadline: float | None = None,
-    nice: bool = True, seconds: float = MAX_SECONDS, work_dir: pathlib.Path | None = None,
+    names: list[str], read: Callable[[str], bytes], charts: list[str], nice: bool = True, seconds: float = MAX_SECONDS, work_dir: pathlib.Path | None = None,
 ) -> dict[str, Fingerprint]:
     """곡 안 차트들의 렌더 특징. names는 곡 안 모든 파일 경로, read(경로)는 그 내용, charts는 렌더할 차트 경로입니다.
-    키음은 내용(sha256) 기준으로 한 번만 풉니다(decode_cache). deadline(time.monotonic 기준)을 넘기면 남은 분기는
-    건너뛰고 truncated로 둡니다. nice는 ffmpeg 우선순위를 낮출지(commit 중에는 False). seconds는 앞에서부터 렌더할
+    키음은 내용(sha256) 기준으로 한 번만 풉니다(decode_cache). #RANDOM은 1로 보고 차트당 한 번 렌더합니다. nice는 ffmpeg 우선순위를 낮출지(commit 중에는 False). seconds는 앞에서부터 렌더할
     길이(업로드 검색용은 앞부분만), work_dir은 키음을 잠깐 풀어 둘 폴더(기본 cache.work_dir()). ffmpeg가 없으면 RuntimeError."""
     ffmpeg = preview._ffmpeg()
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found")
     resolver = preview._Resolver(names)
-    parsed: dict[str, list[tuple[list[preview.Sound], bool]]] = {}
-    cut: dict[str, bool] = {}
+    parsed: dict[str, tuple[list[preview.Sound], bool]] = {}
     for path in charts:
         try:
             content = read(path)
             if len(content) > MAX_CHART_BYTES:
                 logger.warning(f"render_match: skipped huge chart[{path}] {len(content)} bytes")
                 continue
-            texts, cut[path] = branch_charts(content)
+            parsed[path] = _sounds(content, seconds)
             del content
-            parsed[path] = [_sounds(text, seconds) for text in texts]
         except Exception as e:  # 깨진 차트는 렌더하지 않습니다.
             logger.info(f"render_match: parse failed[{path}]: {e}")
     targets: dict[str, dict[str, str | None]] = {}
-    for path, variants in parsed.items():
+    for path, (sounds, _) in parsed.items():
         base = posixpath.dirname(path)
         found = targets.setdefault(path, {})
-        for sounds, _ in variants:
-            for s in sounds:
-                if s.name not in found:
-                    found[s.name] = resolver.find(base, s.name)
+        for s in sounds:
+            if s.name not in found:
+                found[s.name] = resolver.find(base, s.name)
     members = sorted({t for found in targets.values() for t in found.values() if t})
     decoded: dict[str, np.ndarray] = {}
     if members:
@@ -298,24 +195,17 @@ def fingerprints(
                 if data is not None:
                     decoded[member] = data
     out = {}
-    for path, variants in parsed.items():
+    for path, (sounds, truncated) in parsed.items():
         found = targets[path]
         samples = {name: decoded[t] for name, t in found.items() if t in decoded}
-        feats, orders = [], []
-        truncated = cut[path]
-        for sounds, clipped in variants:
-            if deadline is not None and feats and time.monotonic() > deadline:
-                truncated = True
-                break
-            truncated |= clipped
-            feats.append(features(mix(sounds, samples, seconds)))
-            # 확장자만 다른 키음(.wav/.ogg)은 같은 자리로 봅니다.
-            heard = sorted(
-                (round(s.time, 4), posixpath.splitext(found[s.name].lower())[0])
-                for s in sounds
-                if found.get(s.name) in decoded
-            )
-            orders.append(order_grams([target for _, target in heard]))
+        # 확장자만 다른 키음(.wav/.ogg)은 같은 자리로 봅니다.
+        heard = sorted(
+            (round(s.time, 4), posixpath.splitext(found[s.name].lower())[0])
+            for s in sounds
+            if found.get(s.name) in decoded
+        )
+        feats = [features(mix(sounds, samples, seconds))]
+        orders = [order_grams([target for _, target in heard])]
         out[path] = Fingerprint(feats, orders, truncated, (len(samples), len(found)))
     return out
 
