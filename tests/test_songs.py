@@ -404,3 +404,18 @@ def test_purge_song(client, monkeypatch):
     # 삭제한 곡의 차트는 다시 임포트할 수 있습니다(새 번호).
     job = upload(client, "again.zip", make_zip({"a.bms": b"#TITLE A\n", "01.ogg": b"a"}))
     assert job["songs"][0]["song_id"] == 3 and not job["songs"][0].get("skipped")
+
+
+def test_deleted_song_chart_list_is_ascii(client, monkeypatch):
+    """deleted_song.chart_list는 ascii 열이라 한글·일본어 차트 경로도 \\u 이스케이프로 저장해야 합니다(MySQL 1366 오류)."""
+    admin_login(client, monkeypatch)
+    upload(client, "a.zip", make_zip({"花音.bms": b"#TITLE A\n#WAV01 01.ogg\n", "01.ogg": b"a"}))
+    upload(client, "b.zip", make_zip({"곡B.bms": b"#TITLE B\n"}))
+    assert client.post("/api/admin/songs/1/merge", json={"source": 2}).status_code == 200
+    assert client.delete("/api/admin/songs/1").status_code == 200
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT chart_list FROM deleted_song ORDER BY song_id")
+        lists = [r[0] for r in cur.fetchall()]
+    assert len(lists) == 2 and all(s.isascii() for s in lists)
+    assert client.post("/api/admin/songs/1/restore").status_code == 200
+    assert {c["path"] for c in client.get("/api/admin/songs/1").json()["charts"]} == {"花音.bms", "곡B.bms"}
