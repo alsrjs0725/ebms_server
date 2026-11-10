@@ -2098,7 +2098,7 @@ class Database:
                             (song_id, folder, size, sha256, charts, chart_list, reason, deleted_by, deleted_at)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (song_id, folder, size, sha256, len(charts), json.dumps(charts, ensure_ascii=False), reason,
+                        (song_id, folder, size, sha256, len(charts), json.dumps(charts), reason,
                          deleted_by, int(time.time())),
                     )
                     cur.execute("UPDATE chart SET song_id = NULL WHERE song_id = %s", (song_id,))
@@ -2472,7 +2472,7 @@ class Database:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (source_id, src_folder, src_size, src_sha256, len(src_charts),
-                         json.dumps(src_charts, ensure_ascii=False), reason or f"#{song_id}에 합침", deleted_by,
+                         json.dumps(src_charts), reason or f"#{song_id}에 합침", deleted_by,
                          int(time.time())),
                     )
                     for chart_id, _, filename in src_charts:
