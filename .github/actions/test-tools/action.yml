@@ -1,0 +1,34 @@
+name: 테스트 도구 설치(unrar·7zip·ffmpeg)
+description: >
+  rar·7z 임포트·미리듣기 렌더링 테스트용 도구를 설치합니다. 처음 한 번 받은 .deb 묶음을
+  actions/cache에 두고 다음부터는 그 묶음을 그대로 설치합니다(apt-get update·다운로드 생략).
+  버전을 올리려면 아래 key의 v 숫자를 올리세요.
+
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/apt-debs
+        # 러너 이미지(ubuntu-24.04)와 패키지 목록이 같으면 같은 .deb 묶음을 계속 씁니다.
+        key: test-tools-ubuntu-24.04-v1-unrar-7zip-ffmpeg
+
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ~/apt-debs/partial
+        sudo apt-get update
+        sudo apt-get install -y --download-only -o Dir::Cache::archives="$HOME/apt-debs" unrar 7zip ffmpeg
+        sudo rm -rf ~/apt-debs/partial ~/apt-debs/lock
+        sudo chmod -R a+r ~/apt-debs
+        ls ~/apt-debs | wc -l
+
+    - shell: bash
+      run: |
+        # 캐시한 묶음만으로 설치합니다. 러너 이미지가 바뀌어 맞지 않으면 평소처럼 받아 설치합니다.
+        if ! sudo apt-get install -y --no-download ~/apt-debs/*.deb; then
+          echo "::warning::캐시한 .deb로 설치하지 못해 새로 받습니다. action.yml의 key 버전을 올리세요."
+          sudo apt-get update && sudo apt-get install -y unrar 7zip ffmpeg
+        fi
+        command -v unrar 7z ffmpeg ffprobe
