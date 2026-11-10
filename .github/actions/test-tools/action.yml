@@ -26,9 +26,10 @@ runs:
 
     - shell: bash
       run: |
-        # 캐시한 묶음만으로 설치합니다. 러너 이미지가 바뀌어 맞지 않으면 평소처럼 받아 설치합니다.
-        if ! sudo apt-get install -y --no-download ~/apt-debs/*.deb; then
+        # 캐시한 묶음을 dpkg로 바로 설치합니다. apt-get은 러너 이미지의 오래된 패키지 목록과 버전이
+        # 달라 다시 받으려 하므로 쓰지 않습니다. 러너 이미지가 바뀌어 맞지 않으면 평소처럼 받아 설치합니다.
+        if ! sudo dpkg -i ~/apt-debs/*.deb; then
           echo "::warning::캐시한 .deb로 설치하지 못해 새로 받습니다. action.yml의 key 버전을 올리세요."
-          sudo apt-get update && sudo apt-get install -y unrar 7zip ffmpeg
+          sudo apt-get update && sudo apt-get install -y -f unrar 7zip ffmpeg
         fi
         command -v unrar 7z ffmpeg ffprobe
