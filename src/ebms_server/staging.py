@@ -9,6 +9,13 @@
 - 곡(unit): 차트 파일이 바로 아래 있는 폴더 하나. 대상(target)은 "auto"(겹치는 차트로 판정, 기본),
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
+- 폴더 단위 관리(constant.IMPORT_BY_FOLDER, 기본): 곡 폴더 이름이 같은 기존 곡(song.folder)이 하나면 그 곡에 더합니다(add).
+  곡 팩의 패치처럼 일부 파일만 든 폴더도 그대로 반영됩니다. 같은 이름 곡이 여럿이면 보류(ambiguous, 곡 번호 지정 필요),
+  없으면 아래 판정(겹치는 차트·비슷한 곡·렌더)은 후보로만 보여 주고 auto는 새 곡입니다(다른 폴더의 곡에 자동으로 합치지 않음).
+  다른 폴더에 같은 곡이 있으면 중복으로 남고, 렌더 색인(render_index)의 중복 발견으로 나중에 정리합니다.
+  같은 폴더 곡에 더할 때 같은 경로의 파일 내용이 다르면: 차트는 충돌(보류), 키음·이미지·영상은 같은 소재면 고품질 쪽으로
+  바꾸고 아니면 충돌(media_match, 이미지·영상은 4:3과 16:9가 섞여도 비교), 문서(readme.txt 등)·preview 음원은 기존 유지, 그 밖은 충돌입니다.
+  아래는 IMPORT_BY_FOLDER를 끈 이전 방식입니다.
 - 겹치는 차트가 없는 곡은 비슷한 기존 곡(similar)을 찾습니다(BeMusicSeeker의 차분 도입처 추정과 같은 기준).
   없는 키음(#WAV)이 있으면(차분) #TITLE·#ARTIST·#BPM·#GENRE 중 하나 이상 같고, 없는 키음을 하나 이상 가지고 있고,
   곡과 합쳐 키음 충족률이 SIMILAR_SOUNDS 이상인 기존 곡이 후보입니다. 충족률이 SIMILAR_AUTO_SOUNDS 이상이고
@@ -144,6 +151,9 @@ def _render_units(stage: dict) -> None:
     with db.connect() as con, con.cursor() as cur:
         for unit in stage["units"]:
             if (out / f"{unit['id']}.json").is_file():
+                continue
+            if constant.IMPORT_BY_FOLDER and _folder_songs(cur, unit):
+                # 같은 이름 폴더의 곡에 그대로 더하므로 같은 곡을 찾을 필요가 없습니다.
                 continue
             exact = False
             for chart in unit["charts"]:
@@ -580,10 +590,38 @@ def _analyze_units(stage: dict, prints) -> None:
                 kind = "add"
             else:
                 kind = "ambiguous"
-            unit["suggestion"] = {
+            suggestion = {
                 "kind": kind, "songs": songs, "deleted": deleted, "merge": merge, "matches": matches, "sounds": sounds,
                 "complete": complete, "render": render, "render_partial": partial, "render_blocked": blocked,
             }
+            if constant.IMPORT_BY_FOLDER and deleted is None:
+                _by_folder(suggestion, _folder_songs(cur, unit))
+            unit["suggestion"] = suggestion
+
+
+def _folder_songs(cur, unit: dict) -> list[int]:
+    """곡 폴더 이름(unit["name"], 등록하면 song.folder가 되는 이름)이 같은 기존 곡 번호들."""
+    cur.execute("SELECT id FROM song WHERE folder = %s ORDER BY id", (unit["name"],))
+    return [row[0] for row in cur.fetchall()]
+
+
+def _by_folder(suggestion: dict, folder_songs: list[int]) -> None:
+    """폴더 단위 판정(constant.IMPORT_BY_FOLDER)으로 바꿉니다. 같은 이름 폴더의 곡이 하나면 그 곡에 더하고(add, 일부 파일만 든
+    패치도 그대로), 여럿이면 어느 곡인지 정할 수 없어 보류합니다(ambiguous, hold). 없으면 차트가 겹치거나 비슷한 곡이 있어도
+    다른 폴더의 곡에 합치지 않고 새 곡입니다(similar는 후보로만 보여 줌, merge "new"). 차트가 모두 이미 다른 곡에 있으면
+    새 곡을 만들 수 없어 commit에서 보류됩니다."""
+    others = [s for s in suggestion["songs"] if s not in folder_songs]
+    suggestion["folder"] = folder_songs
+    suggestion["hold"] = None
+    if len(folder_songs) == 1:
+        suggestion.update(kind="add", songs=folder_songs + others, merge=folder_songs[0])
+    elif folder_songs:
+        suggestion.update(
+            kind="ambiguous", songs=folder_songs + others, merge=None,
+            hold=f"같은 이름 폴더의 곡이 여러 개({', '.join(map(str, folder_songs))})라 어느 곡에 넣을지 정할 수 없습니다. 곡 번호를 지정하세요.",
+        )
+    else:
+        suggestion.update(kind="similar" if others else "new", songs=others, merge="new")
 
 
 def analyze(stage_id: str) -> dict:
@@ -1429,8 +1467,15 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     info = {"folder": unit["folder"], "error": str(e) or type(e).__name__}
                     infos.append(info)
                     job.songs.append(info)
+                hold = (unit.get("suggestion") or {}).get("hold")
                 for target, charts in groups if unit_dir is not None else []:
                     label = _label(unit, charts, split)
+                    if target == "auto" and hold:
+                        # 폴더 단위 판정에서 넣을 곡을 정하지 못한 곡(같은 이름 폴더의 곡이 여럿)은 곡 번호를 지정할 때까지 남깁니다.
+                        info = {"folder": label, "error": hold}
+                        infos.append(info)
+                        job.songs.append(info)
+                        continue
                     work = work_root / uuid.uuid4().hex
                     try:
                         song_dir = _subset(unit_dir, charts, all_charts, work) if split else unit_dir

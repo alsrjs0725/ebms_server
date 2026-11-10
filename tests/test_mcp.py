@@ -74,7 +74,7 @@ def test_initialize_and_tools(client, monkeypatch):
 
 
 def test_case_and_recommendation(client, monkeypatch):
-    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "readme.txt": b"one\nTWO\n", "m.wav": b"m"})
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "notes.ini": b"one\nTWO\n", "m.wav": b"m"})
     key = create_key(client)
     api = TestClient(client.app)
 
@@ -94,7 +94,7 @@ def test_case_and_recommendation(client, monkeypatch):
     # 곡 정보는 첫 페이지에만
     assert "existing_songs" not in rest and "new_charts" not in rest
     assert rest["next_offset"] is None and "+TWO" in rest["items"][0]["compare"]["diff_head"]
-    diff = call(api, key, "get_file_diff", stage_id=sid, unit_id=unit["id"], path="readme.txt")
+    diff = call(api, key, "get_file_diff", stage_id=sid, unit_id=unit["id"], path="notes.ini")
     assert "-two" in diff["diff"] and diff["truncated"] is False
 
     # 충돌 파일이 아니거나 고를 수 없는 값은 거부
@@ -108,7 +108,7 @@ def test_case_and_recommendation(client, monkeypatch):
     saved = call(api, key, "submit_recommendation", stage_id=sid, unit_id=unit["id"], model="flash",
                  summary="같은 곡", split_recommended=False, issues=[],
                  items=[{"path": "k.wav", "choice": "new", "confidence": 0.9, "reason": "품질 좋음"},
-                        {"path": "readme.txt", "choice": "unsure"}])
+                        {"path": "notes.ini", "choice": "unsure"}])
     assert saved == {"saved": 2, "recommended": 2, "conflicts": 2, "missing": []}
     assert call(api, key, "list_conflict_units")["units"] == []
     assert len(call(api, key, "list_conflict_units", pending_only=False)["units"]) == 1
@@ -118,7 +118,7 @@ def test_case_and_recommendation(client, monkeypatch):
     items = {i["path"]: i for i in listing["items"]}
     assert items["k.wav"]["choice"] is None
     assert items["k.wav"]["ai"]["choice"] == "new" and items["k.wav"]["ai"]["model"] == "flash"
-    assert items["readme.txt"]["ai"]["choice"] == "unsure"
+    assert items["notes.ini"]["ai"]["choice"] == "unsure"
     assert listing["ai"]["summary"] == "같은 곡" and listing["ai"]["split_recommended"] is False
 
 
@@ -158,7 +158,7 @@ def test_sound_clip(client, monkeypatch, tmp_path):
 
 def test_case_time_budget(client, monkeypatch):
     # 비교 계산이 시간 상한을 넘으면 limit보다 적게 주고 next_offset으로 이어 받게 합니다(최소 1개).
-    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "readme.txt": b"one\nTWO\n"})
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "notes.ini": b"one\nTWO\n"})
     key = create_key(client)
     api = TestClient(client.app)
     monkeypatch.setattr(mcp, "CASE_SECONDS", 0.0)

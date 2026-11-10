@@ -97,17 +97,6 @@ def test_recompressed_image_is_same(tmp_path):
 
 
 @needs_ffmpeg
-def test_reencoded_video_is_same(tmp_path):
-    mpg = video(tmp_path, "a.mpg", "testsrc", 6, "-c:v", "mpeg1video", "-q:v", "2")
-    mp4 = video(tmp_path, "a.mp4", "testsrc", 6, "-c:v", "mpeg4", "-q:v", "8")
-    other = video(tmp_path, "b.mpg", "smptebars", 6, "-c:v", "mpeg1video")
-    longer = video(tmp_path, "c.mpg", "testsrc", 12, "-c:v", "mpeg1video")
-    assert judge(tmp_path, "m.mpg", mpg, mp4)
-    assert not judge(tmp_path, "m2.mpg", mpg, other)
-    assert not judge(tmp_path, "m3.mpg", mpg, longer)
-
-
-@needs_ffmpeg
 def test_merge_keeps_same_media_without_conflict(database, tmp_path):
     a = b"#TITLE A\n"
     wav = noise(tmp_path, "a.wav")
@@ -279,3 +268,82 @@ def test_better_quality_many(tmp_path):
             expected.add(f"k{i}.wav")
     assert media_match.better_new(pairs) == expected
     decode_cache.clear()
+
+
+@needs_ffmpeg
+def test_image_aspect_4_3_and_16_9(tmp_path):
+    """4:3과 16:9가 섞인 BGA: 16:9의 가운데를 자른 4:3, 4:3에 검은 띠를 붙인 16:9(필러박스)도 같은 그림입니다."""
+    wide = ffmpeg(tmp_path, "w.png", "-f", "lavfi", "-i", "testsrc=size=640x360:duration=1", "-frames:v", "1")
+    # 16:9 가운데를 잘라 4:3으로(480×360), 크기도 줄임
+    cropped = ffmpeg(tmp_path, "c.png", "-i", str(tmp_path / "w.png"), "-vf", "crop=480:360,scale=320:240")
+    four = ffmpeg(tmp_path, "f.png", "-f", "lavfi", "-i", "testsrc=size=320x240:duration=1", "-frames:v", "1")
+    pillar = ffmpeg(tmp_path, "p.png", "-i", str(tmp_path / "f.png"), "-vf", "scale=480:360,pad=640:360:80:0:color=black")
+    other = ffmpeg(tmp_path, "o.png", "-f", "lavfi", "-i", "smptebars=size=320x240:duration=1", "-frames:v", "1")
+    assert judge(tmp_path, "bg1.png", wide, cropped)
+    assert judge(tmp_path, "bg2.png", four, pillar)
+    assert not judge(tmp_path, "bg3.png", wide, other)
+    assert not judge(tmp_path, "bg4.png", four, other)
+
+
+def cuts(tmp_path, name, seed, *codec, vf=None, seconds=10, size=(160, 120)):
+    """장면이 무작위 길이로 바뀌는 영상(장면마다 무늬가 조금씩 흐름). seed가 같으면 장면이 바뀌는 때가 같습니다."""
+    w, h = size
+    rng = np.random.default_rng(seed)
+    frames = []
+    while len(frames) < seconds * 25:
+        img = (rng.random((h // 8, w // 8)) * 255).astype(np.uint8).repeat(8, 0).repeat(8, 1)
+        frames += [np.roll(img, k, axis=1) for k in range(int(rng.integers(5, 30)))]
+    out = tmp_path / name
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", "25", "-i", "-"]
+    subprocess.run(cmd + (["-vf", vf] if vf else []) + [*codec, str(out)], input=np.stack(frames[: seconds * 25]).tobytes(), check=True)
+    return out.read_bytes()
+
+
+@needs_ffmpeg
+def test_video_by_motion(tmp_path):
+    """영상은 화면 그대로가 아니라 이전 프레임 대비 변화량 곡선으로 봅니다: 화면비·필러박스·크롭이 달라도 장면이 바뀌는 때가 같으면 같습니다."""
+    base = cuts(tmp_path, "a.mp4", 1, "-c:v", "mpeg4", "-q:v", "4")
+    assert judge(tmp_path, "m1.mp4", base, cuts(tmp_path, "a.mpg", 1, "-c:v", "mpeg1video", "-q:v", "2"))
+    # 4:3 → 16:9 필러박스, 가운데만 잘라 1:1
+    assert judge(tmp_path, "m2.mp4", base, cuts(tmp_path, "w.mp4", 1, "-c:v", "mpeg4", vf="pad=214:120:27:0"))
+    assert judge(tmp_path, "m3.mp4", base, cuts(tmp_path, "c.mpg", 1, "-c:v", "mpeg1video", vf="crop=120:120"))
+    # 장면이 바뀌는 때가 다르거나, 0.3초 늦거나, 길이가 다르면 다름
+    assert not judge(tmp_path, "m4.mp4", base, cuts(tmp_path, "b.mpg", 2, "-c:v", "mpeg1video"))
+    assert not judge(tmp_path, "m5.mp4", base, cuts(tmp_path, "d.mpg", 1, "-c:v", "mpeg1video", vf="tpad=start_duration=0.3"))
+    assert not judge(tmp_path, "m6.mp4", base, cuts(tmp_path, "l.mpg", 1, "-c:v", "mpeg1video", seconds=14))
+
+
+def test_still_video_is_not_judged():
+    """변화가 거의 없는 영상은 판정할 특징이 없어 같다고 보지 않습니다(충돌로 보류)."""
+    still = np.full((50, 64 * 64), 100, np.uint8)
+    assert media_match.motion_correlation(media_match.motion(still), media_match.motion(still)) is None
+    assert not media_match.same_video(still, still)
+
+
+def test_aspect_aligned_math():
+    y, x = np.mgrid[0:96, 0:128]
+    content = (60 + 150 * (x / 128) * (y / 96) + 40 * (x > 64)).astype(np.uint8)[None]  # 4:3 내용(밝은 그림)
+    box = np.zeros((1, 128, 128), np.uint8)
+    box[:, 16:112] = content
+    # 같은 내용을 가운데에 두고 검은 띠를 더 넓게(16:9 필러박스처럼) 둔 것
+    pillar = np.zeros((1, 128, 128), np.uint8)
+    pillar[:, 32:96, 21:107] = _shrink(content, 64, 86)
+    a, b = media_match._aspect_aligned(box, pillar, 64)
+    assert a.shape == b.shape == (1, 64, 64)
+    assert media_match.same_image(np.repeat(a.reshape(-1, 1), 4, 1).reshape(-1), np.repeat(b.reshape(-1, 1), 4, 1).reshape(-1))
+    assert media_match._aspect_aligned(np.zeros((1, 8, 8), np.uint8), box, 64) is None
+
+
+def _shrink(frames, h, w):
+    return np.clip(np.rint(media_match._resize(frames, h, w)), 0, 255).astype(np.uint8)
+
+
+def test_merge_keeps_existing_docs_and_preview(database):
+    a = b"#TITLE A\n"
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "readme.txt": b"old", "preview.ogg": b"p1", "memo.dat": b"m1"})
+    importer.import_tmp()
+    put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "readme.txt": b"new", "preview.ogg": b"p2", "memo.dat": b"m2"})
+    songs = importer.import_tmp()
+    # 문서·preview는 충돌 없이 기존 유지, 그 밖의 다른 파일은 충돌(보류)
+    assert songs[0]["conflicts"] == ["memo.dat"]
+    assert song_zip(1) == {"a.bms": a, "readme.txt": b"old", "preview.ogg": b"p1", "memo.dat": b"m1"}

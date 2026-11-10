@@ -1092,7 +1092,7 @@ def _brief_suggestion(suggestion: dict | None, folders: dict) -> dict | None:
             }
             for s in songs[:5]
         ]
-    for key in ("complete", "render_partial", "render_blocked", "deleted", "merge"):
+    for key in ("complete", "render_partial", "render_blocked", "deleted", "merge", "folder", "hold"):
         if suggestion.get(key):
             out[key] = suggestion[key]
     return out

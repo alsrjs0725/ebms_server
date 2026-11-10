@@ -1002,7 +1002,15 @@ function suggestionCell(stage, unit) {
             : ids.map((id) => songName(stage, id)).join(", ");
         td.append(div);
     }
-    if (s.kind === "similar") {
+    if (s.folder) {
+        // 폴더 단위 판정: 같은 이름 폴더의 곡에 더하거나, 그런 곡이 없으면 새 곡(다른 폴더의 곡에는 자동으로 합치지 않음)
+        const div = document.createElement("div");
+        div.className = "small";
+        div.textContent = s.hold ? `보류: ${s.hold}`
+            : s.folder.length ? `자동: ${songName(stage, s.folder[0])}에 추가 (같은 이름 폴더)`
+            : s.songs.length ? "자동: 새 곡 (다른 폴더의 곡에는 자동으로 합치지 않음, 같은 곡이면 곡 번호 지정)" : "";
+        if (div.textContent) td.append(div);
+    } else if (s.kind === "similar") {
         // 겹치는 채보는 없고 키음·이름·작곡가·BPM·장르가 비슷한 곡만 있을 때 "자동"이 하는 일
         const div = document.createElement("div");
         div.className = "small";
@@ -1085,7 +1093,8 @@ function unitRows(stage, unit, locked) {
     }
     const target = document.createElement("td");
     const suggested = unit.suggestion?.songs || [];
-    if (unit.suggestion?.merge && !suggested.includes(unit.suggestion.merge)) suggested.unshift(unit.suggestion.merge);
+    const merge = unit.suggestion?.merge;
+    if (Number.isInteger(merge) && !suggested.includes(merge)) suggested.unshift(merge);
     target.append(targetControl(stage, unit.target, (v) => saveUnit(unit, v, null), { locked, suggested }));
     const sz = document.createElement("td");
     sz.className = "text-end text-nowrap";

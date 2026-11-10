@@ -28,7 +28,7 @@ SCHEMA = [
             id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             size BIGINT UNSIGNED NOT NULL,
             sha256 CHAR(64) NOT NULL,
-            -- 매니페스트용: 원래 곡 폴더명과 zip 항목 목록(JSON)
+            -- 매니페스트용: 원래 곡 폴더명과 zip 항목 목록(JSON). 폴더명은 업로드 곡을 같은 이름 폴더의 곡에 더할 때도 씁니다(staging).
             folder VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT '',
             files MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
             -- 곡 zip 저장소 파일의 상대 경로(store.py)
@@ -37,7 +37,8 @@ SCHEMA = [
             pre_chunk INT UNSIGNED,
 
             PRIMARY KEY (id),
-            INDEX song_pre_chunk (pre_chunk)
+            INDEX song_pre_chunk (pre_chunk),
+            INDEX song_folder (folder)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
     """
@@ -378,7 +379,7 @@ MISSING_COLUMNS = [
     # 삭제(purge_song)한 시각. 있으면 옮겨 둔 파일이 없어 복원할 수 없고, 같은 차트를 다시 임포트할 수 있습니다.
     ("deleted_song", "purged_at", "BIGINT UNSIGNED"),
 ]
-MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk")]
+MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk"), ("song", "song_folder", "folder")]
 # 곡·청크를 저장소 파일로 옮기기 전(#152) 데이터를 두던 테이블·컬럼. 다 옮긴 DB에서 서버 시작 때 지웁니다.
 BLOB_TABLES = ("song_part", "pre_chunk_part")
 BLOB_COLUMNS = [("song", "data"), ("chart_chunk", "data")]
@@ -847,6 +848,18 @@ def song_dir_entries(source_dir: os.PathLike) -> list[tuple[pathlib.Path, bool]]
             if not is_junk(name, is_dir=False) and _safe_entry(base / name, root, is_dir=False):
                 entries.append((base / name, False))
     return entries
+
+
+# 같은 경로에 내용이 달라도 충돌로 보지 않고 기존 파일을 두는 문서 파일 확장자(readme.txt 등)
+KEEP_EXISTING_DOCS = (".txt",)
+
+
+def keeps_existing(arcname: str) -> bool:
+    """기존 곡에 더할 때 내용이 달라도 기존 파일을 그대로 두는 파일인지: 문서(readme.txt 등)와 preview 음원
+    (이름이 preview로 시작하는 오디오, 플레이어가 미리듣기로 찾는 파일). 충돌로 남기지 않습니다."""
+    name = posixpath.basename(arcname.lower())
+    ext = posixpath.splitext(name)[1]
+    return ext in KEEP_EXISTING_DOCS or (name.startswith("preview") and ext in constant.AUDIO_FORMAT)
 
 
 def _is_chart(arcname: str) -> bool:
@@ -1751,7 +1764,8 @@ class Database:
         (k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg, media_match.slot)도 같은 자리로 보고, 풀어서 비교해 같은 소재
         (다시 인코딩만 다름)로 보이면 둘 중 품질이 좋은 쪽(비슷하면 용량이 작은 쪽, media_match.better_new)을 남기고
         (새 파일을 남기면 기존 파일을 새 파일로 바꿈),
-        그 밖에는 기존 것을 두고 충돌로 돌려줍니다.
+        그 밖에는 기존 것을 두고 충돌로 돌려줍니다. 문서(readme.txt 등)와 preview 음원은 내용이 달라도 충돌로 보지 않고
+        기존 파일을 둡니다(keeps_existing).
         resolutions는 관리자가 충돌 파일마다 고른 것({새 파일 경로: "old" | "new"})입니다. "old"면 새 파일을 버리고,
         "new"면 겨룬 기존 항목을 빼고 새 파일을 넣습니다. 고른 파일은 충돌로 돌려주지 않습니다.
         (새 zip 크기, 더하거나 바꿔 넣은 경로, 충돌 경로, 같은 소재로 본 경로, 등록하지 않을 새 차트 경로
@@ -1767,6 +1781,7 @@ class Database:
         media: list[tuple[str, bytes, pathlib.Path]] = []  # 내용이 다른 키음·이미지·영상(기존 내용, 새 파일)
         media_old: dict[str, str] = {}  # 그 새 파일이 겨룬 기존 항목 이름
         conflict_old: dict[str, tuple[str, pathlib.Path]] = {}  # 충돌한 새 파일이 겨룬 기존 파일 항목 이름, 새 파일
+        kept: list[str] = []  # 내용이 다르지만 기존 것을 둔 문서·preview 음원(keeps_existing)
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             existing = {info.filename.rstrip("/").lower(): info for info in zf.infolist()}
             # 확장자만 다른 파일(k.wav ↔ k.ogg, bg.bmp ↔ bg.png ↔ bg.mpg). 플레이어는 확장자가 달라도 같은 자리로 대신 읽습니다(media_match.slot).
@@ -1785,6 +1800,10 @@ class Database:
                     info = slots.get(media_match.slot(arcname))
                 if info is None:
                     new_files.append((arcname, content))
+                elif not info.is_dir() and keeps_existing(arcname) and keeps_existing(info.filename):
+                    # 문서·preview 음원은 내용이 달라도 기존 파일을 둡니다(충돌 아님).
+                    if info.file_size != len(content) or zf.read(info) != content:
+                        kept.append(arcname)
                 elif info.is_dir() or (kind is not None and media_match.kind(info.filename) != kind):
                     # 같은 BGA 자리에 이미지와 영상: 같은 소재로 볼 수 없습니다.
                     conflicts.append(arcname)
@@ -1821,6 +1840,8 @@ class Database:
                 new_files.append((arcname, path.read_bytes()))
         if resolved:
             self.logger.info(f"insert_song: Song[{song_id}] resolved conflicts by admin {resolved}[{root}]")
+        if kept:
+            self.logger.info(f"insert_song: Song[{song_id}] kept existing documents/previews {sorted(kept)}[{root}]")
         if similar:
             self.logger.info(
                 f"insert_song: Song[{song_id}] judged the same media {similar}, replaced with better new ones "

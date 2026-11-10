@@ -10,8 +10,11 @@ ffmpeg로 풀고, 풀지 못하거나(ffmpeg 없음, 깨진 파일) 다르다고
   둘 다 거의 무음이면 길이만 봅니다. 음량만 다른 것은 같은 것으로 봅니다(상관계수는 크기에 무관).
 - 이미지: IMAGE_SIZE×IMAGE_SIZE RGBA로 (면적 평균으로) 줄여 픽셀 차이 평균이 IMAGE_MAX_MEAN_DIFF 이하이고
   어느 채널이든 IMAGE_PIXEL_DIFF보다 많이 다른 픽셀이 IMAGE_MAX_CHANGED 이하이면 같습니다(움직이는 gif는 첫 프레임).
-- 영상: VIDEO_FPS 간격으로 뽑은 프레임(VIDEO_SIZE×VIDEO_SIZE 흑백, 최대 VIDEO_SECONDS초) 수 차이가
-  VIDEO_FRAME_TOLERANCE 안이고, 프레임 차이 평균이 VIDEO_MAX_MEAN_DIFF 이하이면 같습니다.
+- 이미지의 화면비가 다르면(4:3과 16:9) 위처럼 비교하면 다르게 나오므로, 다르다고 본 쌍은 원래 화면비대로 풀어 검은 테두리를
+  걷고 넓은 쪽 가운데를 좁은 쪽 화면비로 잘라 같은 기준으로 한 번 더 봅니다(_aspect_aligned).
+- 영상: 화면 그대로가 아니라 이전 프레임 대비 얼마나 바뀌는지(변화량 곡선, MOTION_FPS)를 크기 정규화해 비교합니다
+  (same_video). 화면비·레터박스·크롭·화질이 달라도 장면이 바뀌는 때가 같으면 같고, 싱크가 어긋나면 다릅니다.
+  변화가 거의 없는 영상(정지 화면 등)은 판정할 특징이 모자라 같다고 보지 않습니다(충돌로 보류).
 
 같은 소재면 품질이 좋은 쪽을 남깁니다(better_new). ffprobe로 형식을 읽고,
 - 키음: 실제로 소리가 있는 대역폭(손실 압축은 고음을 잘라 냄)이 BAND_MARGIN Hz 넘게 넓은 쪽, 무손실(pcm·flac 등),
@@ -61,11 +64,30 @@ IMAGE_MAX_MEAN_DIFF = 0.02
 IMAGE_PIXEL_DIFF = 0.25
 IMAGE_MAX_CHANGED = 0.002
 
-VIDEO_FPS = 0.5
-VIDEO_SIZE = 64
+# 화면비가 다른 그림·영상(4:3과 16:9): 원래 화면비대로 ASPECT_BOX 안에 맞춰 풀고, 검은 테두리(레터박스·필러박스)를 걷어낸 뒤
+# 화면비가 ASPECT_TOLERANCE 넘게 다르면 넓은 쪽 가운데를 좁은 쪽 화면비로 잘라 같은 크기로 줄여 비교합니다.
+ASPECT_BOX = 256
+# 이 밝기(0~1) 이하면 테두리(검은 띠)로 봅니다(영상 흑백은 제한 범위라 검정이 16/255쯤).
+ASPECT_BLACK = 0.1
+ASPECT_TOLERANCE = 0.03
+
 VIDEO_SECONDS = 600.0
-VIDEO_FRAME_TOLERANCE = 1
+# 충돌 비교 화면(conflicts.py)에서 프레임이 다르다고 표시하는 차이
 VIDEO_MAX_MEAN_DIFF = 0.04
+# 영상 판정: MOTION_FPS로 MOTION_SIZE×MOTION_SIZE 흑백으로 풀어 프레임마다 이전 프레임과의 변화량 곡선을 만들고,
+# 크기를 정규화한 상관계수가 MOTION_MIN_CORRELATION 이상이면 같습니다(인코딩 지연 차이로 ±MOTION_LAG 프레임까지 맞춤).
+MOTION_FPS = 10
+MOTION_SIZE = 64
+MOTION_MIN_CORRELATION = 0.8
+MOTION_LAG = 1
+# 곡선에서 빼는 느린 흐름의 이동 평균 길이(초)
+MOTION_TREND_SECONDS = 1.0
+# 이 값(0~255 평균 차이)보다 크고 곡선 중앙값의 2배보다 큰 프레임이 MOTION_MIN_ACTIVE개보다 적으면 특징 부족(판정 안 함)
+MOTION_FLOOR = 1.0
+MOTION_MIN_ACTIVE = 5
+# 길이 차이 허용: 이 비율과 VIDEO_LENGTH_SECONDS 중 큰 값
+VIDEO_LENGTH_TOLERANCE = 0.02
+VIDEO_LENGTH_SECONDS = 1.0
 
 # 품질 비교: 대역폭은 BAND_RATE Hz로 풀어(최대 BAND_SECONDS초) 평균 스펙트럼이 가장 센 곳보다 BAND_FLOOR_DB 아래로
 # 떨어지기 전의 가장 높은 주파수로 잽니다.
@@ -235,10 +257,83 @@ def _same_images(ffmpeg, items, work) -> dict[str, bool]:
     # 면적 평균으로 줄여, 크기만 바꾼 그림(512→256 등)의 가장자리 차이가 남지 않게 합니다.
     args = ["-frames:v", "1", "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}:flags=area", "-pix_fmt", "rgba", "-f", "rawvideo"]
     size = IMAGE_SIZE * IMAGE_SIZE * 4
-    return {
+    out = {
         path: len(a) == len(b) == size and same_image(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8))
         for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v")
     }
+    # 다르다고 본 쌍은 화면비(4:3·16:9)·검은 테두리를 맞춰 한 번 더 봅니다.
+    retry = [item for item in items if out.get(item[0]) is False]
+    if retry:
+        box = ASPECT_BOX * ASPECT_BOX * 4
+        for path, a, b in _pairs_decoded(ffmpeg, retry, work, ["-frames:v", "1", *_box_args("rgba")], "v"):
+            if len(a) == len(b) == box:
+                fa = np.frombuffer(a, np.uint8).reshape(1, ASPECT_BOX, ASPECT_BOX, 4)
+                fb = np.frombuffer(b, np.uint8).reshape(1, ASPECT_BOX, ASPECT_BOX, 4)
+                pair = _aspect_aligned(fa, fb, IMAGE_SIZE)
+                if pair is not None and same_image(pair[0].reshape(-1), pair[1].reshape(-1)):
+                    out[path] = True
+    return out
+
+
+def _box_args(pix_fmt: str) -> list[str]:
+    """(이미지) 원래 화면비(SAR 반영)대로 ASPECT_BOX×ASPECT_BOX 안에 맞춰 줄이고 남는 곳을 검게 채우는 출력 옵션."""
+    vf = f"scale=iw*sar:ih,scale={ASPECT_BOX}:{ASPECT_BOX}:force_original_aspect_ratio=decrease:flags=area,setsar=1," \
+         f"pad={ASPECT_BOX}:{ASPECT_BOX}:(ow-iw)/2:(oh-ih)/2:color=black"
+    return ["-vf", vf, "-pix_fmt", pix_fmt, "-f", "rawvideo"]
+
+
+def _content_box(frames: np.ndarray) -> tuple[int, int, int, int] | None:
+    """(프레임, 높이, 너비[, 채널]) uint8에서 검은 테두리를 뺀 내용 영역 (위, 아래, 왼쪽, 오른쪽). 모두 검으면 None.
+    RGBA는 투명한 곳도 테두리로 봅니다. 프레임 중 하나라도 밝은 곳은 내용입니다."""
+    f = frames.astype(np.float32) / 255
+    if f.ndim == 4:
+        light = f[..., :3].max(axis=-1) * f[..., 3]
+    else:
+        light = f
+    mask = (light > ASPECT_BLACK).any(axis=0)
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+    if not len(rows) or not len(cols):
+        return None
+    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+
+
+def _resize(frames: np.ndarray, height: int, width: int) -> np.ndarray:
+    """(프레임, 높이, 너비, ...)을 면적 평균으로 height×width로 줄입니다(늘릴 때는 가까운 픽셀)."""
+    def axis(a: np.ndarray, n: int, ax: int) -> np.ndarray:
+        size = a.shape[ax]
+        if size == n:
+            return a
+        if size < n:
+            return np.take(a, (np.arange(n) * size) // n, axis=ax)
+        starts = (np.arange(n) * size) // n
+        counts = np.diff(np.append(starts, size)).astype(np.float32)
+        shape = [1] * a.ndim
+        shape[ax] = n
+        return np.add.reduceat(a, starts, axis=ax) / counts.reshape(shape)
+    return axis(axis(frames.astype(np.float32), height, 1), width, 2)
+
+
+def _aspect_aligned(a: np.ndarray, b: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """화면비를 맞춘 두 그림·영상(_box_args로 푼 (프레임, 높이, 너비[, 채널])): 검은 테두리를 걷고, 화면비가 다르면 넓은 쪽 가운데를
+    좁은 쪽 화면비로 잘라 size×size로 줄인 uint8 배열 둘. 내용이 없으면 None."""
+    boxes = _content_box(a), _content_box(b)
+    if None in boxes:
+        return None
+    crops = [x[:, t:bt, l:r] for x, (t, bt, l, r) in zip((a, b), boxes)]
+    ratios = [c.shape[2] / c.shape[1] for c in crops]
+    if abs(ratios[0] - ratios[1]) > ASPECT_TOLERANCE * min(ratios):
+        target = min(ratios)
+        for i, c in enumerate(crops):
+            if ratios[i] > target:
+                width = max(1, round(c.shape[1] * target))
+                left = (c.shape[2] - width) // 2
+                crops[i] = c[:, :, left:left + width]
+            elif ratios[i] < target:  # 같은 화면비로 맞추므로 여기 오지 않지만 높이 쪽도 자를 수 있게 둡니다.
+                height = max(1, round(c.shape[2] / target))
+                top = (c.shape[1] - height) // 2
+                crops[i] = c[:, top:top + height]
+    out = [np.clip(np.rint(_resize(c, size, size)), 0, 255).astype(np.uint8) for c in crops]
+    return out[0], out[1]
 
 
 def same_image(a: np.ndarray, b: np.ndarray) -> bool:
@@ -251,9 +346,9 @@ def same_image(a: np.ndarray, b: np.ndarray) -> bool:
 def _same_videos(ffmpeg, items, work) -> dict[str, bool]:
     args = [
         "-t", f"{VIDEO_SECONDS:.3f}", "-an",
-        "-vf", f"fps={VIDEO_FPS},scale={VIDEO_SIZE}:{VIDEO_SIZE}:flags=area", "-pix_fmt", "gray", "-f", "rawvideo",
+        "-vf", f"fps={MOTION_FPS},scale={MOTION_SIZE}:{MOTION_SIZE}:flags=area", "-pix_fmt", "gray", "-f", "rawvideo",
     ]
-    frame = VIDEO_SIZE * VIDEO_SIZE
+    frame = MOTION_SIZE * MOTION_SIZE
     same = {}
     for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v"):
         fa = np.frombuffer(a, np.uint8)[: len(a) // frame * frame].reshape(-1, frame)
@@ -262,13 +357,56 @@ def _same_videos(ffmpeg, items, work) -> dict[str, bool]:
     return same
 
 
+def motion(frames: np.ndarray) -> np.ndarray:
+    """(프레임 수, 픽셀) 흑백 프레임의 변화량 곡선: 프레임마다 이전 프레임과의 픽셀 차이 평균(프레임 수 - 1개)."""
+    f = frames.astype(np.float32)
+    return np.abs(np.diff(f, axis=0)).mean(axis=1) if len(f) > 1 else np.zeros(0, np.float32)
+
+
+def _detrend(m: np.ndarray) -> np.ndarray:
+    """곡선에서 MOTION_TREND_SECONDS 이동 평균을 뺀 값. 전체적으로 움직임이 늘고 주는 흐름(어느 영상이나 비슷할 수 있음)을 빼고
+    언제 바뀌는지만 남깁니다."""
+    window = max(1, int(MOTION_TREND_SECONDS * MOTION_FPS)) | 1
+    if len(m) < window:
+        return m - m.mean()
+    pad = np.pad(m.astype(np.float64), window // 2, mode="edge")
+    return m - np.convolve(pad, np.ones(window) / window, mode="valid")
+
+
 def same_video(a: np.ndarray, b: np.ndarray) -> bool:
-    """a, b: (프레임 수, 픽셀) 흑백 프레임."""
-    if not len(a) or not len(b) or abs(len(a) - len(b)) > VIDEO_FRAME_TOLERANCE:
+    """a, b: (프레임 수, 픽셀) 흑백 프레임(MOTION_FPS). 화면 그대로가 아니라 변화량 곡선(motion)을 크기 정규화해
+    비교하므로 화면비·레터박스·크롭·배율·화질이 달라도, 화면비마다 따로 렌더했어도 장면이 바뀌는 때가 같으면 같습니다.
+    길이가 VIDEO_LENGTH_TOLERANCE 넘게 다르거나, 어느 쪽이든 변화가 적어(정지 화면 등) 판정할 특징이 모자라면 같다고 보지 않습니다."""
+    ma, mb = motion(a), motion(b)
+    if not len(ma) or not len(mb):
         return False
-    n = min(len(a), len(b))
-    diff = np.abs(a[:n].astype(np.float32) - b[:n].astype(np.float32)) / 255
-    return float(diff.mean()) <= VIDEO_MAX_MEAN_DIFF
+    if abs(len(ma) - len(mb)) > max(VIDEO_LENGTH_TOLERANCE * max(len(ma), len(mb)), VIDEO_LENGTH_SECONDS * MOTION_FPS):
+        return False
+    value = motion_correlation(ma, mb)
+    return value is not None and value >= MOTION_MIN_CORRELATION
+
+
+def motion_correlation(a: np.ndarray, b: np.ndarray) -> float | None:
+    """변화량 곡선 둘의 정규화 상관계수(느린 흐름을 빼고(_detrend) 크기로 나눔, ±MOTION_LAG 프레임 안에서 가장 큰 값).
+    어느 쪽이든 변화가 MOTION_MIN_ACTIVE 프레임보다 적으면 None(특징 부족)."""
+    def active(m: np.ndarray) -> int:
+        return int((m > max(MOTION_FLOOR, float(np.median(m)) * 2)).sum())
+    if active(a) < MOTION_MIN_ACTIVE or active(b) < MOTION_MIN_ACTIVE:
+        return None
+    a, b = _detrend(a), _detrend(b)
+    best = None
+    for lag in range(-MOTION_LAG, MOTION_LAG + 1):
+        x, y = (a[lag:], b) if lag >= 0 else (a, b[-lag:])
+        n = min(len(x), len(y))
+        if n < 2:
+            continue
+        x = x[:n].astype(np.float64) - x[:n].mean()
+        y = y[:n].astype(np.float64) - y[:n].mean()
+        denom = np.sqrt(np.dot(x, x) * np.dot(y, y))
+        if denom > 0:
+            value = float(np.dot(x, y) / denom)
+            best = value if best is None else max(best, value)
+    return best
 
 
 # ---- 품질 비교(같은 소재일 때 어느 쪽을 남길지) ----
