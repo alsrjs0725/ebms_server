@@ -610,3 +610,75 @@ def test_merge_does_not_borrow(client, monkeypatch):
     result = commit_stage(client, job["stage_id"])
     assert [s.get("borrowed_sounds") for s in result["songs"]] == [None]
     assert song_files(1) == ["a.bms", "kick.wav", "x.bms"]
+
+
+def test_folder_mode_adds_to_same_folder_only(client, monkeypatch):
+    """폴더 단위 관리: 같은 이름 폴더의 곡에만 더하고(일부 파일만 든 패치도), 다른 폴더의 곡에는 차트가 겹쳐도 합치지 않습니다."""
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    a = b"#TITLE Song\n#WAV01 k.wav\n"
+    upload(client, "full.zip", make_zip({"Song/a.bms": a, "Song/k.wav": b"k", "Song/readme.txt": b"r1"}))
+    assert [tuple(r) for r in song_rows()] == [(1, "Song")]
+
+    job = stage(client, "patch.zip", make_zip({
+        # 패치: 새 차트와 바뀐 readme만(키음 없음)
+        "Patch/Song/new.bms": b"#TITLE Song [NEW]\n#WAV01 k.wav\n",
+        "Patch/Song/readme.txt": b"r2",
+        # 다른 폴더인데 곡 1의 차트를 그대로 가진 곡
+        "Patch/Other/a.bms": a,
+        "Patch/Other/o.bms": b"#TITLE Other\n#WAV01 o.wav\n",
+        "Patch/Other/o.wav": b"o",
+        # 다른 폴더인데 차트가 모두 곡 1에 있는 곡
+        "Patch/Copy/a.bms": a,
+    }))
+    sid = job["stage_id"]
+    got = units(client, sid)
+    song = got["patch/Patch/Song"]["suggestion"]
+    assert (song["kind"], song["songs"], song["merge"], song["folder"]) == ("add", [1], 1, [1])
+    other = got["patch/Patch/Other"]["suggestion"]
+    assert (other["kind"], other["songs"], other["merge"], other["folder"]) == ("similar", [1], "new", [])
+
+    result = commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "Song"), (2, "Other")]
+    # readme는 충돌 없이 기존 유지
+    assert song_files(1) == ["a.bms", "k.wav", "new.bms", "readme.txt"]
+    with zipfile.ZipFile(io.BytesIO(db_module.Database().get_song_data(1))) as zf:
+        assert zf.read("readme.txt") == b"r1"
+    # 곡에 없는 키음(a.bms의 k.wav)은 후보 곡에서 복사해 플레이할 수 있게 합니다.
+    assert song_files(2) == ["a.bms", "k.wav", "o.bms", "o.wav"]
+    assert chart_owner(a) == 1 and chart_owner(b"#TITLE Other\n#WAV01 o.wav\n") == 2
+    # 차트가 모두 다른 곡에 있는 폴더는 새 곡을 만들 수 없어 남습니다.
+    left = units(client, sid)
+    assert list(left) == ["patch/Patch/Copy"] and left["patch/Patch/Copy"]["result"]["error"]
+    assert any(s.get("error") for s in result["songs"])
+
+
+def test_folder_mode_holds_chart_conflict_and_ambiguous(client, monkeypatch):
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    upload(client, "one.zip", make_zip({"Dup/x.bms": b"#TITLE X\n"}))
+    sid = stage(client, "two.zip", make_zip({"Dup/y.bms": b"#TITLE Y\n"}))["stage_id"]
+    unit = units(client, sid)["two/Dup"]
+    assert unit["suggestion"]["merge"] == 1
+    assert set_target(client, sid, unit, "new").status_code == 200
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "Dup"), (2, "Dup")]
+
+    # 같은 이름 폴더의 곡이 둘이면 보류(곡 번호를 지정해야 함)
+    sid = stage(client, "three.zip", make_zip({"Dup/z.bms": b"#TITLE Z\n"}))["stage_id"]
+    unit = units(client, sid)["three/Dup"]
+    assert unit["suggestion"]["kind"] == "ambiguous" and unit["suggestion"]["hold"]
+    commit_stage(client, sid)
+    unit = units(client, sid)["three/Dup"]
+    assert "여러 개" in unit["result"]["error"]
+    assert set_target(client, sid, unit, 2).status_code == 200
+    commit_stage(client, sid)
+    assert song_files(2) == ["y.bms", "z.bms"]
+
+    # 같은 경로 차트의 내용이 다르면 보류(충돌)
+    sid = stage(client, "fix.zip", make_zip({"Dup/x.bms": b"#TITLE X fixed\n"}))["stage_id"]
+    unit = units(client, sid)["fix/Dup"]
+    assert set_target(client, sid, unit, 1).status_code == 200
+    commit_stage(client, sid)
+    assert units(client, sid)["fix/Dup"]["result"]["conflicts"] == ["x.bms"]
+    assert song_files(1) == ["x.bms"]

@@ -95,6 +95,10 @@ RENDER_INDEX_CPUS = os.environ.get("EBMS_RENDER_INDEX_CPUS", "")
 # 찾습니다(stage_render.py). STAGE_RENDER_WORKERS개 프로세스로 나눠 렌더하고, 0이면 렌더 검색을 하지 않습니다.
 STAGE_RENDER_WORKERS = int(os.environ.get("EBMS_STAGE_RENDER_WORKERS", "4"))
 STAGE_RENDER_SECONDS = float(os.environ.get("EBMS_STAGE_RENDER_SECONDS", "60"))
+# 업로드 곡을 폴더(디렉토리) 단위로 관리합니다(staging). 곡 폴더 이름이 같은 기존 곡이 있으면 그 곡에 더하고(일부 파일만 든
+# 패치도 그대로 반영), 없으면 차트가 겹치거나 비슷한 곡이 있어도 다른 폴더의 곡에 자동으로 합치지 않고 새 곡으로 넣습니다
+# (후보로만 보여 줌). 0이면 이전 방식(겹치는 차트·비슷한 곡 판정으로 다른 폴더 곡에도 더함).
+IMPORT_BY_FOLDER = os.environ.get("EBMS_IMPORT_BY_FOLDER", "1").strip().lower() not in ("0", "false", "no", "")
 # 공유용 난이도표 정적 페이지 폴더. `/table/{표 이름}.html`(과 그 페이지가 가리키는 header·data JSON)로 그대로 내보냅니다.
 TABLE_PAGE_DIR = BASE_DIR / "src" / "ebms_server" / "table"
 # /api/version 으로 알려주는 API 버전. 클라이언트와 호환되지 않는 변경이 있을 때 올립니다.

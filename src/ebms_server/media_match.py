@@ -10,6 +10,8 @@ ffmpeg로 풀고, 풀지 못하거나(ffmpeg 없음, 깨진 파일) 다르다고
   둘 다 거의 무음이면 길이만 봅니다. 음량만 다른 것은 같은 것으로 봅니다(상관계수는 크기에 무관).
 - 이미지: IMAGE_SIZE×IMAGE_SIZE RGBA로 (면적 평균으로) 줄여 픽셀 차이 평균이 IMAGE_MAX_MEAN_DIFF 이하이고
   어느 채널이든 IMAGE_PIXEL_DIFF보다 많이 다른 픽셀이 IMAGE_MAX_CHANGED 이하이면 같습니다(움직이는 gif는 첫 프레임).
+- 이미지·영상의 화면비가 다르면(4:3과 16:9) 위처럼 비교하면 다르게 나오므로, 다르다고 본 쌍은 원래 화면비대로 풀어 검은 테두리를
+  걷고 넓은 쪽 가운데를 좁은 쪽 화면비로 잘라 같은 기준으로 한 번 더 봅니다(_aspect_aligned).
 - 영상: VIDEO_FPS 간격으로 뽑은 프레임(VIDEO_SIZE×VIDEO_SIZE 흑백, 최대 VIDEO_SECONDS초) 수 차이가
   VIDEO_FRAME_TOLERANCE 안이고, 프레임 차이 평균이 VIDEO_MAX_MEAN_DIFF 이하이면 같습니다.
 
@@ -60,6 +62,13 @@ IMAGE_SIZE = 64
 IMAGE_MAX_MEAN_DIFF = 0.02
 IMAGE_PIXEL_DIFF = 0.25
 IMAGE_MAX_CHANGED = 0.002
+
+# 화면비가 다른 그림·영상(4:3과 16:9): 원래 화면비대로 ASPECT_BOX 안에 맞춰 풀고, 검은 테두리(레터박스·필러박스)를 걷어낸 뒤
+# 화면비가 ASPECT_TOLERANCE 넘게 다르면 넓은 쪽 가운데를 좁은 쪽 화면비로 잘라 같은 크기로 줄여 비교합니다.
+ASPECT_BOX = 256
+# 이 밝기(0~1) 이하면 테두리(검은 띠)로 봅니다(영상 흑백은 제한 범위라 검정이 16/255쯤).
+ASPECT_BLACK = 0.1
+ASPECT_TOLERANCE = 0.03
 
 VIDEO_FPS = 0.5
 VIDEO_SIZE = 64
@@ -235,10 +244,85 @@ def _same_images(ffmpeg, items, work) -> dict[str, bool]:
     # 면적 평균으로 줄여, 크기만 바꾼 그림(512→256 등)의 가장자리 차이가 남지 않게 합니다.
     args = ["-frames:v", "1", "-vf", f"scale={IMAGE_SIZE}:{IMAGE_SIZE}:flags=area", "-pix_fmt", "rgba", "-f", "rawvideo"]
     size = IMAGE_SIZE * IMAGE_SIZE * 4
-    return {
+    out = {
         path: len(a) == len(b) == size and same_image(np.frombuffer(a, np.uint8), np.frombuffer(b, np.uint8))
         for path, a, b in _pairs_decoded(ffmpeg, items, work, args, "v")
     }
+    # 다르다고 본 쌍은 화면비(4:3·16:9)·검은 테두리를 맞춰 한 번 더 봅니다.
+    retry = [item for item in items if out.get(item[0]) is False]
+    if retry:
+        box = ASPECT_BOX * ASPECT_BOX * 4
+        for path, a, b in _pairs_decoded(ffmpeg, retry, work, ["-frames:v", "1", *_box_args("rgba")], "v"):
+            if len(a) == len(b) == box:
+                fa = np.frombuffer(a, np.uint8).reshape(1, ASPECT_BOX, ASPECT_BOX, 4)
+                fb = np.frombuffer(b, np.uint8).reshape(1, ASPECT_BOX, ASPECT_BOX, 4)
+                pair = _aspect_aligned(fa, fb, IMAGE_SIZE)
+                if pair is not None and same_image(pair[0].reshape(-1), pair[1].reshape(-1)):
+                    out[path] = True
+    return out
+
+
+def _box_args(pix_fmt: str, fps: bool = False) -> list[str]:
+    """원래 화면비(SAR 반영)대로 ASPECT_BOX×ASPECT_BOX 안에 맞춰 줄이고 남는 곳을 검게 채우는 출력 옵션."""
+    vf = f"scale=iw*sar:ih,scale={ASPECT_BOX}:{ASPECT_BOX}:force_original_aspect_ratio=decrease:flags=area,setsar=1," \
+         f"pad={ASPECT_BOX}:{ASPECT_BOX}:(ow-iw)/2:(oh-ih)/2:color=black"
+    if fps:
+        vf = f"fps={VIDEO_FPS}," + vf
+    return ["-vf", vf, "-pix_fmt", pix_fmt, "-f", "rawvideo"]
+
+
+def _content_box(frames: np.ndarray) -> tuple[int, int, int, int] | None:
+    """(프레임, 높이, 너비[, 채널]) uint8에서 검은 테두리를 뺀 내용 영역 (위, 아래, 왼쪽, 오른쪽). 모두 검으면 None.
+    RGBA는 투명한 곳도 테두리로 봅니다. 프레임 중 하나라도 밝은 곳은 내용입니다."""
+    f = frames.astype(np.float32) / 255
+    if f.ndim == 4:
+        light = f[..., :3].max(axis=-1) * f[..., 3]
+    else:
+        light = f
+    mask = (light > ASPECT_BLACK).any(axis=0)
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+    if not len(rows) or not len(cols):
+        return None
+    return int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+
+
+def _resize(frames: np.ndarray, height: int, width: int) -> np.ndarray:
+    """(프레임, 높이, 너비, ...)을 면적 평균으로 height×width로 줄입니다(늘릴 때는 가까운 픽셀)."""
+    def axis(a: np.ndarray, n: int, ax: int) -> np.ndarray:
+        size = a.shape[ax]
+        if size == n:
+            return a
+        if size < n:
+            return np.take(a, (np.arange(n) * size) // n, axis=ax)
+        starts = (np.arange(n) * size) // n
+        counts = np.diff(np.append(starts, size)).astype(np.float32)
+        shape = [1] * a.ndim
+        shape[ax] = n
+        return np.add.reduceat(a, starts, axis=ax) / counts.reshape(shape)
+    return axis(axis(frames.astype(np.float32), height, 1), width, 2)
+
+
+def _aspect_aligned(a: np.ndarray, b: np.ndarray, size: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """화면비를 맞춘 두 그림·영상(_box_args로 푼 (프레임, 높이, 너비[, 채널])): 검은 테두리를 걷고, 화면비가 다르면 넓은 쪽 가운데를
+    좁은 쪽 화면비로 잘라 size×size로 줄인 uint8 배열 둘. 내용이 없으면 None."""
+    boxes = _content_box(a), _content_box(b)
+    if None in boxes:
+        return None
+    crops = [x[:, t:bt, l:r] for x, (t, bt, l, r) in zip((a, b), boxes)]
+    ratios = [c.shape[2] / c.shape[1] for c in crops]
+    if abs(ratios[0] - ratios[1]) > ASPECT_TOLERANCE * min(ratios):
+        target = min(ratios)
+        for i, c in enumerate(crops):
+            if ratios[i] > target:
+                width = max(1, round(c.shape[1] * target))
+                left = (c.shape[2] - width) // 2
+                crops[i] = c[:, :, left:left + width]
+            elif ratios[i] < target:  # 같은 화면비로 맞추므로 여기 오지 않지만 높이 쪽도 자를 수 있게 둡니다.
+                height = max(1, round(c.shape[2] / target))
+                top = (c.shape[1] - height) // 2
+                crops[i] = c[:, top:top + height]
+    out = [np.clip(np.rint(_resize(c, size, size)), 0, 255).astype(np.uint8) for c in crops]
+    return out[0], out[1]
 
 
 def same_image(a: np.ndarray, b: np.ndarray) -> bool:
@@ -259,6 +343,19 @@ def _same_videos(ffmpeg, items, work) -> dict[str, bool]:
         fa = np.frombuffer(a, np.uint8)[: len(a) // frame * frame].reshape(-1, frame)
         fb = np.frombuffer(b, np.uint8)[: len(b) // frame * frame].reshape(-1, frame)
         same[path] = same_video(fa, fb)
+    # 다르다고 본 쌍은 화면비(4:3·16:9)·검은 테두리를 맞춰 한 번 더 봅니다.
+    retry = [item for item in items if same.get(item[0]) is False]
+    if retry:
+        box = ASPECT_BOX * ASPECT_BOX
+        args = ["-t", f"{VIDEO_SECONDS:.3f}", "-an", *_box_args("gray", fps=True)]
+        for path, a, b in _pairs_decoded(ffmpeg, retry, work, args, "v"):
+            fa = np.frombuffer(a, np.uint8)[: len(a) // box * box].reshape(-1, ASPECT_BOX, ASPECT_BOX)
+            fb = np.frombuffer(b, np.uint8)[: len(b) // box * box].reshape(-1, ASPECT_BOX, ASPECT_BOX)
+            if not len(fa) or not len(fb) or abs(len(fa) - len(fb)) > VIDEO_FRAME_TOLERANCE:
+                continue
+            pair = _aspect_aligned(fa, fb, VIDEO_SIZE)
+            if pair is not None and same_video(pair[0].reshape(len(fa), -1), pair[1].reshape(len(fb), -1)):
+                same[path] = True
     return same
 
 

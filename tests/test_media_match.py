@@ -279,3 +279,56 @@ def test_better_quality_many(tmp_path):
             expected.add(f"k{i}.wav")
     assert media_match.better_new(pairs) == expected
     decode_cache.clear()
+
+
+@needs_ffmpeg
+def test_image_aspect_4_3_and_16_9(tmp_path):
+    """4:3과 16:9가 섞인 BGA: 16:9의 가운데를 자른 4:3, 4:3에 검은 띠를 붙인 16:9(필러박스)도 같은 그림입니다."""
+    wide = ffmpeg(tmp_path, "w.png", "-f", "lavfi", "-i", "testsrc=size=640x360:duration=1", "-frames:v", "1")
+    # 16:9 가운데를 잘라 4:3으로(480×360), 크기도 줄임
+    cropped = ffmpeg(tmp_path, "c.png", "-i", str(tmp_path / "w.png"), "-vf", "crop=480:360,scale=320:240")
+    four = ffmpeg(tmp_path, "f.png", "-f", "lavfi", "-i", "testsrc=size=320x240:duration=1", "-frames:v", "1")
+    pillar = ffmpeg(tmp_path, "p.png", "-i", str(tmp_path / "f.png"), "-vf", "scale=480:360,pad=640:360:80:0:color=black")
+    other = ffmpeg(tmp_path, "o.png", "-f", "lavfi", "-i", "smptebars=size=320x240:duration=1", "-frames:v", "1")
+    assert judge(tmp_path, "bg1.png", wide, cropped)
+    assert judge(tmp_path, "bg2.png", four, pillar)
+    assert not judge(tmp_path, "bg3.png", wide, other)
+    assert not judge(tmp_path, "bg4.png", four, other)
+
+
+@needs_ffmpeg
+def test_video_aspect_4_3_and_16_9(tmp_path):
+    wide = ffmpeg(tmp_path, "w.mp4", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=6", "-c:v", "mpeg4", "-q:v", "3")
+    cropped = ffmpeg(tmp_path, "c.mpg", "-i", str(tmp_path / "w.mp4"), "-vf", "crop=240:180", "-c:v", "mpeg1video", "-q:v", "2")
+    other = ffmpeg(tmp_path, "o.mpg", "-f", "lavfi", "-i", "smptebars=size=240x180:rate=25:duration=6", "-c:v", "mpeg1video")
+    assert judge(tmp_path, "m1.mp4", wide, cropped)
+    assert not judge(tmp_path, "m2.mp4", wide, other)
+
+
+def test_aspect_aligned_math():
+    y, x = np.mgrid[0:96, 0:128]
+    content = (60 + 150 * (x / 128) * (y / 96) + 40 * (x > 64)).astype(np.uint8)[None]  # 4:3 내용(밝은 그림)
+    box = np.zeros((1, 128, 128), np.uint8)
+    box[:, 16:112] = content
+    # 같은 내용을 가운데에 두고 검은 띠를 더 넓게(16:9 필러박스처럼) 둔 것
+    pillar = np.zeros((1, 128, 128), np.uint8)
+    pillar[:, 32:96, 21:107] = _shrink(content, 64, 86)
+    a, b = media_match._aspect_aligned(box, pillar, 64)
+    assert a.shape == b.shape == (1, 64, 64)
+    assert media_match.same_image(np.repeat(a.reshape(-1, 1), 4, 1).reshape(-1), np.repeat(b.reshape(-1, 1), 4, 1).reshape(-1))
+    assert media_match._aspect_aligned(np.zeros((1, 8, 8), np.uint8), box, 64) is None
+
+
+def _shrink(frames, h, w):
+    return np.clip(np.rint(media_match._resize(frames, h, w)), 0, 255).astype(np.uint8)
+
+
+def test_merge_keeps_existing_docs_and_preview(database):
+    a = b"#TITLE A\n"
+    put_song(constant.TMP_DIR / "g" / "song1", {"a.bms": a, "readme.txt": b"old", "preview.ogg": b"p1", "memo.dat": b"m1"})
+    importer.import_tmp()
+    put_song(constant.TMP_DIR / "g" / "pkg", {"a.bms": a, "readme.txt": b"new", "preview.ogg": b"p2", "memo.dat": b"m2"})
+    songs = importer.import_tmp()
+    # 문서·preview는 충돌 없이 기존 유지, 그 밖의 다른 파일은 충돌(보류)
+    assert songs[0]["conflicts"] == ["memo.dat"]
+    assert song_zip(1) == {"a.bms": a, "readme.txt": b"old", "preview.ogg": b"p1", "memo.dat": b"m1"}

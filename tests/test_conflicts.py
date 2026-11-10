@@ -25,7 +25,7 @@ def song_zip(song_id):
 def conflicted(client, monkeypatch, new_files):
     """기존 곡(#1)과 겹치는 곡을 올려 commit하고, 충돌로 남은 (묶음 id, 곡) 을 돌려줍니다."""
     admin_login(client, monkeypatch)
-    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": b"old", "readme.txt": b"one\ntwo\n"}))
+    upload(client, "base.zip", make_zip({"a.bms": b"#TITLE A\n", "k.wav": b"old", "notes.ini": b"one\ntwo\n"}))
     job = stage(client, "pack.zip", make_zip({f"p/s/{k}": v for k, v in {"a.bms": b"#TITLE A\n", **new_files}.items()}))
     sid = job["stage_id"]
     commit_stage(client, sid)
@@ -37,8 +37,8 @@ def base(sid, unit):
 
 
 def test_list_choose_and_apply(client, monkeypatch):
-    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "readme.txt": b"one\nTWO\n", "m.wav": b"m"})
-    assert unit["result"]["conflicts"] == ["k.wav", "readme.txt"]
+    sid, unit = conflicted(client, monkeypatch, {"k.wav": b"new", "notes.ini": b"one\nTWO\n", "m.wav": b"m"})
+    assert unit["result"]["conflicts"] == ["k.wav", "notes.ini"]
 
     r = client.get(base(sid, unit))
     assert r.status_code == 200, r.text
@@ -47,7 +47,7 @@ def test_list_choose_and_apply(client, monkeypatch):
         "path": "k.wav", "song_id": 1, "kind": "sound", "new_size": 3,
         "old_path": "k.wav", "old_kind": "sound", "old_size": 3, "choice": None, "ai": None,
     }
-    assert items["readme.txt"]["kind"] == "other"
+    assert items["notes.ini"]["kind"] == "other"
 
     # 원본 내려받기와 텍스트 diff
     r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "old", "raw": True})
@@ -57,17 +57,17 @@ def test_list_choose_and_apply(client, monkeypatch):
     # 재생 중 위치를 옮길 수 있게 Range 요청을 받습니다.
     r = client.get(base(sid, unit) + "/file", params={"path": "k.wav", "side": "new"}, headers={"Range": "bytes=1-2"})
     assert r.status_code == 206 and r.content == b"ew"
-    diff = client.get(base(sid, unit) + "/compare", params={"path": "readme.txt"}).json()
+    diff = client.get(base(sid, unit) + "/compare", params={"path": "notes.ini"}).json()
     assert "-two" in diff["diff"] and "+TWO" in diff["diff"]
     assert client.get(base(sid, unit) + "/file", params={"path": "a.bms", "side": "old"}).status_code == 404
 
     # 다 고르기 전에는 적용할 수 없습니다.
     assert client.put(base(sid, unit), json={"choices": {"k.wav": "new"}}).status_code == 200
     assert client.post(base(sid, unit) + "/apply").status_code == 409
-    assert client.put(base(sid, unit), json={"choices": {"readme.txt": "maybe"}}).status_code == 400
+    assert client.put(base(sid, unit), json={"choices": {"notes.ini": "maybe"}}).status_code == 400
     assert client.put(base(sid, unit), json={"choices": {"zz.txt": "old"}}).status_code == 400
-    assert client.put(base(sid, unit), json={"choices": {"readme.txt": "old"}}).json() == {
-        "resolutions": {"k.wav": "new", "readme.txt": "old"},
+    assert client.put(base(sid, unit), json={"choices": {"notes.ini": "old"}}).json() == {
+        "resolutions": {"k.wav": "new", "notes.ini": "old"},
     }
 
     r = client.post(base(sid, unit) + "/apply")
@@ -75,10 +75,10 @@ def test_list_choose_and_apply(client, monkeypatch):
     done = wait(client, r.json())
     assert done["songs"] == [{
         "folder": "pack/p/s", "song_id": 1, "new_song": False, "charts": 1, "new_charts": 0,
-        "resolved_files": {"k.wav": "new", "readme.txt": "old"},
+        "resolved_files": {"k.wav": "new", "notes.ini": "old"},
     }]
     files = song_zip(1)
-    assert files["k.wav"] == b"new" and files["readme.txt"] == b"one\ntwo\n" and files["m.wav"] == b"m"
+    assert files["k.wav"] == b"new" and files["notes.ini"] == b"one\ntwo\n" and files["m.wav"] == b"m"
     # 충돌이 풀린 곡은 묶음에서 빠지고, 남은 곡이 없으면 묶음도 지웁니다.
     assert client.get(f"/api/admin/import/stages/{sid}").status_code == 404
 
