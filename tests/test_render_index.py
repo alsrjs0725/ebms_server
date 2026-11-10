@@ -1,5 +1,6 @@
 """모든 곡 렌더 색인(render_index): 다른 곡 번호의 같은 곡(중복)과 곡 안에 섞인 다른 곡(섞임) 찾기."""
 import logging
+import time
 
 import numpy as np
 
@@ -50,6 +51,19 @@ def test_index_finds_duplicate_and_mixed_songs(client, monkeypatch, tmp_path):
     mixed_finding = next(f for f in found if f["kind"] == "mixed")
     assert sorted(map(sorted, mixed_finding["detail"]["groups"])) == [["a.bms", "a2.bms"], ["b.bms"]]
     assert "#1" in client.get("/admin/render").text
+    assert 'data-listen data-song="2" data-chart="c.bms"' in client.get("/admin/render").text
+
+    # 차트 렌더 음원 듣기: 처음엔 만들기 시작하고, 다 되면 ogg를 받습니다.
+    assert client.get("/api/admin/render/audio", params={"song": 1, "chart": "zz.bms"}).status_code == 404
+    assert client.get("/api/admin/render/audio/file", params={"song": 2, "chart": "c.bms"}).status_code == 404
+    for _ in range(200):
+        state = client.get("/api/admin/render/audio", params={"song": 2, "chart": "c.bms"}).json()
+        if state["status"] != "running":
+            break
+        time.sleep(0.1)
+    assert state == {"status": "ready"}
+    res = client.get("/api/admin/render/audio/file", params={"song": 2, "chart": "c.bms"})
+    assert res.status_code == 200 and res.headers["content-type"] == "audio/ogg" and res.content[:4] == b"OggS"
 
     # 넘긴 항목은 다시 색인해도 열리지 않습니다. 바뀐 곡이 없으면 다시 색인하지 않습니다.
     assert client.put(f"/api/admin/render/findings/{dup['id']}", json={"status": "dismissed"}).status_code == 200
