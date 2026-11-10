@@ -1,0 +1,21 @@
+name: Runner image
+
+# 홈서버 배포용 runner 이미지(deploy/runner)가 빌드되는지 확인합니다.
+# apt·runner 다운로드가 많아 Ubuntu 미러가 느리면 수십 분 걸리므로, 그 폴더가 바뀔 때만 돌립니다.
+on:
+  pull_request:
+    paths: [deploy/runner/**, .github/workflows/runner-image.yml]
+  push:
+    branches: [develop]
+    paths: [deploy/runner/**, .github/workflows/runner-image.yml]
+
+jobs:
+  runner-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/runner
+          push: false
