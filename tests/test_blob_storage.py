@@ -393,10 +393,12 @@ def song_member_cases(database):
 
 def test_read_song_member(tmp_path, database):
     """곡 zip 전체를 읽지 않고 항목 하나만 풀어 읽습니다."""
-    database.insert_song(make_song(tmp_path, "s1", {"a.bms": b"#TITLE A\n" * 200, "b.bmp": os.urandom(3000)}))
+    database.insert_song(make_song(
+        tmp_path, "s1", {"a.bms": b"#TITLE A\n" * 200, "b.bmp": os.urandom(3000), "c.ogg": os.urandom(3000)}
+    ))
     cases = song_member_cases(database)
     methods = {entry["method"] for entry, _ in cases}
-    assert zipfile.ZIP_DEFLATED in methods
+    assert methods == {zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED}
     with db_module.connect() as con, con.cursor() as cur:
         for entry, data in cases:
             assert database._read_song_member(cur, 1, entry) == data, entry["path"]
