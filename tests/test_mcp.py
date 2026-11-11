@@ -63,8 +63,8 @@ def test_initialize_and_tools(client, monkeypatch):
     names = {t["name"] for t in rpc(api, key, "tools/list")["result"]["tools"]}
     assert names == {
         "whoami", "list_conflict_units", "get_conflict_case", "get_file_diff", "get_sound_clip", "submit_recommendation",
-        "list_song_findings", "get_song", "compare_songs", "get_compare_result", "preview_split", "split_song", "merge_songs",
-        "remove_charts", "restore_charts", "delete_song", "set_finding_status",
+        "get_song", "preview_split", "split_song", "merge_songs",
+        "remove_charts", "restore_charts", "delete_song",
         "list_import_stages", "list_import_units", "get_import_unit", "set_import_target", "commit_import", "get_import_job",
     }
     assert call(api, key, "whoami")["role"] == "admin"
@@ -169,8 +169,7 @@ def test_case_time_budget(client, monkeypatch):
 
 
 def test_song_cleanup_tools(client, monkeypatch):
-    """등록된 곡 정리: 곡 정보 → 나누기 → 합치기(되돌리기), 발견 닫기."""
-    from ebms_server import render_index
+    """등록된 곡 정리: 곡 정보 → 나누기 → 합치기(되돌리기)."""
 
     admin_login(client, monkeypatch)
     key = create_key(client)
@@ -188,32 +187,10 @@ def test_song_cleanup_tools(client, monkeypatch):
     assert "other_files" not in short
     assert rpc(api, key, "tools/call", {"name": "get_song", "arguments": {"song_id": 9}})["result"]["isError"]
 
-    assert call(api, key, "list_song_findings")["findings"] == []
-    con = render_index.connect()
-    render_index._put_finding(con, "mixed", 1, 0, None, {"groups": [["a.bms"], ["b.bms"]]})
-    con.commit()
-    con.close()
-    found = call(api, key, "list_song_findings", kind="mixed")["findings"]
-    assert [(f["kind"], f["song_a"]) for f in found] == [("mixed", 1)]
-    # 색인한 뒤 곡이 바뀌면(forget이 잠금으로 실패한 경우) 옛 발견은 감춥니다.
-    con = render_index.connect()
-    render_index.fingerprint.mark_song(con, 1, "old", 2)
-    con.commit()
-    assert call(api, key, "list_song_findings")["findings"] == []
-    assert render_index.count_findings("open") == 0
-    con.execute("DELETE FROM song")
-    con.commit()
-    con.close()
-    brief = call(api, key, "list_song_findings", brief=True)["findings"]
-    assert brief == [{"id": found[0]["id"], "kind": "mixed", "song_a": 1, "folder_a": found[0]["folder_a"],
-                      "groups": [[1, "a.bms"], [1, "b.bms"]]}]
-
     preview = call(api, key, "preview_split", song_id=1, charts=["b.bms"])
     assert preview["dry_run"] and preview["moved_files"] == ["b.wav"]
     split = call(api, key, "split_song", song_id=1, charts=["b.bms"], folder="[y] B")
     assert split["song_id"] == 2 and split["moved_files"] == ["b.wav"]
-    # 나눈 곡의 발견은 닫혀 다음 색인 때 다시 검사합니다.
-    assert call(api, key, "list_song_findings")["findings"] == []
     assert call(api, key, "get_song", song_id=2)["folder"] == "[y] B"
     bad = rpc(api, key, "tools/call", {"name": "split_song", "arguments": {"song_id": 1, "charts": ["a.bms"]}})["result"]
     assert bad["isError"] and "400" in bad["content"][0]["text"]
@@ -222,13 +199,6 @@ def test_song_cleanup_tools(client, monkeypatch):
     assert merged["merged_from"] == 2 and merged["subfolder"] is None
     assert [c[0] for c in call(api, key, "get_song", song_id=1)["charts"]] == ["a.bms", "b.bms"]
 
-    con = render_index.connect()
-    render_index._put_finding(con, "dup", 1, 3, 1.0, {})
-    con.commit()
-    fid = con.execute("SELECT id FROM finding").fetchone()[0]
-    con.close()
-    assert call(api, key, "set_finding_status", finding_id=fid, status="dismissed") == {"id": fid, "status": "dismissed"}
-    assert call(api, key, "list_song_findings")["findings"] == []
 
 
 def test_remove_and_delete_tools(client, monkeypatch, caplog):

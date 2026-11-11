@@ -12,7 +12,7 @@ document.querySelectorAll("[data-tab]").forEach((btn) => btn.addEventListener("c
 // ---- 곡 목록 ----
 const songRows = document.getElementById("song-rows");
 const songDetail = document.getElementById("song-detail");
-// 다른 화면(중복·섞임 점검 등)에서 /admin/songs?q=곡번호로 열면 그 검색어로 시작합니다.
+// 다른 화면에서 /admin/songs?q=곡번호로 열면 그 검색어로 시작합니다.
 let songQuery = new URLSearchParams(location.search).get("q") || "";
 let songPage = 1;
 let currentSong = null;
@@ -1015,9 +1015,7 @@ function suggestionCell(stage, unit) {
         const div = document.createElement("div");
         div.className = "small";
         const top = String(s.songs[0]);
-        const why = s.render_blocked ? `${songName(stage, s.render_blocked)}의 키음으로 채워 렌더해도 소리가 다름`
-            : !s.matches[top] ? "맨 앞 곡은 렌더로만 찾은 곡"
-            : s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
+        const why = s.complete ? "키음이 다 있는 곡, 중복 의심만 표시"
             : s.sounds?.[top] < 1 ? "맨 앞 곡에도 없는 키음이 있음"
             : (s.matches[top] || []).length < 2 ? "맨 앞 곡과 같은 항목이 하나뿐" : "맨 앞 곡이 여럿";
         div.textContent = s.merge ? `자동: ${songName(stage, s.merge)}에 추가 (가장 비슷함)` : `자동: 새 곡 (${why})`;
@@ -1026,14 +1024,11 @@ function suggestionCell(stage, unit) {
     return td;
 }
 
-// 비슷한 곡인 이유: 같은 항목과, 곡에 없는 키음이 있으면 그 곡에 있는 비율, 렌더 일치율
+// 비슷한 곡인 이유: 같은 항목과, 곡에 없는 키음이 있으면 그 곡에 있는 비율
 function similarReason(s, id) {
     const parts = (s.matches[String(id)] || []).map((f) => FIELD[f]);
     const rate = s.sounds?.[String(id)];
     if (rate !== undefined) parts.push(`키음 ${Math.round(rate * 100)}%`);
-    // 앞부분 렌더 일치율(70% 이상이면 같은 곡). 올린 곡에 없는 키음은 그 곡 것으로 채워 렌더한 값입니다(앞 3곡).
-    const render = s.render?.[String(id)];
-    if (render !== undefined) parts.push(`렌더 ${Math.round(render * 100)}%`);
     return parts.join("·");
 }
 

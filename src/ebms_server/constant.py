@@ -94,19 +94,6 @@ TABLE_MAX_BYTES = 32 * 1024 * 1024
 TABLE_MATCH_MAX_HASHES = 20000
 # 등록한 난이도표를 모두 다시 읽는 주기(시간). 0이면 자동으로 다시 읽지 않습니다(관리자 페이지에서 직접).
 TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
-# 모든 곡 차트의 렌더 색인(render_index.py): 아직 안 본 곡을 색인하며 다른 곡 번호의 같은 곡·곡 안에 섞인 다른 곡을 찾아
-# 관리자 목록(/admin/render)에 쌓습니다. 웹 서버와 따로 RENDER_INDEX_CPUS 코어에 붙인 프로세스에서 돌고, 할 일이 남으면
-# RENDER_INDEX_MINUTES분씩 쉬지 않고 이어 돌며, 다 보면 RENDER_INDEX_HOURS 뒤 새 곡·바뀐 곡을 다시 봅니다(0이면 자동 없음).
-RENDER_INDEX_DIR = pathlib.Path(os.environ.get("EBMS_RENDER_INDEX_DIR", BASE_DIR / "var" / "render_index"))
-RENDER_INDEX_HOURS = float(os.environ.get("EBMS_RENDER_INDEX_HOURS", "1"))
-RENDER_INDEX_MINUTES = float(os.environ.get("EBMS_RENDER_INDEX_MINUTES", "60"))
-RENDER_INDEX_START_DELAY = float(os.environ.get("EBMS_RENDER_INDEX_START_DELAY", "600"))
-# 색인 프로세스를 붙일 코어 번호("3", "2,3"). 비우면 마지막 코어 하나, "none"이면 붙이지 않습니다.
-RENDER_INDEX_CPUS = os.environ.get("EBMS_RENDER_INDEX_CPUS", "")
-# 업로드 묶음을 풀고 판정하기 전에 곡마다 모든 차트를 앞 STAGE_RENDER_SECONDS초만 렌더해 지문 저장소에서 같은 곡을
-# 찾습니다(stage_render.py). STAGE_RENDER_WORKERS개 프로세스로 나눠 렌더하고, 0이면 렌더 검색을 하지 않습니다.
-STAGE_RENDER_WORKERS = int(os.environ.get("EBMS_STAGE_RENDER_WORKERS", "4"))
-STAGE_RENDER_SECONDS = float(os.environ.get("EBMS_STAGE_RENDER_SECONDS", "60"))
 # 업로드 곡을 폴더(디렉토리) 단위로 관리합니다(staging). 곡 폴더 이름이 같은 기존 곡이 있으면 그 곡에 더하고(일부 파일만 든
 # 패치도 그대로 반영), 없으면 차트가 겹치거나 비슷한 곡이 있어도 다른 폴더의 곡에 자동으로 합치지 않고 새 곡으로 넣습니다
 # (후보로만 보여 줌). 0이면 이전 방식(겹치는 차트·비슷한 곡 판정으로 다른 폴더 곡에도 더함).
