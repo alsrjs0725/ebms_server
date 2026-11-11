@@ -657,9 +657,9 @@ def test_folder_mode_holds_chart_conflict_and_ambiguous(client, monkeypatch):
     monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
     admin_login(client, monkeypatch)
     upload(client, "one.zip", make_zip({"Dup/x.bms": b"#TITLE X\n"}))
-    sid = stage(client, "two.zip", make_zip({"Dup/y.bms": b"#TITLE Y\n"}))["stage_id"]
+    sid = stage(client, "two.zip", make_zip({"Dup/y.bms": b"#TITLE X [another]\n"}))["stage_id"]
     unit = units(client, sid)["two/Dup"]
-    assert unit["suggestion"]["merge"] == 1
+    assert unit["suggestion"]["merge"] == 1 and unit["suggestion"]["evidence"] == ["title"]
     assert set_target(client, sid, unit, "new").status_code == 200
     commit_stage(client, sid)
     assert [tuple(r) for r in song_rows()] == [(1, "Dup"), (2, "Dup")]
@@ -682,3 +682,80 @@ def test_folder_mode_holds_chart_conflict_and_ambiguous(client, monkeypatch):
     commit_stage(client, sid)
     assert units(client, sid)["fix/Dup"]["result"]["conflicts"] == ["x.bms"]
     assert song_files(1) == ["x.bms"]
+
+
+def test_folder_mode_needs_evidence_of_same_song(client, monkeypatch):
+    """폴더 이름만 같은 다른 곡은 자동으로 합치지 않고 보류합니다. 곡 번호나 새 곡을 지정하면 들어갑니다."""
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    upload(client, "one.zip", make_zip({"BMS/x.bms": b"#TITLE X\n#WAV01 k.wav\n", "BMS/k.wav": b"k", "BMS/bg.png": b"p"}))
+
+    files = {
+        # 이름만 같은 다른 곡
+        "a/BMS/y.bms": b"#TITLE Y\n#WAV01 y.wav\n", "a/BMS/y.wav": b"y",
+    }
+    sid = stage(client, "other.zip", make_zip(files))["stage_id"]
+    unit = units(client, sid)["other/a/BMS"]
+    s = unit["suggestion"]
+    assert (s["kind"], s["merge"], s["folder"], s["evidence"]) == ("ambiguous", None, [1], []) and "근거" in s["hold"]
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "BMS")]
+    unit = units(client, sid)["other/a/BMS"]
+    assert "근거" in unit["result"]["error"]
+    assert set_target(client, sid, unit, "new").status_code == 200
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "BMS"), (2, "BMS")]
+    assert song_files(1) == ["bg.png", "k.wav", "x.bms"]
+
+
+def test_folder_mode_evidence_kinds(client, monkeypatch):
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    x = b"#TITLE X\n#WAV01 k.wav\n"
+    upload(client, "one.zip", make_zip({"S/x.bms": x, "S/k.wav": b"k", "S/bg.png": b"p"}))
+    sid = stage(client, "more.zip", make_zip({
+        "chart/S/x.bms": x, "chart/S/n.bms": b"#TITLE N\n",
+        "files/S/n2.bms": b"#TITLE N2\n", "files/S/bg.png": b"p",
+        # 키음 없이 차트만(차분): 쓰는 키음이 그 곡에 있음
+        "sounds/S/n3.bms": b"#TITLE N3\n#WAV01 k.wav\n",
+    }))["stage_id"]
+    got = units(client, sid)
+    assert "chart" in got["more/chart/S"]["suggestion"]["evidence"]
+    assert got["more/files/S"]["suggestion"]["evidence"] == ["files"]
+    assert got["more/sounds/S"]["suggestion"]["evidence"] == ["sounds"]
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "S")]
+    assert song_files(1) == ["bg.png", "k.wav", "n.bms", "n2.bms", "n3.bms", "x.bms"]
+
+
+def test_folder_mode_judges_again_at_commit(client, monkeypatch):
+    """분석할 때는 없던 같은 이름 폴더의 곡(같은 묶음의 앞선 곡)이 commit 때 있으면 새 곡을 또 만들지 않습니다."""
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    sid = stage(client, "pack.zip", make_zip({
+        "base/Song/a.bms": b"#TITLE Song\n#WAV01 k.wav\n", "base/Song/k.wav": b"k",
+        "patch/Song/b.bms": b"#TITLE Song [B]\n#WAV01 k.wav\n",
+        # 이름만 같은 다른 곡은 보류
+        "zzz/Song/c.bms": b"#TITLE Else\n#WAV01 c.wav\n", "zzz/Song/c.wav": b"c",
+    }))["stage_id"]
+    got = units(client, sid)
+    assert {u["suggestion"]["merge"] for u in got.values()} == {"new"}
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "Song")]
+    assert song_files(1) == ["a.bms", "b.bms", "k.wav"]
+    left = units(client, sid)
+    assert list(left) == ["pack/zzz/Song"] and "근거" in left["pack/zzz/Song"]["result"]["error"]
+
+
+def test_folder_mode_holds_unit_without_suggestion(client, monkeypatch):
+    """판정이 없는 곡(분석 실패)은 겹치는 차트로 다른 폴더의 곡에 병합하지 않고 남깁니다."""
+    monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
+    admin_login(client, monkeypatch)
+    a = b"#TITLE A\n"
+    upload(client, "one.zip", make_zip({"A/a.bms": a}))
+    monkeypatch.setattr(staging, "_analyze", lambda stage: (_ for _ in ()).throw(RuntimeError("boom")))
+    sid = stage(client, "two.zip", make_zip({"B/a.bms": a, "B/b.bms": b"#TITLE B\n"}))["stage_id"]
+    assert units(client, sid)["two/B"]["suggestion"] is None
+    commit_stage(client, sid)
+    assert [tuple(r) for r in song_rows()] == [(1, "A")]
+    assert "판정이 없어" in units(client, sid)["two/B"]["result"]["error"]
