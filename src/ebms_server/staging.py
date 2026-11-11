@@ -10,7 +10,9 @@
   "new"(새 곡), 곡 번호(그 곡에 추가), "skip"(넣지 않음)입니다. 차트마다 대상을 따로 줄 수도 있습니다(None이면 곡의 대상).
 - 차트를 여러 대상으로 나누면 대상마다 그 차트, 그 차트가 가리키는 파일(키음·BGA·배너 등), 어느 차트도 가리키지 않는 파일을 묶어 넣습니다.
 - 폴더 단위 관리(constant.IMPORT_BY_FOLDER, 기본): 곡 폴더 이름이 같은 기존 곡(song.folder)이 하나면 그 곡에 더합니다(add).
-  곡 팩의 패치처럼 일부 파일만 든 폴더도 그대로 반영됩니다. 같은 이름 곡이 여럿이면 보류(ambiguous, 곡 번호 지정 필요),
+  곡 팩의 패치처럼 일부 파일만 든 폴더도 그대로 반영됩니다. 단 이름만 같은 다른 곡이 섞이지 않게 같은 곡이라는 근거
+  (같은 차트·제목·파일, 그 곡에 있는 키음: _folder_evidence)가 있어야 하고, 없거나 같은 이름 곡이 여럿이면 보류합니다
+  (ambiguous, 곡 번호 지정 필요). 이 판정은 commit 직전에 다시 합니다(분석 뒤 들어간 같은 이름 곡을 보도록). 같은 이름 곡이
   없으면 아래 판정(겹치는 차트·비슷한 곡·렌더)은 후보로만 보여 주고 auto는 새 곡입니다(다른 폴더의 곡에 자동으로 합치지 않음).
   다른 폴더에 같은 곡이 있으면 중복으로 남고, 렌더 색인(render_index)의 중복 발견으로 나중에 정리합니다.
   같은 폴더 곡에 더할 때 같은 경로의 파일 내용이 다르면: 차트는 충돌(보류), 키음·이미지·영상은 같은 소재면 고품질 쪽으로
@@ -595,7 +597,7 @@ def _analyze_units(stage: dict, prints) -> None:
                 "complete": complete, "render": render, "render_partial": partial, "render_blocked": blocked,
             }
             if constant.IMPORT_BY_FOLDER and deleted is None:
-                _by_folder(suggestion, _folder_songs(cur, unit))
+                _by_folder(cur, stage, unit, suggestion)
             unit["suggestion"] = suggestion
 
 
@@ -605,16 +607,80 @@ def _folder_songs(cur, unit: dict) -> list[int]:
     return [row[0] for row in cur.fetchall()]
 
 
-def _by_folder(suggestion: dict, folder_songs: list[int]) -> None:
-    """폴더 단위 판정(constant.IMPORT_BY_FOLDER)으로 바꿉니다. 같은 이름 폴더의 곡이 하나면 그 곡에 더하고(add, 일부 파일만 든
-    패치도 그대로), 여럿이면 어느 곡인지 정할 수 없어 보류합니다(ambiguous, hold). 없으면 차트가 겹치거나 비슷한 곡이 있어도
+def _unit_files(stage: dict, unit: dict) -> dict[str, tuple[int, str | None]]:
+    """곡 안 파일 {소문자 경로: (크기, crc32 16진수 또는 None)}. 이전 버전의 폴더로 둔 곡은 crc32가 없습니다."""
+    pack = _pack_path(stage, unit)
+    if pack.is_file():
+        with zipfile.ZipFile(pack) as zf:
+            return {i.filename.lower(): (i.file_size, f"{i.CRC:08x}") for i in zf.infolist() if not i.is_dir()}
+    return {path.lower(): (size, None) for path, size in _unit_entries(stage, unit)}
+
+
+def _folder_evidence(cur, stage: dict, unit: dict, song_id: int) -> list[str]:
+    """이름이 같은 폴더의 곡(song_id)이 올린 곡과 정말 같은 곡이라는 근거. 폴더 이름은 팩 이름을 뺀 마지막 폴더명
+    (차트가 압축 파일 최상위에 있으면 압축 파일 이름)이라 "BMS", "patch", "01"처럼 서로 다른 곡끼리 겹칠 수 있습니다.
+    - "chart": 올린 차트 중 그 곡에 이미 있는 차트가 있음
+    - "title": 제목(title_key, 끝의 난이도 표기를 뺀 것)이 같은 차트가 있음
+    - "files": 차트·문서가 아닌 파일 중 경로·크기·crc32가 같은 파일이 있음
+    - "sounds": 올린 곡에 없는 키음(차분·패치)의 SIMILAR_SOUNDS 이상이 그 곡에 있음
+    하나도 없으면 빈 목록(자동으로 넣지 않고 보류)."""
+    _fill_meta(stage, unit)
+    evidence = []
+    cur.execute("SELECT id, size, title_key FROM chart WHERE song_id = %s", (song_id,))
+    rows = cur.fetchall()
+    theirs = {(row[0], row[1]) for row in rows}
+    if any((chart["sha256"], chart["size"]) in theirs for chart in unit["charts"]):
+        evidence.append("chart")
+    titles = {row[2] for row in rows if row[2]}
+    if any((chart.get("keys") or {}).get("title") in titles for chart in unit["charts"]):
+        evidence.append("title")
+    cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+    row = cur.fetchone()
+    entries = json.loads(row[0]) if row is not None and row[0] else []
+    try:
+        mine = _unit_files(stage, unit)
+    except (OSError, zipfile.BadZipFile):
+        mine = {}
+    for entry in entries:
+        path = entry["path"].lower()
+        if db._is_chart(path) or db.keeps_existing(path):
+            continue
+        size, crc = mine.get(path, (None, None))
+        if crc is not None and size == entry.get("size") and crc == entry.get("crc32"):
+            evidence.append("files")
+            break
+    sounds, own = _unit_sounds(stage, unit)
+    missing = [sound for sound in sounds if not sound & own]
+    if missing:
+        stems = _sound_stems(entry["path"] for entry in entries)
+        if sum(1 for sound in missing if sound & stems) / len(missing) >= SIMILAR_SOUNDS:
+            evidence.append("sounds")
+    return evidence
+
+
+def _by_folder(cur, stage: dict, unit: dict, suggestion: dict) -> None:
+    """폴더 단위 판정(constant.IMPORT_BY_FOLDER)으로 바꿉니다. 같은 이름 폴더의 곡이 하나이고 같은 곡이라는 근거
+    (_folder_evidence)가 있으면 그 곡에 더하고(add, 일부 파일만 든 패치도 그대로), 근거가 없거나 같은 이름 곡이 여럿이면
+    어느 곡인지 정할 수 없어 보류합니다(ambiguous, hold). 같은 이름 곡이 없으면 차트가 겹치거나 비슷한 곡이 있어도
     다른 폴더의 곡에 합치지 않고 새 곡입니다(similar는 후보로만 보여 줌, merge "new"). 차트가 모두 이미 다른 곡에 있으면
-    새 곡을 만들 수 없어 commit에서 보류됩니다."""
+    새 곡을 만들 수 없어 commit에서 보류됩니다. 분석할 때와 commit 직전에(그 사이 들어간 곡을 보도록) 부릅니다."""
+    folder_songs = _folder_songs(cur, unit)
+    # 지난 판정에서 폴더 곡이던 곡도 후보로 남깁니다.
     others = [s for s in suggestion["songs"] if s not in folder_songs]
     suggestion["folder"] = folder_songs
     suggestion["hold"] = None
+    suggestion["evidence"] = []
     if len(folder_songs) == 1:
-        suggestion.update(kind="add", songs=folder_songs + others, merge=folder_songs[0])
+        evidence = _folder_evidence(cur, stage, unit, folder_songs[0])
+        suggestion["evidence"] = evidence
+        if evidence:
+            suggestion.update(kind="add", songs=folder_songs + others, merge=folder_songs[0])
+        else:
+            suggestion.update(
+                kind="ambiguous", songs=folder_songs + others, merge=None,
+                hold=f"폴더 이름이 같은 곡 #{folder_songs[0]}이 있지만 같은 곡이라는 근거(같은 차트·제목·파일, 그 곡에 있는 키음)가 "
+                "없습니다. 같은 곡이면 곡 번호를, 다른 곡이면 새 곡을 지정하세요.",
+            )
     elif folder_songs:
         suggestion.update(
             kind="ambiguous", songs=folder_songs + others, merge=None,
@@ -1375,6 +1441,21 @@ def _render_check(unit: dict, song_dir: pathlib.Path, charts: list[str], song_id
     return held, sorted(replaced)
 
 
+def _folder_hold(stage: dict, unit: dict, batch) -> str | None:
+    """commit 직전에 폴더 단위 판정을 지금 DB(배치에서 아직 커밋하지 않은 앞선 곡 포함)로 다시 하고, auto로 넣을 수 없으면 그 이유.
+    분석한 뒤 같은 이름 폴더의 곡이 들어갔으면(같은 묶음의 앞선 곡, 먼저 commit한 다른 묶음) 새 곡을 또 만들지 않고 그 곡으로 판정합니다.
+    판정이 없는 곡(분석 실패)은 이전 방식(겹치는 차트로 다른 폴더의 곡에 병합)으로 넘어가지 않게 보류합니다."""
+    if not constant.IMPORT_BY_FOLDER:
+        return (unit.get("suggestion") or {}).get("hold")
+    suggestion = unit.get("suggestion")
+    if suggestion is None:
+        return "판정이 없어 자동으로 넣지 않았습니다. 다시 분석한 뒤 commit하거나 대상을 지정하세요."
+    if suggestion.get("deleted") is None and any(_chart_target(unit, chart) == "auto" for chart in unit["charts"]):
+        with batch.reader() as cur:
+            _by_folder(cur, stage, unit, suggestion)
+    return suggestion.get("hold")
+
+
 def _groups(unit: dict) -> list[tuple[str | int, list[str]]]:
     """(대상, 차트 경로 목록). skip은 뺍니다. 모든 차트가 같은 대상이면 하나."""
     groups: dict = {}
@@ -1467,7 +1548,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
                     info = {"folder": unit["folder"], "error": str(e) or type(e).__name__}
                     infos.append(info)
                     job.songs.append(info)
-                hold = (unit.get("suggestion") or {}).get("hold")
+                hold = _folder_hold(stage, unit, batch) if unit_dir is not None else None
                 for target, charts in groups if unit_dir is not None else []:
                     label = _label(unit, charts, split)
                     if target == "auto" and hold:

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import gzip
@@ -2698,6 +2699,15 @@ class SongBatch:
     def open(self) -> bool:
         """커밋하지 않은 곡이 있어 쓰기 잠금을 잡고 있는지."""
         return self._con is not None
+
+    @contextlib.contextmanager
+    def reader(self):
+        """읽기용 커서. 배치가 열려 있으면 배치의 커서라 아직 커밋하지 않은 앞선 곡도 보입니다."""
+        if self._cur is not None:
+            yield self._cur
+            return
+        with connect() as con, con.cursor() as cur:
+            yield cur
 
     def _reset(self) -> None:
         self._charts: list[tuple[str, bytes]] = []

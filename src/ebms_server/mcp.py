@@ -129,6 +129,8 @@ split_song / merge_songs / 아니면 set_finding_status(dismissed).
     render가 0.2 이하이거나 render_blocked면 new로 정합니다(키음이 다르면 다른 곡). render가 없고 키음 충족률(sounds)만 높으면
     제목·아티스트가 같을 때만 그 곡으로, 아니면 new.
   ambiguous: 차트가 여러 곡에 흩어져 있음 → 대부분의 차트가 있는 곡이 폴더명과 맞으면 그 곡 번호로, 아니면 정하지 말고 보고.
+    hold가 있으면 폴더 단위 판정의 보류입니다(같은 이름 폴더의 곡이 여럿이거나, 하나지만 같은 곡이라는 근거 evidence가 없음).
+    후보(candidates)의 제목·렌더로 같은 곡이 확실하면 그 곡 번호로, 다른 곡이 확실하면 new로, 아니면 정하지 말고 보고.
   unused: 사용 중지(제외)한 곡의 차트가 있음 → 건드리지 않습니다(다시 넣지 않으려고 제외한 곡).
 - failed(지난 commit 실패: 헤더 인코딩·파일 오류 등)는 사람이 내려받아 고치는 곡이니 대상을 바꾸지 말고 보고만 합니다.
   충돌(conflicts>0)은 위의 충돌 판단 흐름(get_conflict_case → submit_recommendation)으로 추천만 남깁니다.
@@ -1092,7 +1094,7 @@ def _brief_suggestion(suggestion: dict | None, folders: dict) -> dict | None:
             }
             for s in songs[:5]
         ]
-    for key in ("complete", "render_partial", "render_blocked", "deleted", "merge", "folder", "hold"):
+    for key in ("complete", "render_partial", "render_blocked", "deleted", "merge", "folder", "evidence", "hold"):
         if suggestion.get(key):
             out[key] = suggestion[key]
     return out
