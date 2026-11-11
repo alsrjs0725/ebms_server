@@ -278,6 +278,26 @@ def test_create_zip_skips_symlinks(tmp_path):
     assert [p.name for p in db_module.chart_files(song)] == ["a.bms"]
 
 
+def test_create_zip_stores_compressed_formats(tmp_path):
+    """이미 압축된 형식(ogg·png·영상)은 그대로 저장하고, 차트·wav·bmp는 DEFLATE로 압축합니다."""
+    song = tmp_path / "song"
+    (song / "bga").mkdir(parents=True)
+    files = {
+        "a.bms": b"#TITLE A\n" * 50, "k.wav": b"\0" * 4000, "back.bmp": b"\1" * 4000,
+        "k.OGG": os.urandom(2000), "s.png": os.urandom(2000), "bga/m.mp4": os.urandom(2000),
+    }
+    for name, body in files.items():
+        (song / name).write_bytes(body)
+    data = db_module.Database.create_zip(None, song)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        methods = {i.filename: i.compress_type for i in zf.infolist()}
+        assert {n: zf.read(n) for n in files} == files
+    assert methods == {
+        "a.bms": zipfile.ZIP_DEFLATED, "k.wav": zipfile.ZIP_DEFLATED, "back.bmp": zipfile.ZIP_DEFLATED,
+        "k.OGG": zipfile.ZIP_STORED, "s.png": zipfile.ZIP_STORED, "bga/m.mp4": zipfile.ZIP_STORED,
+    }
+
+
 def test_import_tmp_slow(client, monkeypatch):
     """천천히 모드는 작은 배치로 커밋하고 커밋마다 쉽니다."""
     admin_login(client, monkeypatch)

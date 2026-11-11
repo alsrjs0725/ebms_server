@@ -10,6 +10,16 @@ IMAGE_FORMAT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
 AUDIO_FORMAT = (".wav", ".ogg", ".mp3", ".flac")
 # BGA 영상(media_match가 다시 인코딩만 다른지 볼 때 씁니다)
 VIDEO_FORMAT = (".mpg", ".mpeg", ".m1v", ".m2v", ".mp4", ".m4v", ".avi", ".wmv", ".webm", ".mkv", ".flv", ".mov")
+# 곡 zip에 압축 없이(ZIP_STORED) 넣는 확장자. 이미 압축된 형식이라 DEFLATE로 거의 줄지 않고 CPU만 씁니다
+# (stage 833곡 실측: ogg 6.5%, mp4 0.7%, wmv 5.4%, png 4.5%). mpg·avi·wav·bmp·차트는 DEFLATE.
+ZIP_STORED_FORMAT = (
+    ".ogg", ".mp3", ".flac", ".opus", ".m4a", ".aac", ".wma",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".mp4", ".m4v", ".wmv", ".webm", ".mkv", ".flv", ".mov",
+    ".zip", ".7z", ".rar",
+)
+# 곡 zip DEFLATE 레벨. 1은 6보다 몇 배 빠르고 wav·bmp·차트에서 압축률 차이가 작습니다.
+ZIP_COMPRESS_LEVEL = 1
 DB_HOST = os.environ.get("EBMS_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("EBMS_DB_PORT", "3306"))
 DB_USER = os.environ.get("EBMS_DB_USER", "ebms")

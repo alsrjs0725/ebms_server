@@ -897,13 +897,26 @@ def chart_files(source_dir: os.PathLike) -> list[pathlib.Path]:
     ]
 
 
+def _song_compress_type(name: str) -> int:
+    """곡 zip 항목의 압축 방식. 이미 압축된 형식(ogg·png·영상 등)은 그대로 저장하고 나머지는 DEFLATE."""
+    if pathlib.PurePosixPath(name).suffix.lower() in constant.ZIP_STORED_FORMAT:
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
+
+
 def _song_zipinfo(name: str) -> zipfile.ZipInfo:
     """곡 zip 파일 항목. create_zip과 같은 형식(권한 정보 없음, 날짜 고정)입니다."""
     info = zipfile.ZipInfo(name)
     info.create_system = 0
     info.external_attr = 0
-    info.compress_type = zipfile.ZIP_DEFLATED
+    info.compress_type = _song_compress_type(name)
     return info
+
+
+def _write_song_entry(zf: zipfile.ZipFile, name: str, content: bytes) -> None:
+    """곡 zip에 새 파일 항목을 씁니다(확장자에 맞는 압축 방식)."""
+    info = _song_zipinfo(name)
+    zf.writestr(info, content, compress_type=info.compress_type, compresslevel=constant.ZIP_COMPRESS_LEVEL)
 
 
 class AmbiguousSongError(ValueError):
@@ -1882,13 +1895,13 @@ class Database:
             with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as zf:
                 for info in src.infolist():
                     if info.filename not in dropped:
-                        zf.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=6)
+                        zf.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=constant.ZIP_COMPRESS_LEVEL)
         else:
             buf = io.BytesIO(data)
         # 기존 항목은 그대로 두고 뒤에 붙입니다(기존 항목의 위치·압축 데이터가 바뀌지 않음).
         with zipfile.ZipFile(buf, mode="a") as zf:
             for arcname, content in new_files:
-                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                _write_song_entry(zf, arcname, content)
         data = buf.getvalue()
         cur.execute(
             "UPDATE song SET size = %s, sha256 = %s, files = %s WHERE id = %s",
@@ -1978,23 +1991,15 @@ class Database:
                     zf.writestr(info, b"")
 
             else:
-                info = make_zipinfo(arcname)
-                info.compress_type = zipfile.ZIP_DEFLATED
-
                 with path.open("rb") as f:
-                    zf.writestr(
-                        info,
-                        f.read(),
-                        compress_type=zipfile.ZIP_DEFLATED,
-                        compresslevel=6,
-                    )
+                    _write_song_entry(zf, arcname, f.read())
 
         buf = io.BytesIO()
         with zipfile.ZipFile(
             buf,
             mode="w",
             compression=zipfile.ZIP_DEFLATED,
-            compresslevel=6,
+            compresslevel=constant.ZIP_COMPRESS_LEVEL,
         ) as zf:
 
             # 심볼릭 링크는 따라가지 않습니다(곡 폴더 밖의 파일이 곡에 들어가지 않도록).
@@ -2273,7 +2278,7 @@ class Database:
                             with zipfile.ZipFile(buf, "w") as out:
                                 for info in zf.infolist():
                                     if info.filename not in removed:
-                                        out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=6)
+                                        out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=constant.ZIP_COMPRESS_LEVEL)
                             data = buf.getvalue()
                     if removed:
                         cur.execute(
@@ -2317,9 +2322,9 @@ class Database:
         with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(buf, "w") as out:
             for info in src.infolist():
                 if info.filename not in drop:
-                    out.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=6)
+                    out.writestr(info, src.read(info), compress_type=info.compress_type, compresslevel=constant.ZIP_COMPRESS_LEVEL)
             for arcname, content in add:
-                out.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                _write_song_entry(out, arcname, content)
         return buf.getvalue()
 
     def _update_song_zip(self, cur, song_id: int, data: bytes) -> None:
@@ -2392,7 +2397,7 @@ class Database:
                         with zipfile.ZipFile(buf, "w") as out:
                             for name in new_files:
                                 info = infos[name]
-                                out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=6)
+                                out.writestr(info, zf.read(info), compress_type=info.compress_type, compresslevel=constant.ZIP_COMPRESS_LEVEL)
                         new_data = buf.getvalue()
                     moved_files = used_moving - used_keep
                     shared_only = bool(used_moving) and not moved_files
@@ -2499,7 +2504,7 @@ class Database:
                         buf = io.BytesIO(data)
                         with zipfile.ZipFile(buf, mode="a") as zf:
                             for arcname, content in new_files:
-                                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                                _write_song_entry(zf, arcname, content)
                         self._update_song_zip(cur, song_id, buf.getvalue())
 
                     self._write_unused(source_id, src_data, src_chart_data)
@@ -2628,7 +2633,7 @@ class Database:
                         buf = io.BytesIO(data)
                         with zipfile.ZipFile(buf, mode="a") as zf:
                             for arcname, content in add:
-                                zf.writestr(_song_zipinfo(arcname), content, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
+                                _write_song_entry(zf, arcname, content)
                         self._update_song_zip(cur, song_id, buf.getvalue())
                     for chart_id, _, _ in rows:
                         cur.execute("UPDATE chart SET song_id = %s WHERE id = %s AND song_id IS NULL", (song_id, chart_id))
