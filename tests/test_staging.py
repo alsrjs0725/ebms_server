@@ -1,9 +1,9 @@
 """곡 임포트 대기(staged): 올린 곡을 검토하고 대상을 바꾼 뒤 commit하는 흐름 테스트."""
+import hashlib
 import io
 import json
 import zipfile
 
-import pytest
 
 from ebms_server import constant, db as db_module, importer, staging
 
@@ -488,43 +488,32 @@ def test_chart_header_encoding_is_scored():
     assert db_module.chart_meta("#TITLE 노래\n".encode("utf-8"))["title"] == "노래"
     # '#'로 시작하지 않는 줄(주석)은 보지 않습니다.
     assert db_module.chart_meta(b"\x85\x40 memo\n#TITLE A\n")["title"] == "A"
-    with pytest.raises(db_module.ChartEncodingError, match="cp949"):
-        db_module.chart_meta(b"#TITLE \x85\x40\n")
+    # 어느 인코딩으로도 안 풀리면 cp932로 읽고 못 읽는 바이트만 대체 문자로 둡니다.
+    assert db_module.chart_meta(b"#TITLE \x85\x40\n")["title"] == "\ufffd@"
 
 
-def test_chart_encoding_error_unit_is_held_and_downloadable(client, monkeypatch):
-    """헤더 인코딩을 알 수 없는 곡은 대체하지 않고 등록 불가로 묶음에 남기며, 내려받을 수 있습니다."""
+def test_undecodable_chart_header_is_registered_as_is(client, monkeypatch):
+    """헤더를 어느 인코딩으로도 풀 수 없어도 막지 않고, 차트는 원본 바이트 그대로(해시 그대로) 등록합니다.
+    잘린 cp932(_HEXPERUS_Overcome.bms)와 GBK(you.bms) 같은 경우입니다."""
     admin_login(client, monkeypatch)
-    bad = b"#TITLE \x85\x40\n"
+    truncated = b"#TITLE HEXPERUS\n#ARTIST qfeileadh&\x82\xcc\x82\n#WAV01 k.wav\n"
+    gbk = "#TITLE 結ばれる奇跡の願い\n#ARTIST 宮水 三葉\n".encode("gbk") + b"#WAV01 k.wav\n"
     job = stage(client, "pack.zip", make_zip({
-        "p/ok/a.bms": "#TITLE 한글\n".encode("cp949"),
-        "p/bad/b.bms": bad,
-        "p/bad/k.wav": b"k",
+        "p/a/a.bms": truncated, "p/a/k.wav": b"k",
+        "p/b/b.bms": gbk, "p/b/k.wav": b"k",
     }))
     sid = job["stage_id"]
-    assert sorted(bool(s.get("error")) for s in job["songs"]) == [False, True]
+    assert not any(s.get("error") for s in job["songs"]), job["songs"]
     got = units(client, sid)
-    assert got["pack/p/ok"]["error"] is None and got["pack/p/ok"]["charts"][0]["title"] == "한글"
-    held = got["pack/p/bad"]
-    assert "b.bms" in held["error"] and "인코딩" in held["charts"][0]["error"]
-    assert detail(client, sid)["counts"]["failed"] == 1
-    assert [u["folder"] for u in detail(client, sid, show="failed")["items"]] == ["pack/p/bad"]
-
-    r = client.get(f"/api/admin/import/stages/{sid}/units/{held['id']}/zip")
-    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
-    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-        assert sorted(zf.namelist()) == ["b.bms", "k.wav"] and zf.read("b.bms") == bad
-    assert client.get(f"/api/admin/import/stages/{sid}/units/nope/zip").status_code == 404
-
+    assert got["pack/p/a"]["error"] is None
+    assert got["pack/p/a"]["charts"][0]["artist"] == "qfeileadh&の\ufffd"
+    assert got["pack/p/b"]["error"] is None
     done = commit_stage(client, sid)
-    assert any(s.get("error") for s in done["songs"])
-    assert [tuple(r) for r in song_rows()] == [(1, "ok")]
-    # 등록 불가 곡은 묶음에 그대로 남습니다.
-    assert list(units(client, sid)) == ["pack/p/bad"]
-    # 제외로 두면 commit 때 묶음에서 빠집니다.
-    assert set_target(client, sid, held, "skip").status_code == 200
-    commit_stage(client, sid)
-    assert client.get("/api/admin/import/stages").json() == []
+    assert not any(s.get("error") for s in done["songs"]), done["songs"]
+    assert len(song_rows()) == 2
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT md5 FROM chart ORDER BY md5")
+        assert sorted(r[0] for r in cur.fetchall()) == sorted(hashlib.md5(c).hexdigest() for c in (truncated, gbk))
 
 
 def test_chart_encoding_ignores_file_name_headers():
@@ -536,31 +525,9 @@ def test_chart_encoding_ignores_file_name_headers():
     mixed = "#TITLE 노래\n".encode("cp949") + "#ARTIST ソナタ\n".encode("cp932")
     assert db_module.chart_meta(mixed)["title"] == "노래"
     assert db_module.chart_meta(mixed)["artist"] == "ソナタ"
-    # 어느 인코딩으로도 안 풀리는 값이 있으면 그대로 오류입니다.
-    with pytest.raises(db_module.ChartEncodingError, match="#ARTIST"):
-        db_module.chart_meta("#TITLE 노래\n".encode("cp949") + b"#ARTIST \x85\x40\n")
-
-
-def test_commit_unit_with_skipped_broken_chart(client, monkeypatch):
-    """헤더 인코딩 오류가 난 차트만 제외(skip)로 두면 같은 곡의 나머지 차트는 등록됩니다(#157)."""
-    admin_login(client, monkeypatch)
-    job = stage(client, "pack.zip", make_zip({
-        "p/s/a.bms": "#TITLE 한글\n".encode("cp949"),
-        "p/s/b.bms": b"#TITLE \x85\x40\n",
-        "p/s/k.wav": b"k",
-    }))
-    sid = job["stage_id"]
-    held = units(client, sid)["pack/p/s"]
-    assert "b.bms" in held["error"]
-    # 오류가 없는 차트만 제외해도 등록할 수 없습니다.
-    assert set_target(client, sid, held, "auto", {"a.bms": "skip"}).status_code == 200
-    commit_stage(client, sid)
-    assert not song_rows()
-    assert set_target(client, sid, held, "auto", {"a.bms": None, "b.bms": "skip"}).status_code == 200
-    done = commit_stage(client, sid)
-    assert not any(s.get("error") for s in done["songs"]), done["songs"]
-    assert len(song_rows()) == 1
-    assert client.get("/api/admin/import/stages").json() == []
+    # 어느 인코딩으로도 안 풀리는 값만 대체 문자로 둡니다.
+    broken = db_module.chart_meta("#TITLE 노래\n".encode("cp949") + b"#ARTIST \x85\x40\n")
+    assert broken["title"] == "노래" and broken["artist"] == "\ufffd@"
 
 
 def test_download_old_unpacked_unit(client, monkeypatch):
