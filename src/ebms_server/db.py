@@ -489,7 +489,8 @@ def _bmson_text(value) -> str:
 
 
 def chart_meta(chart: bytes) -> dict[str, str]:
-    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''. 헤더 인코딩을 알 수 없으면 ChartEncodingError.
+    """차트의 {title, artist, bpm, genre} 헤더 값(처음 나온 것). 없으면 ''. 어느 인코딩으로도 안 풀리는 값은 cp932로 읽고
+    못 읽는 바이트는 대체 문자(U+FFFD)로 둡니다(오류로 막지 않음).
     bmson은 info의 title·artist·init_bpm·genre입니다(subtitle은 BMS #TITLE의 난이도 표기와 같아 뺍니다)."""
     data = _bmson(chart)
     if data is not None:
@@ -505,17 +506,16 @@ def chart_meta(chart: bytes) -> dict[str, str]:
         encoding = chart_encoding(chart)
         meta = {field: value.decode(encoding) for field, value in values.items()}
     except ChartEncodingError:
-        # 한 인코딩으로 다 풀리지 않으면(일본 곡의 한국어 차분 등) 값마다 따로 고릅니다. 그래도 안 풀리는 값이 있으면 오류입니다.
+        # 한 인코딩으로 다 풀리지 않으면(일본 곡의 한국어 차분 등) 값마다 따로 고릅니다.
         meta = {}
-        failures = []
         for field, value in values.items():
-            encoding, reasons = charset.guess_encoding([value], CHART_ENCODINGS)
+            encoding, _ = charset.guess_encoding([value], CHART_ENCODINGS)
             if encoding is None:
-                failures.append(f"{META_HEADERS[field].decode()}: " + "; ".join(reasons))
+                # 어느 인코딩으로도 안 풀리는 값(잘린 바이트, GBK 등)은 beatoraja처럼 cp932로 읽고 못 읽는 바이트만
+                # 대체 문자로 둡니다. 차트 파일은 원본 바이트 그대로 저장하므로 해시는 클라이언트·난이도표와 같습니다.
+                meta[field] = value.decode("cp932", errors="replace")
             else:
                 meta[field] = value.decode(encoding)
-        if failures:
-            raise ChartEncodingError("차트 헤더의 인코딩을 알 수 없습니다(" + " / ".join(failures) + ")") from None
     return {field: meta.get(field, "") for field in META_HEADERS}
 
 
