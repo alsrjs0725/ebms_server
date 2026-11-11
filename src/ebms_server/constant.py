@@ -90,6 +90,8 @@ PRE_CHUNK_FILENAME_TEMPLATE = "pre_chunk_{:05d}.zip"
 # 난이도표(tables.py)를 읽을 때 주소 하나의 응답 시간·크기 한도
 TABLE_FETCH_TIMEOUT = 30
 TABLE_MAX_BYTES = 32 * 1024 * 1024
+# 사용자 지정 난이도표 매칭(POST /api/tables/match)에 한 번에 보낼 수 있는 해시 수(md5·sha256 각각)
+TABLE_MATCH_MAX_HASHES = 20000
 # 등록한 난이도표를 모두 다시 읽는 주기(시간). 0이면 자동으로 다시 읽지 않습니다(관리자 페이지에서 직접).
 TABLE_REFRESH_HOURS = float(os.environ.get("EBMS_TABLE_REFRESH_HOURS", "24"))
 # 모든 곡 차트의 렌더 색인(render_index.py): 아직 안 본 곡을 색인하며 다른 곡 번호의 같은 곡·곡 안에 섞인 다른 곡을 찾아

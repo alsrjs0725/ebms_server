@@ -365,3 +365,33 @@ def test_new_song_goes_to_table_chunk(client, monkeypatch):
         cur.execute("SELECT id, sig FROM pre_chunk ORDER BY id")
         assert [tuple(r) for r in cur.fetchall()] == [(0, str(insane["id"])), (1, "")]
     assert db_module.Database().rebalance_pre_chunks() == 0
+
+
+def test_match_user_table(client, monkeypatch):
+    """사용자가 직접 읽은 표의 해시로 곡을 찾습니다. 서버는 표 주소에 접속하지 않습니다."""
+    assert client.post("/api/tables/match", json={"md5": [md5(A)]}).status_code == 401
+    admin_login(client, monkeypatch)
+    for name, chart in (("a.zip", A), ("b.zip", B)):
+        upload(client, name, make_zip({"x.bms": chart, "banner.png": b"png"}))
+    monkeypatch.setattr(tables, "http_get", lambda url: pytest.fail("서버가 외부 주소에 접속했습니다"))
+
+    r = client.post(
+        "/api/tables/match",
+        # 대문자·공백은 맞추고, 형식이 틀린 해시·서버에 없는 차트는 건너뜁니다.
+        json={"md5": [md5(A).upper(), " " + md5(A), md5(C), "zz"], "sha256": [sha256(B), sha256(C)]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["matched_md5"] == [md5(A)]
+    assert body["matched_sha256"] == [sha256(B)]
+    assert len(body["songs"]) == 2 and all(s["size"] > 0 for s in body["songs"])
+    # 한 곡의 차트를 md5·sha256로 둘 다 보내도 곡은 한 번만
+    r = client.post("/api/tables/match", json={"md5": [md5(A)], "sha256": [sha256(A)]})
+    assert len(r.json()["songs"]) == 1
+    assert client.post("/api/tables/match", json={}).json()["songs"] == []
+
+
+def test_match_rejects_too_many_hashes(client, monkeypatch):
+    client_login(client, monkeypatch)
+    r = client.post("/api/tables/match", json={"md5": ["0" * 32] * (constant.TABLE_MATCH_MAX_HASHES + 1)})
+    assert r.status_code == 422

@@ -20,6 +20,7 @@ API 버전 3에서 사전 청크(`/api/pre/assethash`, `/api/pre/asset/{chunk_id
 | GET | `/api/pre/asset/{chunk_id}` | 사전 청크 zip 다운로드 |
 | GET | `/api/pre/sizes` | 차트·사전 청크별 SHA-256과 바이트 크기. `{"chart": {id: {"sha256", "size"}}, "asset": {…}}` |
 | GET | `/api/pre/tables` | 난이도표 목록과 사전 청크별 난이도표 태그 |
+| POST | `/api/tables/match` | 사용자가 고른 난이도표의 차트 해시에 맞는 곡 |
 | GET | `/api/pre/manifest/hash` | 매니페스트 청크별 SHA-256 목록 |
 | GET | `/api/pre/manifest/{chunk_id}` | 곡 매니페스트 (JSON) |
 | GET | `/api/pre/song/{song_id}/file?path=` | 곡의 사전 파일 하나 |
@@ -110,6 +111,24 @@ zip 안 항목 이름은 `{song_id}/{곡 zip 안 경로}` (예: `123/banner.png`
 - `charts`: 표에 실린 차트 수, `matched_charts`: 그중 서버에 있는 차트 수, `songs`: 그 차트가 든 곡 수, `fetched_at`: 표를 마지막으로 읽은 시각(unix 초)
 - `chunks`: 사전 청크 번호 → 태그(표 id 목록). 난이도표의 곡이 없는 청크는 빠집니다.
 - 이 경로가 없는 이전 서버(`404`)라면 클라이언트는 전곡을 받습니다. 사용량에는 세지 않습니다.
+
+## `POST /api/tables/match`
+
+사용자가 직접 고른 난이도표(관리자가 등록하지 않은 표 포함)의 곡을 찾습니다. **표 주소는 클라이언트가 직접 읽고** 차트 해시만 보냅니다. 서버는 표 주소에 접속하지 않으므로 서버 IP가 표 호스트에 드러나지 않고, 서버가 임의 주소에 접속하게 만드는 요청(SSRF)도 없습니다.
+
+```json
+{"md5": ["<32자>", ...], "sha256": ["<64자>", ...]}
+```
+
+- 각각 최대 20000개(`TABLE_MATCH_MAX_HASHES`), 넘으면 `422`. 대소문자·앞뒤 공백은 맞추고 형식이 틀린 해시는 건너뜁니다.
+- md5는 `chart.md5`, sha256은 차트 id와 맞춥니다. 지운 곡의 차트는 빠집니다.
+
+```json
+{"songs": [{"id": 12, "size": 34567890}], "matched_md5": ["..."], "matched_sha256": ["..."]}
+```
+
+- `songs`: 맞는 곡(곡 번호 순)과 곡 zip 크기. 곡 받기는 `/api/play/song/{song_id}`(티켓)로 합니다.
+- `matched_md5`·`matched_sha256`: 보낸 해시 중 서버에 있는 것. 나머지는 서버에 없는 차트입니다.
 
 ## `GET /api/pre/manifest/hash`
 
