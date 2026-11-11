@@ -759,3 +759,43 @@ def test_folder_mode_holds_unit_without_suggestion(client, monkeypatch):
     commit_stage(client, sid)
     assert [tuple(r) for r in song_rows()] == [(1, "A")]
     assert "판정이 없어" in units(client, sid)["two/B"]["result"]["error"]
+
+
+def test_unit_sounds_opens_pack_once_and_caches(tmp_path, monkeypatch):
+    """차트가 여러 개여도 곡 zip은 한 번만 열고, 곡 파일이 그대로면 다시 파싱하지 않습니다."""
+    pack = tmp_path / "song.zip"
+    with zipfile.ZipFile(pack, "w") as zf:
+        zf.writestr("a.bms", b"#TITLE A\n#WAV01 x.wav\n")
+        zf.writestr("b.bms", b"#TITLE B\n#WAV02 sub/y.ogg\n")
+        zf.writestr("x.wav", b"RIFF")
+    monkeypatch.setattr(staging, "_pack_path", lambda stage, unit: pack)
+    monkeypatch.setattr(staging, "_SOUNDS_CACHE", {})
+    opened = []
+    real = zipfile.ZipFile
+
+    class Counting(real):
+        def __init__(self, *args, **kwargs):
+            opened.append(args[0])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(staging.zipfile, "ZipFile", Counting)
+    unit = {"id": "u", "name": "song", "charts": [{"path": "a.bms", "sha256": "a"}, {"path": "b.bms", "sha256": "b"}]}
+    sounds, own = staging._unit_sounds({"id": "s"}, unit)
+    assert sounds == [frozenset(["sub/y"]), frozenset(["x"])]
+    assert own == {"x"}
+    assert len(opened) == 2  # 파일 목록 1번 + 차트 읽기 1번(차트 수와 무관)
+    assert staging._unit_sounds({"id": "s"}, unit) == (sounds, own)
+    assert len(opened) == 2  # 캐시
+
+
+def test_fill_meta_reads_all_charts_in_one_open(tmp_path, monkeypatch):
+    pack = tmp_path / "song.zip"
+    with zipfile.ZipFile(pack, "w") as zf:
+        zf.writestr("a.bms", b"#TITLE Alpha\n#ARTIST Foo\n")
+        zf.writestr("b.bms", b"#TITLE Beta\n#ARTIST Foo\n")
+    monkeypatch.setattr(staging, "_pack_path", lambda stage, unit: pack)
+    unit = {"id": "u", "name": "song", "charts": [{"path": "a.bms"}, {"path": "b.bms"}, {"path": "missing.bms"}]}
+    staging._fill_meta({"id": "s"}, unit)
+    assert unit["charts"][0]["title"] == "Alpha"
+    assert unit["charts"][1]["title"] == "Beta"
+    assert unit["charts"][2]["keys"] == {field: "" for field in staging.META_HEADERS}

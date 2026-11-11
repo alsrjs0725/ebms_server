@@ -6,6 +6,7 @@ import json
 import pathlib
 import posixpath
 import re
+import functools
 import hashlib
 import logging
 import shutil
@@ -402,6 +403,7 @@ PRE_HEADERS = {
 }
 # 키음(#WAVxx)·BGA(#BMPxx) 정의. 여기서 가리키는 파일은 사전 헤더가 함께 가리키지 않는 한 pre가 아닙니다.
 PLAY_HEADER = re.compile(rb"#(?:WAV|BMP)[0-9A-Z]{2}[ \t]", re.IGNORECASE)
+_WAV_HEADER = re.compile(rb"#WAV[0-9A-Z]{2}[ \t]", re.IGNORECASE)
 # 차트 헤더 값(파일명)의 인코딩 후보
 CHART_ENCODINGS = ("utf-8", "cp932", "cp949")
 # 이전 버전에서 사전 청크를 song id 구간으로 묶던 크기. 곡마다 청크 번호(song.pre_chunk)를 정한 뒤에는 지웁니다.
@@ -635,13 +637,28 @@ def chart_sounds(chart: bytes, base: str) -> list[frozenset[str]]:
                 stems.add(frozenset([posixpath.splitext(path)[0]]))
         return sorted(stems, key=sorted)
     stems = set()
-    for line in chart.splitlines():
-        line = line.strip()
-        if line[:4].upper() == b"#WAV" and PLAY_HEADER.match(line):
-            paths = _header_paths(line[6:].strip(), base)
-            if paths:
-                stems.add(frozenset(posixpath.splitext(path)[0] for path in paths))
+    # 줄마다 나눠 strip하면 노트 줄이 많은 차트에서 느려서, #WAVxx 자리만 찾아 그 줄이 그것으로 시작하는지 봅니다
+    # (splitlines·strip으로 줄을 보던 것과 같은 결과).
+    for match in _WAV_HEADER.finditer(chart):
+        start = match.start()
+        line_start = max(chart.rfind(b"\n", 0, start), chart.rfind(b"\r", 0, start)) + 1
+        if chart[line_start:start].strip():
+            continue
+        ends = [i for i in (chart.find(b"\n", start), chart.find(b"\r", start)) if i >= 0]
+        value = chart[start + 6:min(ends) if ends else len(chart)].strip()
+        if not value:
+            continue
+        stem = _sound_stem(value, base)
+        if stem is not None:
+            stems.add(stem)
     return sorted(stems, key=sorted)
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _sound_stem(value: bytes, base: str) -> frozenset[str] | None:
+    """#WAV 값 하나의 소문자 확장자 뺀 경로 후보(chart_sounds). 한 곡의 차트들은 같은 키음 정의를 되풀이하므로 기억해 둡니다."""
+    paths = _header_paths(value, base)
+    return frozenset(posixpath.splitext(path)[0] for path in paths) if paths else None
 
 
 def kinds_from_charts(paths: list[str], charts: dict[str, bytes]) -> dict[str, str]:

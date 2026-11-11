@@ -213,6 +213,28 @@ def _read(stage: dict, unit: dict, rel: str) -> bytes:
     return (_unit_dir(stage, unit) / rel).read_bytes()
 
 
+def _read_charts(stage: dict, unit: dict) -> dict[str, bytes]:
+    """곡의 차트 내용 {차트 경로: 내용}. 곡 zip은 한 번만 엽니다(차트마다 열면 파일이 많은 곡에서 목록을 매번 다시 읽음).
+    읽지 못한 차트는 빠집니다."""
+    contents = {}
+    pack = _pack_path(stage, unit)
+    if pack.is_file():
+        with zipfile.ZipFile(pack) as zf:
+            for chart in unit["charts"]:
+                try:
+                    contents[chart["path"]] = zf.read(chart["path"])
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    continue
+        return contents
+    root = _unit_dir(stage, unit)
+    for chart in unit["charts"]:
+        try:
+            contents[chart["path"]] = (root / chart["path"]).read_bytes()
+        except OSError:
+            continue
+    return contents
+
+
 def _extract(pack: pathlib.Path, out: pathlib.Path) -> None:
     """곡 파일(pack)을 out 폴더에 풉니다."""
     out.mkdir(parents=True, exist_ok=True)
@@ -453,17 +475,43 @@ def _sound_stems(paths) -> set[str]:
     return stems
 
 
+# _unit_sounds 결과 {(곡 zip이나 폴더, 수정 시각, 크기, 차트 sha256들): (키음, 곡 안 오디오)}.
+# 한 묶음 처리 중 렌더 준비·판정·폴더 근거·commit 직전 재판정에서 같은 곡을 여러 번 파싱하지 않게 합니다.
+_SOUNDS_CACHE: dict[tuple, tuple[list[frozenset[str]], set[str]]] = {}
+_SOUNDS_CACHE_SIZE = 4096
+_sounds_lock = threading.Lock()
+
+
+def _sounds_key(stage: dict, unit: dict) -> tuple | None:
+    pack = _pack_path(stage, unit)
+    source = pack if pack.is_file() else _unit_dir(stage, unit)
+    try:
+        st = source.stat()
+    except OSError:
+        return None
+    return (str(source), st.st_mtime_ns, st.st_size, tuple(chart["sha256"] for chart in unit["charts"]))
+
+
 def _unit_sounds(stage: dict, unit: dict) -> tuple[list[frozenset[str]], set[str]]:
-    """곡의 차트가 쓰는 키음(chart_sounds 형식)과 곡 안 오디오 파일의 소문자 확장자 뺀 경로."""
+    """곡의 차트가 쓰는 키음(chart_sounds 형식)과 곡 안 오디오 파일의 소문자 확장자 뺀 경로.
+    곡 파일이 그대로면 앞서 구한 결과를 씁니다(_SOUNDS_CACHE). 돌려준 값은 고치지 마세요."""
+    key = _sounds_key(stage, unit)
+    if key is not None:
+        with _sounds_lock:
+            hit = _SOUNDS_CACHE.get(key)
+        if hit is not None:
+            return hit
     own = _sound_stems(path for path, _ in _unit_entries(stage, unit))
     sounds = set()
-    for chart in unit["charts"]:
-        try:
-            content = _read(stage, unit, chart["path"])
-        except (OSError, KeyError, zipfile.BadZipFile):
-            continue
-        sounds.update(chart_sounds(content, posixpath.dirname(chart["path"])))
-    return sorted(sounds, key=sorted), own
+    for path, content in _read_charts(stage, unit).items():
+        sounds.update(chart_sounds(content, posixpath.dirname(path)))
+    result = (sorted(sounds, key=sorted), own)
+    if key is not None:
+        with _sounds_lock:
+            if len(_SOUNDS_CACHE) >= _SOUNDS_CACHE_SIZE:
+                _SOUNDS_CACHE.pop(next(iter(_SOUNDS_CACHE)))
+            _SOUNDS_CACHE[key] = result
+    return result
 
 
 def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tuple[list[int], dict[str, list[str]], dict[str, float], int | None, bool]:
@@ -523,11 +571,18 @@ def _similar(cur, unit: dict, sounds: list[frozenset[str]], own: set[str]) -> tu
 
 def _fill_meta(stage: dict, unit: dict) -> None:
     """헤더를 읽기 전 버전에서 넣은 곡의 차트를 읽어 채웁니다."""
-    for chart in unit["charts"]:
-        if "keys" in chart:
-            continue
+    todo = [chart for chart in unit["charts"] if "keys" not in chart]
+    if not todo:
+        return
+    try:
+        contents = _read_charts(stage, unit)
+    except (OSError, zipfile.BadZipFile):
+        contents = {}
+    for chart in todo:
         try:
-            _set_meta(chart, _read(stage, unit, chart["path"]))
+            if chart["path"] not in contents:
+                raise KeyError(chart["path"])
+            _set_meta(chart, contents[chart["path"]])
         except db.ChartEncodingError as e:
             chart.update({field: "" for field in META_HEADERS}, keys={field: "" for field in META_HEADERS}, error=str(e))
             unit["error"] = "; ".join(filter(None, [unit.get("error"), f"{chart['path']}: {e}"]))
