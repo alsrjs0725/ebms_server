@@ -350,6 +350,51 @@ def pre_tables(user: Annotated[User, Depends(current_user)]):
     }
 
 
+class MatchBody(BaseModel):
+    md5: list[str] = Field(default_factory=list, max_length=constant.TABLE_MATCH_MAX_HASHES)
+    sha256: list[str] = Field(default_factory=list, max_length=constant.TABLE_MATCH_MAX_HASHES)
+
+
+def match_charts(md5s: list[str], sha256s: list[str]) -> dict:
+    """해시 목록에 맞는 서버 곡. 지운 곡의 차트는 뺍니다. 형식이 틀린 해시는 건너뜁니다.
+    {songs: [{id, size}], matched_md5: [...], matched_sha256: [...]}"""
+    wanted = {
+        "md5": sorted({h for h in (_hash(v, 32) for v in md5s) if h}),
+        "id": sorted({h for h in (_hash(v, 64) for v in sha256s) if h}),
+    }
+    songs: set[int] = set()
+    matched: dict[str, set[str]] = {"md5": set(), "id": set()}
+    with db.connect() as con, con.cursor() as cur:
+        for column, hashes in wanted.items():
+            for i in range(0, len(hashes), 1000):
+                part = hashes[i : i + 1000]
+                cur.execute(
+                    f"SELECT {column}, song_id FROM chart WHERE {column} IN ({', '.join(['%s'] * len(part))})"
+                    " AND song_id IS NOT NULL",
+                    part,
+                )
+                for value, song_id in cur.fetchall():
+                    matched[column].add(value)
+                    songs.add(song_id)
+        sizes: dict[int, int] = {}
+        ids = sorted(songs)
+        for i in range(0, len(ids), 1000):
+            part = ids[i : i + 1000]
+            cur.execute(f"SELECT id, size FROM song WHERE id IN ({', '.join(['%s'] * len(part))})", part)
+            sizes.update(cur.fetchall())
+    return {
+        "songs": [{"id": song_id, "size": sizes[song_id]} for song_id in ids if song_id in sizes],
+        "matched_md5": sorted(matched["md5"]),
+        "matched_sha256": sorted(matched["id"]),
+    }
+
+
+@router.post("/api/tables/match")
+async def tables_match(body: MatchBody, user: Annotated[User, Depends(current_user)]):
+    """사용자가 고른 난이도표의 차트 해시(클라이언트가 직접 읽음)에 맞는 곡. 서버는 표 주소에 접속하지 않습니다."""
+    return await run_in_threadpool(match_charts, body.md5, body.sha256)
+
+
 # ---- 관리자 ----
 
 class TableBody(BaseModel):
