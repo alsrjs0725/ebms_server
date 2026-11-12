@@ -579,6 +579,15 @@ async function setSpeed(job, slow, button) {
     }
 }
 
+// 에셋 누락(staging._missing_assets) 한 줄. 없으면 "".
+const MISSING_KINDS = { sound: "키음", bga: "BGA", image: "이미지" };
+function missingText(missing) {
+    if (!missing) return "";
+    return Object.entries(missing)
+        .map(([kind, v]) => `${MISSING_KINDS[kind] || kind} ${v.count}개(${v.examples.join(", ")}${v.count > v.examples.length ? " …" : ""})`)
+        .join(" · ");
+}
+
 function songLine(song) {
     const li = document.createElement("li");
     const name = document.createElement("code");
@@ -612,6 +621,12 @@ function songLine(song) {
             li.append(`, 충돌 파일 고른 대로 처리(새 파일로 바꿈 ${picked.filter((v) => v === "new").length}개, 기존 유지 ${picked.filter((v) => v === "old").length}개)`);
         }
         if (song.kept_charts) li.append(`, 내용이 다른 같은 이름 차트 ${song.kept_charts.length}개는 차트로만 등록(곡 파일은 기존 유지)`);
+        if (song.missing_assets) {
+            const miss = document.createElement("span");
+            miss.className = "text-warning-emphasis";
+            miss.textContent = ` · 없는 에셋: ${missingText(song.missing_assets)}`;
+            li.append(miss);
+        }
         if (song.conflicts) {
             const warn = document.createElement("span");
             warn.className = "text-warning-emphasis";
@@ -642,7 +657,7 @@ function matches(song) {
     if (filterLevel.value && songLevel(song) !== filterLevel.value) return false;
     const q = filterText.value.trim().toLowerCase();
     if (!q) return true;
-    const text = [song.folder, song.error, song.song_id, ...(song.conflicts || []), ...(song.added_files || []), ...(song.similar_files || [])].join("\n");
+    const text = [song.folder, song.error, song.song_id, ...(song.conflicts || []), ...(song.added_files || []), ...(song.similar_files || []), song.missing_assets ? "에셋 누락 " + missingText(song.missing_assets) : ""].join("\n");
     return text.toLowerCase().includes(q);
 }
 
@@ -805,7 +820,8 @@ const SUGGESTION = {
 function stageCounts(stage) {
     const c = stage.counts;
     return `곡 ${stage.units}개 · 채보 ${stage.charts}개 · ${size(stage.size)} · 새 곡 ${c.new} · 추가 ${c.add} · 여러 곡과 겹침 ${c.ambiguous} · 사용 중지 곡 ${c.unused} · 비슷한 곡 ${c.similar} · 대상 바꿈 ${c.changed} · 제외 ${c.skip}` +
-        (c.failed ? ` · 등록 불가·commit 실패 ${c.failed}` : "");
+        (c.failed ? ` · 등록 불가·commit 실패 ${c.failed}` : "") +
+        (c.missing ? ` · 에셋 누락 ${c.missing}` : "");
 }
 
 async function loadCache() {
@@ -1074,6 +1090,12 @@ function unitRows(stage, unit, locked) {
         err.className = "text-danger";
         err.textContent = `등록 불가(내려받아 고친 뒤 다시 올리세요. 제외로 두면 commit 때 묶음에서 빠집니다): ${unit.error}`;
         folder.append(err);
+    }
+    if (unit.missing) {
+        const miss = document.createElement("div");
+        miss.className = "text-warning-emphasis";
+        miss.textContent = `차트가 쓰는데 없는 에셋(넣는 데는 문제없음, 차분이면 기존 곡에서 채움): ${missingText(unit.missing)}`;
+        folder.append(miss);
     }
     if (unit.result) {
         const warn = document.createElement("div");

@@ -144,3 +144,22 @@ def test_chart_sounds():
     assert any("d/キック" in s for s in sounds) and len(sounds) == 3
     bmson = b'{"version": "1.0.0", "info": {"title": "x"}, "sound_channels": [{"name": "A.wav", "notes": []}], "bga": {"bga_header": [{"id": 1, "name": "bg.bmp"}]}}'
     assert chart_sounds(bmson, "") == [frozenset(["a"])]
+
+
+def test_chart_assets():
+    from ebms_server.db import chart_assets
+    chart = (
+        "#WAV01 Sub\\Kick.wav\n#BMP01 bg.mpg\n#BMP02 レイヤー.bmp\n#STAGEFILE stage.png\n#BANNER\tbanner.jpg\n"
+        "#BACKBMP back\n#PREVIEW preview.ogg\n#00101:01\n #BMP03 indented.bmp\n#00104:0102\n"
+    ).encode("cp932")
+    assets = chart_assets(chart, "d")
+    assert assets["sound"] == [frozenset(["d/sub/kick"])]
+    assert frozenset(["d/bg"]) in assets["bga"] and any("d/レイヤー" in s for s in assets["bga"])
+    # 들여쓴 정의도 플레이어는 읽으므로 셉니다(chart_sounds와 같음). 확장자 없는 이미지 헤더·#PREVIEW는 세지 않습니다.
+    assert len(assets["bga"]) == 3
+    assert sorted(min(s) for s in assets["image"]) == ["d/banner", "d/stage"]
+    bmson = (
+        b'{"version": "1.0.0", "info": {"title": "x", "banner_image": "Ban.PNG", "back_image": ""},'
+        b' "sound_channels": [{"name": "A.wav", "notes": []}], "bga": {"bga_header": [{"id": 1, "name": "bg.mp4"}]}}'
+    )
+    assert chart_assets(bmson, "") == {"sound": [frozenset(["a"])], "bga": [frozenset(["bg"])], "image": [frozenset(["ban"])]}

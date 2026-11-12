@@ -679,6 +679,62 @@ def chart_sounds(chart: bytes, base: str) -> list[frozenset[str]]:
     return sorted(stems, key=sorted)
 
 
+# chart_assets의 종류: sound 키음(#WAV), bga BGA(#BMP), image 배너·스테이지 이미지(#BANNER·#STAGEFILE·#BACKBMP)
+_BMP_HEADER = re.compile(rb"#BMP[0-9A-Z]{2}[ \t]", re.IGNORECASE)
+_IMAGE_HEADER = re.compile(rb"#(?:BANNER|STAGEFILE|BACKBMP)[ \t]", re.IGNORECASE)
+_BMSON_IMAGE_FIELDS = ("banner_image", "eyecatch_image", "back_image", "title_image")
+
+
+def chart_assets(chart: bytes, base: str) -> dict[str, list[frozenset[str]]]:
+    """차트가 가리키는 키음·BGA·이미지 {"sound"|"bga"|"image": [소문자 확장자 뺀 경로 후보 집합]}.
+    경로 후보는 헤더 값의 인코딩 후보별(chart_sounds와 같음)이고, 플레이어가 확장자를 바꿔 찾으므로 확장자는 뺍니다.
+    이미지 헤더는 값의 확장자가 이미지일 때만 셉니다(_chart_refs와 같음). #PREVIEW는 없어도 만들어 주므로 세지 않습니다."""
+    result: dict[str, set[frozenset[str]]] = {"sound": set(), "bga": set(), "image": set()}
+    data = _bmson(chart)
+    if data is not None:
+        def stem(name) -> frozenset[str] | None:
+            if not isinstance(name, str) or not name.strip():
+                return None
+            path = posixpath.normpath(posixpath.join(base, name.strip().replace("\\", "/"))).lower()
+            return frozenset([posixpath.splitext(path)[0]])
+
+        bga = data.get("bga")
+        for kind, items in (
+            ("sound", data.get("sound_channels") or []),
+            ("bga", (bga.get("bga_header") or []) if isinstance(bga, dict) else []),
+        ):
+            for item in items:
+                found = stem(item.get("name")) if isinstance(item, dict) else None
+                if found is not None:
+                    result[kind].add(found)
+        info = _bmson_info(data)
+        for field in _BMSON_IMAGE_FIELDS:
+            name = info.get(field)
+            found = stem(name)
+            if found is not None and posixpath.splitext(name.strip().lower())[1] in constant.IMAGE_FORMAT:
+                result["image"].add(found)
+        return {kind: sorted(stems, key=sorted) for kind, stems in result.items()}
+    # chart_sounds처럼 헤더 자리만 찾아 그 줄이 그것으로 시작하는지 봅니다(노트 줄이 많은 차트에서 줄마다 나누면 느림).
+    for kind, header in (("sound", _WAV_HEADER), ("bga", _BMP_HEADER), ("image", _IMAGE_HEADER)):
+        for match in header.finditer(chart):
+            start = match.start()
+            line_start = max(chart.rfind(b"\n", 0, start), chart.rfind(b"\r", 0, start)) + 1
+            if chart[line_start:start].strip():
+                continue
+            ends = [i for i in (chart.find(b"\n", start), chart.find(b"\r", start)) if i >= 0]
+            value = chart[match.end():min(ends) if ends else len(chart)].strip()
+            if not value:
+                continue
+            if kind == "image":
+                paths = [p for p in _header_paths(value, base) if posixpath.splitext(p)[1] in constant.IMAGE_FORMAT]
+                found = frozenset(posixpath.splitext(p)[0] for p in paths) if paths else None
+            else:
+                found = _sound_stem(value, base)
+            if found is not None:
+                result[kind].add(found)
+    return {kind: sorted(stems, key=sorted) for kind, stems in result.items()}
+
+
 @functools.lru_cache(maxsize=1 << 16)
 def _sound_stem(value: bytes, base: str) -> frozenset[str] | None:
     """#WAV 값 하나의 소문자 확장자 뺀 경로 후보(chart_sounds). 한 곡의 차트들은 같은 키음 정의를 되풀이하므로 기억해 둡니다."""
