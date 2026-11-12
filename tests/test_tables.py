@@ -395,3 +395,77 @@ def test_match_rejects_too_many_hashes(client, monkeypatch):
     client_login(client, monkeypatch)
     r = client.post("/api/tables/match", json={"md5": ["0" * 32] * (constant.TABLE_MATCH_MAX_HASHES + 1)})
     assert r.status_code == 422
+
+
+def pack_names(client, chunk_id: int) -> list[str]:
+    import io
+    import zipfile
+
+    r = client.get(f"/api/pre/chart/{chunk_id}")
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        return sorted(zf.namelist())
+
+
+def test_chart_packs_follow_pre_chunks(client, monkeypatch):
+    """차트 청크를 사전 청크와 같은 번호로 묶어, 표를 고른 클라이언트가 그 표의 차트만 받게 합니다."""
+    monkeypatch.setattr(constant, "SONGS_PER_PRE_CHUNK", 2)
+    admin_login(client, monkeypatch)
+    pages = {
+        "https://t.example/h.json": {"name": "Insane", "symbol": "★", "data_url": "d.json"},
+        "https://t.example/d.json": [{"md5": md5(A), "level": "1"}, {"md5": md5(C), "level": "2"}],
+    }
+    monkeypatch.setattr(tables, "http_get", fake_web(pages))
+    insane = client.post("/api/admin/tables", json={"url": "https://t.example/h.json"}).json()
+    for name, chart in (("a.zip", A), ("b.zip", B), ("c.zip", C)):
+        upload(client, name, make_zip({"x.bms": chart, "banner.png": b"png"}))
+    database = db_module.Database()
+    legacy = client.get("/api/pre/charthash").json()
+
+    # 다 만들기 전에는 이전 차트 청크(임포트 순서)를 내려줍니다.
+    assert client.get("/api/pre/tables").json()["chart_layout"] == "legacy"
+    assert pack_names(client, 0) == sorted(f"{sha256(c)}.bms" for c in (A, B, C))
+
+    # 곡 1(A)·3(C)은 Insane 청크 0, 곡 2(B)는 청크 1. 차트 묶음도 같은 번호입니다.
+    assert database.backfill_chart_packs() == (0, 0)
+    pre = client.get("/api/pre/tables").json()
+    assert pre["chart_layout"] == "pre" and pre["chunks"] == {"0": [insane["id"]]}
+    hashes = client.get("/api/pre/charthash").json()
+    assert sorted(hashes) == ["0", "1"] and hashes != legacy
+    assert client.get("/api/pre/sizes").json()["chart"]["0"]["sha256"] == hashes["0"]
+    assert pack_names(client, 0) == sorted(f"{sha256(c)}.bms" for c in (A, C))
+    assert pack_names(client, 1) == [f"{sha256(B)}.bms"]
+    r = client.post("/api/pre/song_chunks", json={"songs": [3, 1, 2, 99]})
+    assert r.json() == {"chunks": {"1": 0, "2": 1, "3": 0}}
+
+    # 기존 곡에 차트만 더해도(사전 파일은 그대로) 그 곡의 묶음을 다시 만듭니다.
+    D = b"#TITLE D\n"
+    upload(client, "a2.zip", make_zip({"x.bms": A, "y.bms": D}))
+    assert pack_names(client, 0) == sorted(f"{sha256(c)}.bms" for c in (A, C, D))
+    # 곡을 사용 중지하면 묶음에서 빠지고, 곡이 없는 묶음은 지웁니다.
+    assert client.request("DELETE", "/api/admin/songs/2", json={"reason": "x"}).status_code == 200
+    assert sorted(client.get("/api/pre/charthash").json()) == ["0"]
+    assert client.get("/api/pre/chart/1").status_code == 404
+    assert database.backfill_chart_packs() == (0, 0)
+
+
+def test_chart_packs_migrate_from_legacy(client, monkeypatch):
+    """이전 버전 DB(차트 보관 청크 번호 없음, 묶음 없음)는 조금씩 묶음을 만들고, 다 만든 뒤에야 묶음을 내려줍니다."""
+    monkeypatch.setattr(constant, "SONGS_PER_PRE_CHUNK", 1)
+    admin_login(client, monkeypatch)
+    for name, chart in (("a.zip", A), ("b.zip", B), ("c.zip", C)):
+        upload(client, name, make_zip({"x.bms": chart}))
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("DELETE FROM chart_pack")
+        cur.execute("UPDATE chart SET chunk = NULL")
+        cur.execute("DELETE FROM setting WHERE name = %s", (db_module.CHART_LAYOUT_SETTING,))
+        con.commit()
+    database = db_module.Database()
+    assert database.backfill_chart_packs(budget=1) == (1, 2)
+    assert client.get("/api/pre/tables").json()["chart_layout"] == "legacy"
+    with db_module.connect() as con, con.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM chart WHERE chunk IS NULL")
+        assert cur.fetchone()[0] == 0
+    assert database.backfill_chart_packs() == (2, 0)
+    assert client.get("/api/pre/tables").json()["chart_layout"] == "pre"
+    assert [pack_names(client, i) for i in range(3)] == [[f"{sha256(c)}.bms"] for c in (A, B, C)]

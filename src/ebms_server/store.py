@@ -1,4 +1,4 @@
-"""곡 zip·차트 청크·사전 청크 파일 저장소(constant.STORE_DIR, #152).
+"""곡 zip·차트 청크·차트 묶음·사전 청크 파일 저장소(constant.STORE_DIR, #152).
 
 내용은 파일로 두고 DB에는 크기·sha256·상대 경로(path)만 둡니다. 파일 이름에 sha256 앞부분을 넣어 같은 행을 바꿀 때
 새 이름으로 쓰고, 옛 파일은 DB가 더 가리키지 않게 된 뒤 gc가 지웁니다. 받는 중인 다운로드는 열어 둔 파일로 끝까지 받습니다.
@@ -23,6 +23,10 @@ def song_path(song_id: int, sha256: str) -> str:
 
 def chart_chunk_path(chunk_no: int, sha256: str) -> str:
     return f"chart_chunk/{chunk_no:05d}.{sha256[:16]}.zip"
+
+
+def chart_pack_path(chunk_no: int, sha256: str) -> str:
+    return f"chart_pack/{chunk_no // 1000:04d}/{chunk_no:05d}.{sha256[:16]}.zip"
 
 
 def pre_chunk_path(chunk_no: int, sha256: str) -> str:

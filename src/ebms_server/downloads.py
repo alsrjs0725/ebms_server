@@ -202,7 +202,7 @@ def _pre_file(request: Request, table: str, chunk_id: int, filename: str, user: 
 
 @router.get("/api/pre/chart/{chunk_id}")
 def pre_chart_chunk(chunk_id: int, request: Request, user: Annotated[User | None, Depends(download_user)]):
-    return _pre_file(request, "chart_chunk", chunk_id, constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
+    return _pre_file(request, "chart", chunk_id, constant.CHART_CHUNK_FILENAME_TEMPLATE.format(chunk_id), user)
 
 
 @router.get("/api/pre/assethash")

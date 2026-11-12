@@ -8,7 +8,7 @@
 | 8000/tcp (`EBMS_PORT`) | EBMS 서버 (HTTP) | 금지 | 기본은 호스트의 `127.0.0.1`에만 바인딩(`EBMS_BIND_ADDR`). 같은 호스트의 리버스 프록시만 접근 |
 | 3306/tcp | MySQL | 불필요 | 호스트에 바인딩하지 않음. compose 내부 네트워크에서 `ebms` 컨테이너만 접근 |
 
-- 곡 zip·차트 청크·사전 청크는 파일로 `var/store/`(`EBMS_STORE_DIR`)에 두고, MySQL(`mysql-data` 볼륨)에는 경로·크기·sha256 같은 메타데이터만 둡니다(#152). 테이블은 서버가 시작할 때 자동 생성됩니다. 백업할 때는 DB와 `var/store/`를 함께 백업합니다.
+- 곡 zip·차트 청크·차트 묶음·사전 청크는 파일로 `var/store/`(`EBMS_STORE_DIR`)에 두고, MySQL(`mysql-data` 볼륨)에는 경로·크기·sha256 같은 메타데이터만 둡니다(#152). 테이블은 서버가 시작할 때 자동 생성됩니다. 백업할 때는 DB와 `var/store/`를 함께 백업합니다.
 - 서버 로그, 임포트 폴더(`var/log`, `var/tmp`, 검토 대기 `var/staged`), 저장소(`var/store`)는 `ebms-var` 볼륨에 유지됩니다.
 
 ### 로그 보관

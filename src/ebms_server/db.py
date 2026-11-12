@@ -56,6 +56,8 @@ SCHEMA = [
             artist_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
             bpm_key VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
             genre_key VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            -- 차트 내용이 든 차트 보관 청크(chart_chunk) 번호. NULL이면 아직 찾지 않음(locate_charts)
+            chunk INT UNSIGNED,
 
             PRIMARY KEY (id, size),
             INDEX chart_md5 (md5),
@@ -65,6 +67,8 @@ SCHEMA = [
             FOREIGN KEY (song_id) REFERENCES song(id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
     """,
+    # 차트 보관 청크. 임포트한 차트를 순서대로 CHARTS_PER_CHUNK개씩 덧붙여 두는 서버 안 보관소입니다(지운 곡·뗀 차트 포함).
+    # 클라이언트에는 차트 묶음(chart_pack)을 내려주고, 묶음을 다 만들기 전(CHART_LAYOUT_SETTING이 없을 때)에만 이것을 내려줍니다.
     """
         CREATE TABLE IF NOT EXISTS chart_chunk(
             id INT UNSIGNED NOT NULL,
@@ -82,6 +86,21 @@ SCHEMA = [
             sha256 CHAR(64) NOT NULL,
             -- gzip으로 압축한 JSON
             data LONGBLOB NOT NULL,
+
+            PRIMARY KEY (id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
+    """,
+    # 차트 묶음. 클라이언트가 받는 차트 청크입니다. id는 사전 청크 번호와 같고, song.pre_chunk가 그 번호인 곡들의 차트를
+    # 무압축 zip으로 묶습니다. 그래서 난이도표를 고른 클라이언트는 사전 청크와 같은 번호의 차트 묶음만 받습니다.
+    # 항목 이름은 차트 보관 청크와 같은 "{sha256}{확장자}"이고, charts는 만들 때 든 차트 id들의 서명(_chart_digest,
+    # 지금 든 차트와 다르면 다시 만듭니다)입니다.
+    """
+        CREATE TABLE IF NOT EXISTS chart_pack(
+            id INT UNSIGNED NOT NULL,
+            size BIGINT UNSIGNED NOT NULL,
+            sha256 CHAR(64) NOT NULL,
+            path VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+            charts CHAR(64) NOT NULL DEFAULT '',
 
             PRIMARY KEY (id)
         ) ENGINE=InnoDB DEFAULT CHARSET=ascii COLLATE=ascii_bin
@@ -380,6 +399,8 @@ MISSING_COLUMNS = [
     ("pre_chunk", "songs", "VARCHAR(1024)"),
     # 삭제(purge_song)한 시각. 있으면 옮겨 둔 파일이 없어 복원할 수 없고, 같은 차트를 다시 임포트할 수 있습니다.
     ("deleted_song", "purged_at", "BIGINT UNSIGNED"),
+    # 차트 묶음(chart_pack) 전 버전에는 없던 차트 보관 청크 번호
+    ("chart", "chunk", "INT UNSIGNED"),
 ]
 MISSING_INDEXES = [("song", "song_pre_chunk", "pre_chunk"), ("song", "song_folder", "folder")]
 # 곡·청크를 저장소 파일로 옮기기 전(#152) 데이터를 두던 테이블·컬럼. 다 옮긴 DB에서 서버 시작 때 지웁니다.
@@ -411,7 +432,11 @@ PRE_CHUNK_SETTING = "pre_chunk_songs"
 # 곡마다 사전 청크 번호를 정했는지("tables"). 없으면 서버 시작 때 이전 구간(id // 크기)으로 정합니다.
 PRE_LAYOUT_SETTING = "pre_chunk_layout"
 # 저장소 파일 경로(path)를 가진 테이블
-STORE_TABLES = ("pre_chunk", "chart_chunk", "song")
+STORE_TABLES = ("pre_chunk", "chart_chunk", "chart_pack", "song")
+# 차트 묶음(chart_pack)을 다 만들어 클라이언트에 내려주는지("pre"). 없으면 차트 보관 청크(chart_chunk)를 내려줍니다.
+CHART_LAYOUT_SETTING = "chart_chunk_layout"
+# open_file에 주면 지금 클라이언트에 내려주는 차트 청크 테이블(chart_pack 또는 chart_chunk)을 엽니다.
+SERVED_CHART = "chart"
 # bmson 차트 info의 이미지·오디오 항목. PRE_HEADERS와 같은 사전 파일입니다.
 BMSON_PRE_FIELDS = {
     "banner_image": constant.IMAGE_FORMAT,
@@ -811,6 +836,11 @@ def chart_arcname(sha256: str, path: pathlib.PurePath) -> str:
     return f"{sha256}{path.suffix.lower()}"
 
 
+def _chart_digest(chart_ids) -> str:
+    """차트 묶음에 든 차트 id들의 서명(chart_pack.charts). 차트가 바뀌었는지만 보므로 순서와 무관합니다."""
+    return hashlib.sha256(",".join(sorted(chart_ids)).encode()).hexdigest()
+
+
 def _safe_entry(path: pathlib.Path, root: pathlib.Path, is_dir: bool) -> bool:
     """곡 폴더(root, resolve된 경로) 안의 항목을 곡에 넣어도 되는지 봅니다.
 
@@ -1201,6 +1231,8 @@ class Database:
             data = buf.getvalue()
             count += len(take)
             self._write_chart_chunk(cur, chunk_no, data)
+            for arcname, _ in take:
+                cur.execute("UPDATE chart SET chunk = %s WHERE id = %s", (chunk_no, arcname.split(".", 1)[0]))
 
     def _write_chart_chunk(self, cur, chunk_no: int, data: bytes) -> None:
         """차트 청크를 저장소 파일로 쓰고 행을 그 파일로 바꿉니다. 옛 파일은 gc가 지웁니다."""
@@ -1440,6 +1472,8 @@ class Database:
         든 곡이 없으면 청크를 지웁니다."""
         cur.execute("SELECT id, files, sha256 FROM song WHERE pre_chunk = %s ORDER BY id", (chunk_no,))
         songs = cur.fetchall()
+        # 같은 번호의 차트 묶음도 든 곡의 차트가 바뀌었으면 다시 만듭니다(곡이 없으면 지움).
+        self._refresh_chart_pack(cur, chunk_no)
         if not songs:
             cur.execute("DELETE FROM pre_chunk WHERE id = %s", (chunk_no,))
             return
@@ -1666,6 +1700,209 @@ class Database:
                     raise
             progress.update(i)
         return len(todo)
+
+    # ---- 차트 묶음(chart_pack) ----
+
+    def _pack_members(self, cur, chunk_ids: list[int] | None = None) -> dict[int, list[str]]:
+        """{사전 청크 번호: 그 청크에 든 곡들의 차트 id들}. chunk_ids가 있으면 그 청크만."""
+        sql = "SELECT s.pre_chunk, c.id FROM chart c JOIN song s ON s.id = c.song_id WHERE s.pre_chunk IS NOT NULL"
+        if chunk_ids is None:
+            cur.execute(sql)
+        elif not chunk_ids:
+            return {}
+        else:
+            cur.execute(sql + f" AND s.pre_chunk IN ({', '.join(['%s'] * len(chunk_ids))})", tuple(chunk_ids))
+        members: dict[int, list[str]] = defaultdict(list)
+        for chunk_no, chart_id in cur.fetchall():
+            members[chunk_no].append(chart_id)
+        return members
+
+    def _stale_chart_packs(self, cur, chunk_ids: list[int] | None = None) -> list[int]:
+        """다시 만들 차트 묶음: 든 차트가 만들 때와 다르거나, 차트가 있는데 묶음이 없거나, 묶음이 있는데 차트가 없는 번호."""
+        members = self._pack_members(cur, chunk_ids)
+        if chunk_ids is None:
+            cur.execute("SELECT id, charts FROM chart_pack")
+        elif not chunk_ids:
+            return []
+        else:
+            cur.execute(
+                f"SELECT id, charts FROM chart_pack WHERE id IN ({', '.join(['%s'] * len(chunk_ids))})", tuple(chunk_ids)
+            )
+        built = {row[0]: row[1] for row in cur.fetchall()}
+        stale = []
+        for chunk_no in set(members) | set(built):
+            ids = members.get(chunk_no)
+            if built.get(chunk_no) != (_chart_digest(ids) if ids else None):
+                stale.append(chunk_no)
+        return sorted(stale)
+
+    def _refresh_chart_pack(self, cur, chunk_no: int) -> int:
+        """차트 묶음이 든 차트와 다르면 다시 만듭니다. 쓴 바이트를 반환합니다(그대로면 0)."""
+        if not self._stale_chart_packs(cur, [chunk_no]):
+            return 0
+        return self._rebuild_chart_pack(cur, chunk_no)
+
+    def _rebuild_chart_pack(self, cur, chunk_no: int) -> int:
+        """사전 청크 chunk_no에 든 곡들의 차트를 차트 보관 청크에서 꺼내 다시 묶어 저장합니다. 든 차트가 없으면 묶음을 지웁니다.
+        쓴 바이트를 반환합니다. 내용을 찾지 못한 차트는 경고를 남기고 뺍니다(다시 만들어도 같으므로 서명에는 넣음)."""
+        cur.execute(
+            """
+            SELECT c.id, c.size, c.filename, c.chunk, c.song_id FROM chart c JOIN song s ON s.id = c.song_id
+            WHERE s.pre_chunk = %s ORDER BY c.id
+            """,
+            (chunk_no,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            cur.execute("DELETE FROM chart_pack WHERE id = %s", (chunk_no,))
+            return 0
+        contents = self._chart_contents(cur, rows)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED) as zf:
+            for chart_id, _, filename, _, song_id in rows:
+                content = contents.get(chart_id)
+                if content is None:
+                    self.logger.warning(f"chart pack {chunk_no}: chart {chart_id} of song {song_id} not found")
+                    continue
+                arcname = chart_arcname(chart_id, pathlib.PurePosixPath(filename or f"{chart_id}.bms"))
+                zf.writestr(zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0)), content)
+        data = buf.getvalue()
+        sha256 = hashlib.sha256(data).hexdigest()
+        path = store.write(store.chart_pack_path(chunk_no, sha256), data)
+        cur.execute(
+            """
+            INSERT INTO chart_pack (id, size, sha256, path, charts) VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE size = VALUES(size), sha256 = VALUES(sha256), path = VALUES(path),
+                charts = VALUES(charts)
+            """,
+            (chunk_no, len(data), sha256, path, _chart_digest(row[0] for row in rows)),
+        )
+        return len(data)
+
+    def _chart_contents(self, cur, rows) -> dict[str, bytes]:
+        """차트 (id, size, filename, chunk, song_id) 행들의 내용 {id: 내용}. 차트 보관 청크(chart.chunk)에서 꺼내고,
+        보관 청크 번호를 모르거나 거기 없으면 곡 zip의 같은 경로, 그래도 없으면 보관 청크 전체에서 찾습니다(찾으면 번호를 적음)."""
+        found: dict[str, bytes] = {}
+        by_chunk: dict[int, list[str]] = defaultdict(list)
+        for chart_id, _, _, chunk, _ in rows:
+            if chunk is not None:
+                by_chunk[chunk].append(chart_id)
+        for chunk, ids in by_chunk.items():
+            found.update(self._read_archived_charts(cur, chunk, set(ids)))
+        left = [row for row in rows if row[0] not in found]
+        for chart_id, size, filename, _, song_id in left:
+            content = self._song_chart(cur, song_id, filename, size)
+            if content is not None and hashlib.sha256(content).hexdigest() == chart_id:
+                found[chart_id] = content
+        wanted = {row[0] for row in rows if row[0] not in found}
+        if wanted:
+            cur.execute("SELECT id FROM chart_chunk ORDER BY id DESC")
+            for (chunk,) in cur.fetchall():
+                got = self._read_archived_charts(cur, chunk, wanted)
+                for chart_id, content in got.items():
+                    found[chart_id] = content
+                    cur.execute("UPDATE chart SET chunk = %s WHERE id = %s", (chunk, chart_id))
+                wanted -= set(got)
+                if not wanted:
+                    break
+        return found
+
+    def _read_archived_charts(self, cur, chunk: int, chart_ids: set[str]) -> dict[str, bytes]:
+        """차트 보관 청크 하나에서 chart_ids의 내용을 꺼냅니다. 파일 전체를 읽지 않고 필요한 항목만 읽습니다."""
+        cur.execute("SELECT path FROM chart_chunk WHERE id = %s", (chunk,))
+        row = cur.fetchone()
+        if row is None or not chart_ids:
+            return {}
+        out: dict[str, bytes] = {}
+        try:
+            with zipfile.ZipFile(store.full_path(row[0])) as zf:
+                for name in zf.namelist():
+                    chart_id = name.split(".", 1)[0]
+                    if chart_id in chart_ids and chart_id not in out:
+                        content = zf.read(name)
+                        if hashlib.sha256(content).hexdigest() == chart_id:
+                            out[chart_id] = content
+        except (OSError, zipfile.BadZipFile) as e:
+            self.logger.warning(f"chart chunk {chunk}: could not read: {e}")
+        return out
+
+    def _song_chart(self, cur, song_id: int, filename: str, size: int) -> bytes | None:
+        """곡 zip에서 filename 경로의 차트(크기가 size인 것)를 읽습니다. 없으면 None."""
+        if not filename:
+            return None
+        cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+        row = cur.fetchone()
+        if row is None or not row[0]:
+            return None
+        for entry in json.loads(row[0]):
+            if entry["path"] == filename and entry["size"] == size:
+                try:
+                    return self._read_song_member(cur, song_id, entry)
+                except (ValueError, zlib.error):
+                    return None
+        return None
+
+    def locate_charts(self) -> int:
+        """보관 청크 번호(chart.chunk)를 모르는 차트(이전 버전에서 넣은 차트)의 번호를 적습니다. 적은 차트 수를 반환합니다.
+        같은 차트가 여러 보관 청크에 있으면(되살린 차트) 나중 청크를 적습니다. 보관 청크마다 따로 커밋합니다."""
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM chart WHERE chunk IS NULL")
+            if not cur.fetchone()[0]:
+                return 0
+            cur.execute("SELECT id, path FROM chart_chunk ORDER BY id DESC")
+            chunks = cur.fetchall()
+        located = 0
+        for chunk, path in chunks:
+            try:
+                with zipfile.ZipFile(store.full_path(path)) as zf:
+                    ids = sorted({name.split(".", 1)[0] for name in zf.namelist()})
+            except (OSError, zipfile.BadZipFile) as e:
+                self.logger.warning(f"locate_charts: chart chunk {chunk}: could not read: {e}")
+                continue
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                for i in range(0, len(ids), 500):
+                    part = ids[i : i + 500]
+                    cur.execute(
+                        f"UPDATE chart SET chunk = %s WHERE chunk IS NULL AND id IN ({', '.join(['%s'] * len(part))})",
+                        (chunk, *part),
+                    )
+                    located += cur.rowcount
+                con.commit()
+        self.logger.info(f"locate_charts: Located {located} charts in chart chunks.")
+        return located
+
+    def backfill_chart_packs(self, budget: int | None = None) -> tuple[int, int]:
+        """든 차트가 바뀐 차트 묶음을 다시 만듭니다(처음에는 모두). 한 번에 쓰는 용량은 대략 budget(기본
+        CHART_PACK_BYTES)까지이고, 묶음마다 따로 커밋합니다. 남은 묶음이 없으면 클라이언트에 차트 묶음을 내려주기
+        시작합니다(CHART_LAYOUT_SETTING). (다시 만든 수, 남은 수)를 반환합니다."""
+        budget = constant.CHART_PACK_BYTES if budget is None else budget
+        self.locate_charts()
+        with connect() as con, con.cursor() as cur:
+            todo = self._stale_chart_packs(cur)
+        if todo:
+            self.logger.info(f"backfill_chart_packs: {len(todo)} chart packs to build.")
+        written = done = 0
+        progress = _Progress(self.logger, "backfill_chart_packs", len(todo))
+        for chunk_no in todo:
+            if written >= budget:
+                break
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                try:
+                    written += self._refresh_chart_pack(cur, chunk_no)
+                    con.commit()
+                except Exception:
+                    con.rollback()
+                    raise
+            done += 1
+            progress.update(done)
+        left = len(todo) - done
+        if not left:
+            with self._write_lock, connect() as con, con.cursor() as cur:
+                if self._setting(cur, CHART_LAYOUT_SETTING) != "pre" and not self._stale_chart_packs(cur):
+                    self._set_setting(cur, CHART_LAYOUT_SETTING, "pre")
+                    con.commit()
+                    self.logger.info("backfill_chart_packs: All chart packs built. Serving chart packs to clients.")
+        return done, left
 
     def get_song_data(self, song_id: int) -> bytes | None:
         """곡 id의 전체 zip. 없는 곡이면 None."""
@@ -2008,9 +2245,18 @@ class Database:
 
         return buf.getvalue()
 
+    def _served_chart_table(self, cur) -> str:
+        """클라이언트에 내려주는 차트 청크 테이블. 차트 묶음을 다 만들기 전에는 차트 보관 청크."""
+        return "chart_pack" if self._setting(cur, CHART_LAYOUT_SETTING) == "pre" else "chart_chunk"
+
+    def chart_layout(self) -> str:
+        """클라이언트에 내려주는 차트 청크 구성. "pre"면 사전 청크와 같은 번호로 묶은 차트 묶음, "legacy"면 보관 청크."""
+        with connect() as con, con.cursor() as cur:
+            return "pre" if self._served_chart_table(cur) == "chart_pack" else "legacy"
+
     def get_chart_chunk_hash(self) -> dict[int, str]:
         with connect() as con, con.cursor() as cur:
-            cur.execute("SELECT id, sha256 FROM chart_chunk ORDER BY id")
+            cur.execute(f"SELECT id, sha256 FROM {self._served_chart_table(cur)} ORDER BY id")
             return {row[0]: row[1] for row in cur.fetchall()}
 
     def get_song_files(self, song_id: int) -> list[dict] | None:
@@ -2031,7 +2277,7 @@ class Database:
         """차트·사전 청크별 SHA-256과 바이트 크기. 클라이언트가 동기화 전에 받을 용량을 셉니다."""
         out: dict[str, dict[int, dict]] = {}
         with connect() as con, con.cursor() as cur:
-            for key, table in (("chart", "chart_chunk"), ("asset", "pre_chunk")):
+            for key, table in (("chart", self._served_chart_table(cur)), ("asset", "pre_chunk")):
                 cur.execute(f"SELECT id, sha256, size FROM {table} ORDER BY id")
                 out[key] = {row[0]: {"sha256": row[1], "size": row[2]} for row in cur.fetchall()}
         return out
@@ -2676,14 +2922,15 @@ class Database:
         return removed
 
     def open_file(self, table: str, row_id: int) -> StoreFile | None:
-        """song / chart_chunk / pre_chunk 행의 저장소 파일을 엽니다. 없는 id면 None.
-        전송 중 DB 연결을 잡지 않도록 조회만 단기 연결로 합니다."""
-        if table not in STORE_TABLES:
+        """STORE_TABLES 행의 저장소 파일을 엽니다. 없는 id면 None. table이 SERVED_CHART면 지금 클라이언트에 내려주는
+        차트 청크 테이블(chart_pack 또는 chart_chunk)입니다. 전송 중 DB 연결을 잡지 않도록 조회만 단기 연결로 합니다."""
+        if table not in STORE_TABLES and table != SERVED_CHART:
             raise ValueError(table)
         # 파일을 여는 사이에 새 판으로 바뀌어 옛 파일이 지워졌으면 한 번 더 조회합니다.
         for attempt in range(2):
             with connect() as con, con.cursor() as cur:
-                cur.execute(f"SELECT size, sha256, path FROM {table} WHERE id = %s", (row_id,))
+                name = self._served_chart_table(cur) if table == SERVED_CHART else table
+                cur.execute(f"SELECT size, sha256, path FROM {name} WHERE id = %s", (row_id,))
                 row = cur.fetchone()
             if row is None:
                 return None
@@ -2738,6 +2985,8 @@ class SongBatch:
         self._songs = 0
         self._manifest_chunks: set[int] = set()
         self._pre_chunks: set[int] = set()
+        # 사전 청크는 그대로인데 차트만 바뀐 곡(기존 곡에 차트만 더함)의 차트 묶음
+        self._chart_packs: set[int] = set()
         self._remove: list[pathlib.Path] = []
         self._infos: list[dict] = []
 
@@ -2872,6 +3121,11 @@ class SongBatch:
             self._manifest_chunks.add(song_id // constant.SONGS_PER_MANIFEST_CHUNK)
         if pre_chunk is not None:
             self._pre_chunks.add(pre_chunk)
+        elif new_charts or reattached:
+            cur.execute("SELECT pre_chunk FROM song WHERE id = %s", (song_id,))
+            row = cur.fetchone()
+            if row is not None and row[0] is not None:
+                self._chart_packs.add(row[0])
         if remove and not conflicts:
             self._remove.append(root)
         elif remove:
@@ -2922,6 +3176,8 @@ class SongBatch:
                 self.db._rebuild_manifest_chunk(cur, chunk_no)
             for chunk_no in sorted(self._pre_chunks):
                 self.db._rebuild_pre_chunk(cur, chunk_no)
+            for chunk_no in sorted(self._chart_packs - self._pre_chunks):
+                self.db._refresh_chart_pack(cur, chunk_no)
             self._con.commit()
         except Exception:
             # 트레이스백은 예외를 받은 쪽(임포트 작업)이 남깁니다.

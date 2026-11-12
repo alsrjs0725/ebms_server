@@ -26,13 +26,14 @@ def fake_database(calls: list, fail: set = frozenset()):
 def test_background_startup_keeps_going_after_a_step_fails(monkeypatch, caplog):
     calls = []
     monkeypatch.setattr(main, "Database", fake_database(calls, fail={"backfill_pre_chunks"}))
+    monkeypatch.setattr(main, "start_chart_packs", lambda: calls.append("start_chart_packs"))
     monkeypatch.setattr(main.pre_rebalance, "kick", lambda: calls.append("pre_rebalance.kick"))
     monkeypatch.setattr(preview, "kick", lambda: calls.append("preview.kick"))
 
     main.background_startup()
 
-    # 사전 청크 만들기가 실패해도 재배치·미리듣기는 그대로 돕니다.
-    assert calls == ["backfill_pre_chunks", "pre_rebalance.kick", "preview.kick"]
+    # 사전 청크 만들기가 실패해도 차트 묶음·재배치·미리듣기는 그대로 돕니다.
+    assert calls == ["backfill_pre_chunks", "start_chart_packs", "pre_rebalance.kick", "preview.kick"]
     failed = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert failed == ["backfill_pre_chunks failed"]
 
