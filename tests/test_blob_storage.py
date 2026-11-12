@@ -267,8 +267,8 @@ def test_store_gc(tmp_path, database, monkeypatch):
     # 방금 쓴 파일은 지우지 않습니다.
     assert database.store_gc() == 0
     monkeypatch.setattr(constant, "STORE_GC_GRACE_SECONDS", -10)
-    # old, 임시 파일, 두 번째 곡을 넣을 때 바뀐 차트 청크의 옛 판
-    assert database.store_gc() == 3
+    # old, 임시 파일, 두 번째 곡을 넣을 때 바뀐 차트 청크·차트 묶음(두 곡이 같은 사전 청크)의 옛 판
+    assert database.store_gc() == 4
     assert not store.full_path(old).exists()
     assert not list(store.full_path(old).parent.glob(f"*{store.TMP_MARK}*"))
     with db_module.connect() as con, con.cursor() as cur:

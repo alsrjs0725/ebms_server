@@ -3,6 +3,7 @@ import logging
 import logging.handlers
 import shutil
 import threading
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 
@@ -86,10 +87,29 @@ def background_startup() -> None:
         Database().backfill_pre_chunks()
     except Exception:
         logging.getLogger(__name__).exception("backfill_pre_chunks failed")
+    # 차트를 사전 청크와 같은 번호로 묶은 차트 묶음을 만든다(처음에는 전부라 조금씩 쉬어 가며).
+    start_chart_packs()
     # 사전 청크에 난이도표 조합이 섞인 곡을 조합이 같은 청크로 조금씩 옮긴다(이전 버전에서 넣은 곡, 바뀐 난이도표).
     pre_rebalance.kick()
     # 미리듣기 음원이 없는 곡의 미리듣기를 만든다. 곡마다 키음을 풀어 섞으므로 오래 걸린다.
     preview.kick()
+
+
+def start_chart_packs() -> None:
+    threading.Thread(target=chart_pack_loop, name="backfill_chart_packs", daemon=True).start()
+
+
+def chart_pack_loop() -> None:
+    """든 차트가 바뀐 차트 묶음을 CHART_PACK_BYTES씩 CHART_PACK_PAUSE_SECONDS 쉬어 가며 다시 만든다. 다 만들면 끝난다."""
+    while True:
+        try:
+            _, left = Database().backfill_chart_packs()
+        except Exception:
+            logging.getLogger(__name__).exception("backfill_chart_packs failed")
+            return
+        if not left:
+            return
+        time.sleep(constant.CHART_PACK_PAUSE_SECONDS)
 
 
 def store_gc_loop(stop: threading.Event) -> None:

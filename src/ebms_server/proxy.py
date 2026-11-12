@@ -29,7 +29,7 @@ EXPECT_SHA256_HEADER = "x-ebms-expect-sha256"
 
 # 프록시가 캐시하는 경로 -> (테이블, 종류). 종류 pre는 사용량을 기록하고, play는 티켓을 씁니다.
 CACHED_ROUTES = (
-    (re.compile(r"/api/pre/chart/(\d+)"), "chart_chunk", "pre"),
+    (re.compile(r"/api/pre/chart/(\d+)"), "chart", "pre"),
     (re.compile(r"/api/pre/asset/(\d+)"), "pre_chunk", "pre"),
     (re.compile(r"/api/play/song/(\d+)"), "song", "play"),
 )

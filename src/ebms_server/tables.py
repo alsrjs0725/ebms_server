@@ -347,7 +347,36 @@ def pre_tables(user: Annotated[User, Depends(current_user)]):
             for t in tables
         ],
         "chunks": chunk_tags(),
+        # "pre"면 차트 청크도 사전 청크와 같은 번호로 묶여 있어, 고른 표의 사전 청크와 같은 번호의 차트 청크만 받으면 됩니다.
+        "chart_layout": db.Database().chart_layout(),
     }
+
+
+class SongChunksBody(BaseModel):
+    songs: list[int] = Field(default_factory=list, max_length=constant.TABLE_MATCH_MAX_HASHES)
+
+
+def song_chunks(song_ids: list[int]) -> dict[int, int]:
+    """{곡 id: 사전 청크 번호}. 없는 곡(지운 곡)과 청크가 없는 곡은 빠집니다."""
+    ids = sorted(set(song_ids))
+    out: dict[int, int] = {}
+    with db.connect() as con, con.cursor() as cur:
+        for i in range(0, len(ids), 1000):
+            part = ids[i : i + 1000]
+            cur.execute(
+                f"SELECT id, pre_chunk FROM song WHERE id IN ({', '.join(['%s'] * len(part))}) AND pre_chunk IS NOT NULL",
+                part,
+            )
+            out.update(cur.fetchall())
+    return out
+
+
+@router.post("/api/pre/song_chunks")
+async def pre_song_chunks(body: SongChunksBody, user: Annotated[User, Depends(current_user)]):
+    """곡들이 든 사전 청크 번호. 사용자가 직접 고른 난이도표의 곡은 서버 태그가 없으므로, 클라이언트가 이것으로 그 곡의
+    차트 청크(chart_layout이 "pre"일 때 사전 청크와 같은 번호)를 찾습니다."""
+    chunks = await run_in_threadpool(song_chunks, body.songs)
+    return {"chunks": {str(k): v for k, v in sorted(chunks.items())}}
 
 
 class MatchBody(BaseModel):
