@@ -28,6 +28,8 @@
 - 기존 곡에 더하는 차트는 commit 직전에 올린 그대로의 소리와 병합 뒤 날 소리를 렌더해 비교하고(render_match), 다르면(같은 이름의
   다른 곡 키음으로 울리게 되면) 그 차트를 넣지 않고 묶음에 남깁니다(result.render_held). 충돌 키음을 새 파일로 고르거나 차트를 새 곡으로 두면 들어갑니다.
 - 새 곡으로 넣는 차트가 곡 안에 없는 키음을 쓰면(차분) 비슷한 곡 후보에서 그 키음만 복사해 넣습니다(병합했을 때와 같은 소리로 플레이).
+- 차트가 쓰는 키음·BGA·이미지 중 곡(auto로 더할 기존 곡 포함)에 없는 것을 분석 때 세어 경고로 보여 주고(missing),
+  commit 뒤에도 빌려오고 남은 것을 결과(missing_assets)와 서버 로그에 남깁니다. 막지는 않습니다(차분은 키음 없이 배포되기도 함).
 - commit은 배치로 넣고(importer.Job의 천천히 모드 그대로), 실패하거나 충돌(내용이 다른 같은 경로 파일)이 난 곡은 묶음에 남겨 다시 검토합니다.
 - 캐시(cache.py, SSD)를 켜 두면 원본과 풀린 크기 추정이 한도 안인 묶음은 `cache/staged/{묶음}/`에 둡니다. commit 작업 폴더(`_work`)도 묶음 안이라 같이 따라갑니다.
 """
@@ -46,7 +48,7 @@ import uuid
 import zipfile
 
 from . import cache, constant, db, decode_cache, importer, preview, rar, render_match, sevenzip, store
-from .db import META_HEADERS, Database, _chart_refs, chart_meta, chart_sounds, meta_keys, song_dir_entries
+from .db import META_HEADERS, Database, _chart_refs, chart_assets, chart_meta, chart_sounds, meta_keys, song_dir_entries
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +419,44 @@ def _sound_stems(paths) -> set[str]:
     return stems
 
 
+# 에셋 누락(missing)을 셀 때 종류별로 찾는 파일 형식. BGA는 이미지와 영상 모두 됩니다.
+ASSET_FORMATS = {
+    "sound": constant.AUDIO_FORMAT,
+    "bga": constant.IMAGE_FORMAT + constant.VIDEO_FORMAT,
+    "image": constant.IMAGE_FORMAT,
+}
+# 에셋 누락에 남기는 종류별 예시 파일 수
+MISSING_EXAMPLES = 5
+
+
+def _missing_assets(paths, charts: dict[str, bytes]) -> dict | None:
+    """차트(charts {경로: 내용})가 가리키는 키음·BGA·이미지 중 paths(곡 안 파일 경로들)에 없는 것.
+    {"sound"|"bga"|"image": {"count": 수, "examples": [확장자 뺀 경로]}}이고 없는 게 없으면 None입니다.
+    경고용입니다(차분은 키음 없이 배포되는 경우가 많아 막지 않습니다)."""
+    stems = {kind: set() for kind in ASSET_FORMATS}
+    for path in paths:
+        stem, ext = posixpath.splitext(path.lower())
+        for kind, formats in ASSET_FORMATS.items():
+            if ext in formats:
+                stems[kind].add(stem)
+    missing: dict[str, set[frozenset[str]]] = {kind: set() for kind in ASSET_FORMATS}
+    for path, content in charts.items():
+        for kind, refs in chart_assets(content, posixpath.dirname(path)).items():
+            missing[kind].update(ref for ref in refs if not ref & stems[kind])
+    result = {
+        kind: {"count": len(refs), "examples": sorted(min(ref) for ref in refs)[:MISSING_EXAMPLES]}
+        for kind, refs in missing.items() if refs
+    }
+    return result or None
+
+
+def _song_paths(cur, song_id: int) -> list[str]:
+    """기존 곡의 파일 경로들."""
+    cur.execute("SELECT files FROM song WHERE id = %s", (song_id,))
+    row = cur.fetchone()
+    return [entry["path"] for entry in json.loads(row[0])] if row is not None and row[0] else []
+
+
 # _unit_sounds 결과 {(곡 zip이나 폴더, 수정 시각, 크기, 차트 sha256들): (키음, 곡 안 오디오)}.
 # 한 묶음 처리 중 렌더 준비·판정·폴더 근거·commit 직전 재판정에서 같은 곡을 여러 번 파싱하지 않게 합니다.
 _SOUNDS_CACHE: dict[tuple, tuple[list[frozenset[str]], set[str]]] = {}
@@ -575,6 +615,21 @@ def _analyze(stage: dict) -> None:
             if constant.IMPORT_BY_FOLDER and deleted is None:
                 _by_folder(cur, stage, unit, suggestion)
             unit["suggestion"] = suggestion
+            _set_missing(cur, stage, unit)
+
+
+def _set_missing(cur, stage: dict, unit: dict) -> None:
+    """곡이 쓰는 에셋 중 없는 것(unit["missing"], _missing_assets)을 채웁니다. auto로 기존 곡에 더하는 곡은
+    그 곡 파일도 있는 것으로 봅니다(차분·패치). 곡 번호를 직접 지정한 경우는 commit 결과에서 다시 셉니다."""
+    try:
+        paths = [path for path, _ in _unit_entries(stage, unit)]
+        song_id = _merge_song(unit, "auto")
+        if song_id is not None:
+            paths += _song_paths(cur, song_id)
+        unit["missing"] = _missing_assets(paths, _read_charts(stage, unit))
+    except (OSError, zipfile.BadZipFile):
+        logger.warning(f"staging: missing assets check failed[{unit['folder']}]", exc_info=True)
+        unit["missing"] = None
 
 
 def _folder_songs(cur, unit: dict) -> list[int]:
@@ -1026,7 +1081,7 @@ def _require_ready(stage: dict) -> None:
 
 def _counts(stage: dict) -> dict:
     counts = {kind: 0 for kind in SUGGESTIONS}
-    counts.update(changed=0, skip=0, failed=0)
+    counts.update(changed=0, skip=0, failed=0, missing=0)
     for unit in stage["units"]:
         kind = (unit.get("suggestion") or {}).get("kind")
         if kind in counts:
@@ -1037,6 +1092,8 @@ def _counts(stage: dict) -> dict:
             counts["changed"] += 1
         if _failed(unit):
             counts["failed"] += 1
+        if unit.get("missing"):
+            counts["missing"] += 1
     return counts
 
 
@@ -1100,6 +1157,8 @@ def _matches(unit: dict, show: str, q: str) -> bool:
         return False
     if show == "failed" and not _failed(unit):
         return False
+    if show == "missing" and not unit.get("missing"):
+        return False
     if q:
         text = "\n".join(
             [unit["folder"], *(f"{c['path']}\n{c.get('title', '')}\n{c.get('artist', '')}\n{c.get('genre', '')}" for c in unit["charts"])]
@@ -1127,7 +1186,7 @@ SORTS = {
 
 def get_stage(stage_id: str, page: int = 1, show: str = "", q: str = "", sort: str = "") -> dict:
     """묶음 요약과 곡 한 쪽. show는 판정(new/add/ambiguous/unused/similar)이나 changed(대상을 바꾼 곡),
-    failed(등록할 수 없는 곡·지난 commit에서 실패한 곡).
+    failed(등록할 수 없는 곡·지난 commit에서 실패한 곡), missing(차트가 쓰는 키음·BGA·이미지 중 없는 게 있는 곡).
     sort는 SORTS의 이름(파일 수 많은/적은 순)이고, 없거나 모르는 값이면 넣은 순서입니다."""
     with _lock:
         stage = _load(stage_id)
@@ -1338,6 +1397,25 @@ def _borrow_sounds(song_dir: pathlib.Path, charts: list[str], song_ids: list[int
     return borrowed
 
 
+def _commit_missing(song_dir: pathlib.Path, charts: list[str], song_id: int | None) -> dict | None:
+    """commit하는 차트가 쓰는데 넣을 곡 폴더(빌려온 키음 포함)와 더할 기존 곡(song_id)에 모두 없는 에셋(_missing_assets)."""
+    try:
+        paths = [path.relative_to(song_dir).as_posix() for path in song_dir.rglob("*") if path.is_file()]
+        contents = {}
+        for chart in charts:
+            try:
+                contents[chart] = (song_dir / chart).read_bytes()
+            except OSError:
+                continue
+        if song_id is not None:
+            with db.connect() as con, con.cursor() as cur:
+                paths += _song_paths(cur, song_id)
+        return _missing_assets(paths, contents)
+    except Exception:
+        logger.warning(f"commit: missing assets check failed[{song_dir.name}]", exc_info=True)
+        return None
+
+
 def _merge_song(unit: dict, target: str | int) -> int | None:
     """이 대상으로 넣으면 더해질 기존 곡 번호(새 곡이 되거나 정할 수 없으면 None)."""
     effective = _auto(unit, target)
@@ -1538,6 +1616,7 @@ def commit(stage_id: str, job: importer.Job) -> None:
                         )
                         # 렌더는 배치 쓰기 전에 합니다(쓰기 잠금을 오래 잡지 않게).
                         merge_into = _merge_song(unit, target)
+                        missing = _commit_missing(song_dir, charts, merge_into)
                         held, replaced = _render_check(unit, song_dir, charts, merge_into) if merge_into is not None else ([], [])
                         for item in held:
                             (song_dir / item["chart"]).unlink(missing_ok=True)
@@ -1552,6 +1631,12 @@ def commit(stage_id: str, job: importer.Job) -> None:
                             )
                         if borrowed:
                             info["borrowed_sounds"] = borrowed
+                        if missing and not info.get("error"):
+                            info["missing_assets"] = missing
+                            logger.warning(
+                                f"commit: missing assets[{label}] song[{info.get('song_id')}] "
+                                + ", ".join(f"{kind} {v['count']} ({', '.join(v['examples'])})" for kind, v in missing.items())
+                            )
                         if held:
                             info["render_held"] = held
                     except Exception as e:

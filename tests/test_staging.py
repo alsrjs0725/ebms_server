@@ -579,6 +579,42 @@ def test_merge_does_not_borrow(client, monkeypatch):
     assert song_files(1) == ["a.bms", "kick.wav", "x.bms"]
 
 
+def test_missing_assets_are_warned(client, monkeypatch):
+    """차트가 쓰는 키음·BGA·이미지가 곡에 없으면 검토 화면과 commit 결과에 경고를 남깁니다(막지는 않음)."""
+    admin_login(client, monkeypatch)
+    job = stage(client, "pack.zip", make_zip({
+        "s/a.bms": b"#TITLE Lonely\n#WAV01 kick.wav\n#WAV02 snare.wav\n#BMP01 movie.mpg\n#BMP02 bg.bmp\n#STAGEFILE st.png\n",
+        # 확장자가 달라도 플레이어가 찾으므로 있는 것으로 봅니다(kick.wav → kick.ogg, movie.mpg → movie.mp4).
+        "s/kick.ogg": b"k", "s/movie.mp4": b"m",
+        "ok/b.bms": b"#TITLE Fine\n#WAV01 x.wav\n", "ok/x.wav": b"x",
+    }))
+    sid = job["stage_id"]
+    found = units(client, sid)
+    assert found["pack/s"]["missing"] == {
+        "sound": {"count": 1, "examples": ["snare"]},
+        "bga": {"count": 1, "examples": ["bg"]},
+        "image": {"count": 1, "examples": ["st"]},
+    }
+    assert found["pack/ok"]["missing"] is None
+    page = detail(client, sid, show="missing")
+    assert page["counts"]["missing"] == 1 and [u["folder"] for u in page["items"]] == ["pack/s"]
+    result = commit_stage(client, sid)
+    by_folder = {s["folder"]: s for s in result["songs"]}
+    assert by_folder["pack/s"]["missing_assets"]["sound"] == {"count": 1, "examples": ["snare"]}
+    assert "missing_assets" not in by_folder["pack/ok"]
+
+
+def test_missing_assets_count_merge_target(client, monkeypatch):
+    """기존 곡에 더하는 차분은 그 곡의 키음도 있는 것으로 봅니다."""
+    admin_login(client, monkeypatch)
+    upload_new(client, "base.zip", make_zip({"b/a.bms": b"#TITLE Song\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n", "b/kick.wav": b"k"}))
+    job = stage(client, "pack.zip", make_zip({"d/x.bms": b"#TITLE Song [X]\n#ARTIST Comp\n#BPM 150\n#WAV01 kick.wav\n"}))
+    unit = units(client, job["stage_id"])["pack/d"]
+    assert unit["suggestion"]["merge"] == 1 and unit["missing"] is None
+    result = commit_stage(client, job["stage_id"])
+    assert [s.get("missing_assets") for s in result["songs"]] == [None]
+
+
 def test_folder_mode_adds_to_same_folder_only(client, monkeypatch):
     """폴더 단위 관리: 같은 이름 폴더의 곡에만 더하고(일부 파일만 든 패치도), 다른 폴더의 곡에는 차트가 겹쳐도 합치지 않습니다."""
     monkeypatch.setattr(constant, "IMPORT_BY_FOLDER", True)
