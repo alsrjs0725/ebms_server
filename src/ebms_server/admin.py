@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingRes
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import audit, auth, cache, conflicts, constant, db, download_log, downloads, importer, logs, media_match, quota, render_check, staging
+from . import audit, auth, cache, conflicts, constant, db, download_log, downloads, importer, logs, media_match, quota, staging
 from .accounts import User
 from .templating import templates
 
@@ -489,8 +489,6 @@ def restore_song(song_id: int, admin: Annotated[User, Depends(web_admin)]):
 
 def purge_song(song_id: int, reason: str, admin_id: str) -> dict:
     """곡 삭제(db.purge_song). 사용 중인 곡이면 사용 중지한 뒤 삭제합니다. 관리자 API와 MCP가 같이 씁니다."""
-    from . import render_index
-
     reason = reason.strip()
     if len(reason) > REASON_MAX:
         raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
@@ -500,7 +498,6 @@ def purge_song(song_id: int, reason: str, admin_id: str) -> dict:
         raise HTTPException(status_code=409, detail="곡 임포트가 진행 중입니다. 잠시 뒤 다시 시도하세요.")
     if not done:
         raise HTTPException(status_code=404, detail="song not found")
-    render_index.forget_songs([song_id])
     logger.info(f"song {song_id} purged by {admin_id}: {reason}")
     return {"ok": True, "song_id": song_id, "purged": True}
 
@@ -560,8 +557,6 @@ class SongMerge(BaseModel):
 
 def split_song(song_id: int, charts: list[str], folder: str, admin_id: str, dry_run: bool = False) -> dict:
     """곡 나누기(db.split_song). 관리자 API와 MCP가 같이 씁니다."""
-    from . import render_index
-
     try:
         result = db.Database().split_song(song_id, charts, folder, timeout=DELETE_LOCK_TIMEOUT, dry_run=dry_run)
     except TimeoutError:
@@ -572,15 +567,12 @@ def split_song(song_id: int, charts: list[str], folder: str, admin_id: str, dry_
         raise HTTPException(status_code=404, detail="song not found")
     if dry_run:
         return result
-    render_index.forget_songs([song_id, result["song_id"]])
     logger.info(f"song {song_id} split by {admin_id}: {result}")
     return result
 
 
 def merge_songs(song_id: int, source: int, reason: str, admin_id: str) -> dict:
     """곡 합치기(db.merge_songs). 관리자 API와 MCP가 같이 씁니다."""
-    from . import render_index
-
     reason = reason.strip()
     if len(reason) > REASON_MAX:
         raise HTTPException(status_code=400, detail=f"reason must be at most {REASON_MAX} characters")
@@ -592,7 +584,6 @@ def merge_songs(song_id: int, source: int, reason: str, admin_id: str) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
         raise HTTPException(status_code=404, detail="song not found")
-    render_index.forget_songs([song_id, source])
     logger.info(f"song {source} merged into {song_id} by {admin_id}: {result}")
     return result
 
@@ -615,8 +606,6 @@ class ChartAttach(BaseModel):
 
 def attach_charts(song_id: int, charts: list[str], reason: str, admin_id: str) -> dict:
     """뗀 차트 되살리기(db.attach_charts). 관리자 API와 MCP가 같이 씁니다."""
-    from . import render_index
-
     try:
         result = db.Database().attach_charts(song_id, charts, timeout=DELETE_LOCK_TIMEOUT)
     except TimeoutError:
@@ -625,7 +614,6 @@ def attach_charts(song_id: int, charts: list[str], reason: str, admin_id: str) -
         raise HTTPException(status_code=400, detail=str(e))
     if result is None:
         raise HTTPException(status_code=404, detail="song not found")
-    render_index.forget_songs([song_id])
     logger.info(f"song {song_id} charts attached by {admin_id}: {result} reason={reason!r}")
     return result
 
@@ -634,26 +622,6 @@ def attach_charts(song_id: int, charts: list[str], reason: str, admin_id: str) -
 def api_attach_charts(song_id: int, body: ChartAttach, admin: Annotated[User, Depends(web_admin)]):
     """뗀 차트(sha256)를 원본 없이 다시 붙입니다. 차트 청크에 남은 내용을 원래 경로로 곡 zip에 넣습니다."""
     return attach_charts(song_id, body.charts, body.reason, admin.id)
-
-class RenderCompare(BaseModel):
-    songs: list[int]
-    # 곡 id → 볼 차트 경로들. 없는 곡은 모든 차트
-    charts: dict[int, list[str]] = {}
-
-
-@router.post("/api/admin/render/compare")
-def render_compare(body: RenderCompare, admin: Annotated[User, Depends(web_admin)]):
-    """곡들의 차트를 서버에서 렌더해 같은 곡끼리 묶는 작업을 시작합니다(render_check). 진행·결과는
-    /api/admin/import/jobs/{id}의 done/total과 result({groups, unrendered})로 봅니다."""
-    try:
-        job = render_check.start(body.songs, body.charts)
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    logger.info(f"render compare {job.id} by {admin.id}: songs {body.songs}")
-    return job.json()
-
 
 @router.get("/api/admin/songs/{song_id}/zip")
 def download_song_zip(song_id: int, request: Request, admin: Annotated[User, Depends(web_admin)]):

@@ -79,13 +79,6 @@ services:
       EBMS_RETENTION_INTERVAL_HOURS: ${EBMS_RETENTION_INTERVAL_HOURS:-24}
       # 등록한 난이도표를 다시 읽는 주기(시간). 0이면 관리자 페이지에서 직접(docs/admin.md)
       EBMS_TABLE_REFRESH_HOURS: ${EBMS_TABLE_REFRESH_HOURS:-24}
-      # 모든 곡 렌더 색인(중복·섞임 점검, docs/admin.md): 따로 띄운 프로세스가 정한 코어에서 상시로 돕니다.
-      # 다 보면 몇 시간 뒤 새 곡만 다시 봅니다(0이면 자동 없음). 코어는 비우면 마지막 코어 하나.
-      EBMS_RENDER_INDEX_HOURS: ${EBMS_RENDER_INDEX_HOURS:-1}
-      EBMS_RENDER_INDEX_MINUTES: ${EBMS_RENDER_INDEX_MINUTES:-60}
-      EBMS_RENDER_INDEX_CPUS: ${EBMS_RENDER_INDEX_CPUS:-}
-      # 색인 파일(index.sqlite) 위치(컨테이너 안 경로). 랜덤 읽기가 많아 SSD가 좋습니다. 예: /app/cache/render_index
-      EBMS_RENDER_INDEX_DIR: ${EBMS_RENDER_INDEX_DIR:-/app/var/render_index}
       # 임포트 캐시(EBMS_CACHE_DIR, SSD 등) 한도. 예: 50G. 0이면 끄고 모두 var에 둡니다(docs/deployment.md)
       EBMS_CACHE_MAX_BYTES: ${EBMS_CACHE_MAX_BYTES:-0}
       # 로그 시각의 시간대. 비우면 UTC. 예: KST-9(이미지에 tzdata가 없어도 동작)(docs/deployment.md)

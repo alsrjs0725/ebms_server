@@ -291,9 +291,7 @@ def test_chart_held_when_merge_changes_its_sound(client, monkeypatch):
     job = stage(client, "pack.zip", make_zip({f"p/s/{k}": v for k, v in other.items()}))
     sid = job["stage_id"]
     unit = units(client, sid)["pack/p/s"]
-    # 판정 때 기존 곡 키음으로 채워 렌더해도 '다름'이라 자동 추가하지 않습니다(키음 이름·제목으로는 자동 추가 대상).
-    assert unit["suggestion"]["merge"] is None and unit["suggestion"]["render_blocked"] == 1
-    # 그래도 관리자가 그 곡을 고르면 commit 직전 렌더 검증이 채보를 남깁니다.
+    # 관리자가 그 곡을 고르면 commit 직전 렌더 검증이 채보를 남깁니다.
     assert client.put(f"/api/admin/import/stages/{sid}/units/{unit['id']}", json={"target": 1}).status_code == 200
     result = commit_stage(client, sid)
     held = result["songs"][0]["render_held"]

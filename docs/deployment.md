@@ -134,18 +134,6 @@ EBMS_MYSQL_BUFFER_POOL=2G
 EBMS_MYSQL_REDO_CAPACITY=1G
 ```
 
-### 렌더 색인을 SSD에 두기
-
-렌더 색인(`index.sqlite`, 수 GB)은 해시 조회가 거의 모두 랜덤 읽기라 HDD에서 느립니다. `EBMS_RENDER_INDEX_DIR`는 컨테이너 안 경로이므로, SSD에 붙인 캐시 폴더 아래를 가리키면 따로 마운트하지 않아도 됩니다(그만큼 `EBMS_CACHE_MAX_BYTES` 한도에 들어갑니다). 서버를 멈춘 뒤 파일을 옮기고 켭니다.
-
-```bash
-docker compose -p ebms-release --env-file /opt/ebms/release.env stop ebms
-mkdir -p $EBMS_CACHE_DIR/render_index
-cp -a $EBMS_VAR_DIR/render_index/. $EBMS_CACHE_DIR/render_index/
-# /opt/ebms/release.env
-EBMS_RENDER_INDEX_DIR=/app/cache/render_index
-```
-
 ## 브랜치와 자동 배포
 
 | 브랜치 | 단계 | 병합 시 |
