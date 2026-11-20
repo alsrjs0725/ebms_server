@@ -893,6 +893,18 @@ def discard_stage(stage_id: str, admin: Annotated[User, Depends(web_admin)]):
     return {"ok": True}
 
 
+class UnitDiscard(BaseModel):
+    unit_ids: list[str]
+
+
+@router.post("/api/admin/import/stages/{stage_id}/units/discard")
+def discard_units(stage_id: str, body: UnitDiscard, admin: Annotated[User, Depends(web_admin)]):
+    """대기 묶음에서 고른 곡만 버립니다(풀어 둔 파일 삭제). 남은 곡이 없으면 묶음도 지웁니다."""
+    result = _stage_call(staging.discard_units, stage_id, body.unit_ids)
+    logger.info(f"import stage {stage_id} units discarded by {admin.id}: {len(body.unit_ids)}")
+    return result
+
+
 @router.get("/api/admin/import/jobs")
 def list_jobs(admin: Annotated[User, Depends(web_admin)]):
     return [job.json() for job in importer.list_jobs()]
