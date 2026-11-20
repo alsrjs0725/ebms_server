@@ -1292,6 +1292,28 @@ def discard(stage_id: str) -> None:
         shutil.rmtree(_dir(stage_id), ignore_errors=True)
 
 
+def discard_units(stage_id: str, unit_ids: list[str]) -> dict:
+    """묶음에서 고른 곡만 버립니다(풀어 둔 파일 삭제). 남은 곡이 없으면 묶음도 지웁니다."""
+    wanted = set(unit_ids)
+    if not wanted:
+        raise StageError(400, "버릴 곡을 고르세요.")
+    with _lock:
+        stage = _load(stage_id)
+        _require_ready(stage)
+        root = _dir(stage_id)
+        unknown = wanted - {unit["id"] for unit in stage["units"]}
+        if unknown:
+            raise StageError(404, f"묶음에 없는 곡입니다: {', '.join(sorted(unknown))}")
+        stage["units"] = [unit for unit in stage["units"] if unit["id"] not in wanted]
+        if not stage["units"]:
+            shutil.rmtree(root, ignore_errors=True)
+            return {"discarded": len(wanted), "left": 0}
+        _save(stage)
+    for unit_id in wanted:
+        shutil.rmtree(root / unit_id, ignore_errors=True)
+    return {"discarded": len(wanted), "left": len(stage["units"])}
+
+
 # ---- commit ----
 
 def _referenced(unit_dir: pathlib.Path, chart_paths: list[str]) -> dict[str, set[str]]:

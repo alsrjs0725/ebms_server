@@ -188,6 +188,36 @@ def test_skip_ambiguous_and_failures_stay(client, monkeypatch):
     assert client.get(f"/api/admin/import/stages/{sid}").status_code == 404
 
 
+def test_discard_units(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    sid = stage(client, "pack.zip", make_zip({
+        "p/a/a.bms": b"#TITLE A\n",
+        "p/b/b.bms": b"#TITLE B\n",
+        "p/c/c.bms": b"#TITLE C\n",
+    }))["stage_id"]
+    got = units(client, sid)
+    url = f"/api/admin/import/stages/{sid}/units/discard"
+    assert client.post(url, json={"unit_ids": []}).status_code == 400
+    assert client.post(url, json={"unit_ids": ["nope"]}).status_code == 404
+    a, b, c = (got[f"pack/p/{n}"]["id"] for n in "abc")
+    r = client.post(url, json={"unit_ids": [a, b]})
+    assert r.status_code == 200 and r.json() == {"discarded": 2, "left": 1}
+    assert sorted(units(client, sid)) == ["pack/p/c"]
+    commit_stage(client, sid)
+    assert chart_owner(b"#TITLE A\n") is None
+    assert chart_owner(b"#TITLE C\n") is not None
+    assert client.get(f"/api/admin/import/stages/{sid}").status_code == 404
+
+
+def test_discard_last_units_removes_stage(client, monkeypatch):
+    admin_login(client, monkeypatch)
+    sid = stage(client, "one.zip", make_zip({"p/a/a.bms": b"#TITLE A\n"}))["stage_id"]
+    unit_id = units(client, sid)["one/p/a"]["id"]
+    r = client.post(f"/api/admin/import/stages/{sid}/units/discard", json={"unit_ids": [unit_id]})
+    assert r.json() == {"discarded": 1, "left": 0}
+    assert client.get(f"/api/admin/import/stages/{sid}").status_code == 404
+
+
 def test_tmp_is_staged_and_recover(client, monkeypatch):
     admin_login(client, monkeypatch)
     song = constant.TMP_DIR / "g" / "s1"
